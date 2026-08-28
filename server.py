@@ -287,7 +287,84 @@ async def get_live_odds(fixture_id: int):
         },
     )
 
+# =========================
+# ZYLA MATCH DATA
+# =========================
 
+async def zyla_get(endpoint_id: int, endpoint_slug: str, params: dict):
+    """Send a request to Zyla API."""
+    if not ZYLA_API_KEY:
+        return {"error": "ZYLA_API_KEY is not configured"}
+
+    url = (
+        f"https://zylalabs.com/api/12518/"
+        f"flashscore+-+live+api/{endpoint_id}/{endpoint_slug}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {ZYLA_API_KEY}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params,
+            )
+
+            try:
+                data = response.json()
+            except Exception:
+                data = {"raw_response": response.text}
+
+            return {
+                "http_status": response.status_code,
+                "data": data,
+            }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_zyla_match_details(match_id: str):
+    """Get Zyla details for a specific live match."""
+    return await zyla_get(
+        23859,
+        "get+match+details",
+        {"match_id": match_id},
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_stats(match_id: str):
+    """Get Zyla live statistics including xG, shots and possession."""
+    return await zyla_get(
+        23861,
+        "get+match+stats",
+        {"match_id": match_id},
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_summary(match_id: str):
+    """Get Zyla goals, cards, substitutions and match events."""
+    return await zyla_get(
+        23860,
+        "get+match+summary",
+        {"match_id": match_id},
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_odds(match_id: str):
+    """Get Zyla odds for a specific match."""
+    return await zyla_get(
+        23865,
+        "get+match+odds",
+        {"match_id": match_id},
+    )
 # =========================
 # START SERVER
 # =========================
