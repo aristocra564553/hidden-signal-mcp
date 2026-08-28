@@ -6,6 +6,8 @@ API_KEY = os.environ.get("API_FOOTBALL_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
 
 mcp = MCPServer("Hidden Signal Live")
+
+
 async def api_get(endpoint: str, params: dict | None = None):
     if not API_KEY:
         return {"error": "API_FOOTBALL_KEY is not configured"}
@@ -17,12 +19,6 @@ async def api_get(endpoint: str, params: dict | None = None):
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         response = await client.get(
-            f"{BASE_URL}{endpoint}",
-            headers=headers,
-            params=params or {},
-        )
-        response.raise_for_status()
-        return response.json()
             f"{BASE_URL}{endpoint}",
             headers=headers,
             params=params or {},
@@ -66,7 +62,10 @@ async def get_head_to_head(team1_id: int, team2_id: int, last: int = 10):
     """Get recent head-to-head matches between two teams."""
     return await api_get(
         "/fixtures/headtohead",
-        {"h2h": f"{team1_id}-{team2_id}", "last": last},
+        {
+            "h2h": f"{team1_id}-{team2_id}",
+            "last": last,
+        },
     )
 
 
@@ -75,7 +74,11 @@ async def get_team_last_matches(team_id: int, season: int, last: int = 10):
     """Get a team's latest matches for form analysis."""
     return await api_get(
         "/fixtures",
-        {"team": team_id, "season": season, "last": last},
+        {
+            "team": team_id,
+            "season": season,
+            "last": last,
+        },
     )
 
 
@@ -98,8 +101,8 @@ async def get_live_odds(fixture_id: int):
 
 
 if __name__ == "__main__":
-   mcp.run(
-    transport="streamable-http",
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", "10000")),
-)
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "10000")),
+    )
