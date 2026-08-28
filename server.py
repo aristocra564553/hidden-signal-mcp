@@ -10,7 +10,11 @@ mcp = MCPServer("Hidden Signal Live")
 
 async def api_get(endpoint: str, params: dict | None = None):
     if not API_KEY:
-        return {"error": "API_FOOTBALL_KEY is not configured"}
+        return {
+            "error": "API_FOOTBALL_KEY is not configured",
+            "key_loaded": False,
+            "key_length": 0,
+        }
 
     headers = {
         "x-apisports-key": API_KEY,
@@ -22,8 +26,19 @@ async def api_get(endpoint: str, params: dict | None = None):
             headers=headers,
             params=params or {},
         )
-        response.raise_for_status()
-        return response.json()
+
+        data = response.json()
+
+        return {
+            "diagnostic": {
+                "key_loaded": True,
+                "key_length": len(API_KEY),
+                "http_status": response.status_code,
+                "header_used": "x-apisports-key",
+                "base_url": BASE_URL,
+            },
+            "api_response": data,
+        }
 
 
 @mcp.tool()
