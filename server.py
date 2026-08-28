@@ -2,7 +2,7 @@ import os
 import httpx
 from mcp.server import MCPServer
 
-API_KEY = os.environ.get("API_FOOTBALL_KEY")
+API_KEY = os.environ.get("API_FOOTBALL_KEY", "").strip()
 BASE_URL = "https://v3.football.api-sports.io"
 
 mcp = MCPServer("Hidden Signal Live")
