@@ -1,11 +1,11 @@
 import os
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 API_KEY = os.environ.get("API_FOOTBALL_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
 
-mcp = FastMCP("Hidden Signal Live")
+mcp = MCPServer("Hidden Signal Live")
 
 
 async def api_get(endpoint: str, params: dict | None = None):
