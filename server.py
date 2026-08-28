@@ -4,22 +4,17 @@ from mcp.server import MCPServer
 
 
 # =========================
-# API-FOOTBALL
+# CONFIG
 # =========================
 
 API_KEY = (os.environ.get("API_FOOTBALL_KEY") or "").strip()
-BASE_URL = "https://v3.football.api-sports.io"
-
-
-# =========================
-# ZYLA / FLASHSCORE
-# =========================
-
 ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
 
-ZYLA_LIVE_URL = (
+API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
+
+ZYLA_BASE_URL = (
     "https://zylalabs.com/api/12518/"
-    "flashscore+-+live+api/23856/get+live+matches"
+    "flashscore+-+live+api"
 )
 
 
@@ -38,9 +33,9 @@ async def api_get(endpoint: str, params: dict | None = None):
     if not API_KEY:
         return {
             "error": "API_FOOTBALL_KEY is not configured",
+            "source": "api-football",
             "diagnostic": {
                 "key_loaded": False,
-                "key_length": 0,
             },
         }
 
@@ -51,33 +46,31 @@ async def api_get(endpoint: str, params: dict | None = None):
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(
-                f"{BASE_URL}{endpoint}",
+                f"{API_FOOTBALL_BASE_URL}{endpoint}",
                 headers=headers,
                 params=params or {},
             )
 
-            try:
-                data = response.json()
-            except Exception:
-                data = {
-                    "raw_response": response.text
-                }
-
-            return {
-                "source": "api-football",
-                "diagnostic": {
-                    "key_loaded": True,
-                    "key_length": len(API_KEY),
-                    "http_status": response.status_code,
-                    "header_used": "x-apisports-key",
-                },
-                "api_response": data,
+        try:
+            data = response.json()
+        except Exception:
+            data = {
+                "raw_response": response.text,
             }
+
+        return {
+            "source": "api-football",
+            "diagnostic": {
+                "key_loaded": True,
+                "http_status": response.status_code,
+            },
+            "api_response": data,
+        }
 
     except Exception as e:
         return {
-            "error": str(e),
             "source": "api-football",
+            "error": str(e),
         }
 
 
@@ -85,15 +78,25 @@ async def api_get(endpoint: str, params: dict | None = None):
 # ZYLA REQUEST
 # =========================
 
-async def zyla_get(url: str, params: dict | None = None):
+async def zyla_get(
+    endpoint_id: int,
+    endpoint_slug: str,
+    params: dict | None = None,
+):
     if not ZYLA_API_KEY:
         return {
             "error": "ZYLA_API_KEY is not configured",
+            "source": "zyla-flashscore",
             "diagnostic": {
                 "key_loaded": False,
-                "key_length": 0,
             },
         }
+
+    url = (
+        f"{ZYLA_BASE_URL}/"
+        f"{endpoint_id}/"
+        f"{endpoint_slug}"
+    )
 
     headers = {
         "Authorization": f"Bearer {ZYLA_API_KEY}",
@@ -107,45 +110,105 @@ async def zyla_get(url: str, params: dict | None = None):
                 params=params or {},
             )
 
-            try:
-                data = response.json()
-            except Exception:
-                data = {
-                    "raw_response": response.text
-                }
-
-            return {
-                "source": "zyla-flashscore",
-                "diagnostic": {
-                    "key_loaded": True,
-                    "key_length": len(ZYLA_API_KEY),
-                    "http_status": response.status_code,
-                },
-                "api_response": data,
+        try:
+            data = response.json()
+        except Exception:
+            data = {
+                "raw_response": response.text,
             }
+
+        return {
+            "source": "zyla-flashscore",
+            "diagnostic": {
+                "key_loaded": True,
+                "http_status": response.status_code,
+                "endpoint_id": endpoint_id,
+            },
+            "api_response": data,
+        }
 
     except Exception as e:
         return {
-            "error": str(e),
             "source": "zyla-flashscore",
+            "error": str(e),
         }
 
 
 # ==================================================
-# ZYLA / FLASHSCORE LIVE
+# ZYLA / FLASHSCORE TOOLS
 # ==================================================
 
 @mcp.tool()
 async def get_zyla_live_matches():
     """
-    Get all football matches currently live
-    from the Zyla FlashScore Live API.
+    Get all football matches currently live from Zyla FlashScore.
     """
 
     return await zyla_get(
-        ZYLA_LIVE_URL,
+        23856,
+        "get+live+matches",
         {
             "sport_id": 1,
+        },
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_details(match_id: str):
+    """
+    Get detailed information for a Zyla FlashScore match.
+    """
+
+    return await zyla_get(
+        23859,
+        "get+match+details",
+        {
+            "match_id": match_id,
+        },
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_summary(match_id: str):
+    """
+    Get match events, goals, cards and substitutions from Zyla.
+    """
+
+    return await zyla_get(
+        23860,
+        "get+match+summary",
+        {
+            "match_id": match_id,
+        },
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_stats(match_id: str):
+    """
+    Get live match statistics from Zyla.
+    """
+
+    return await zyla_get(
+        23861,
+        "get+match+stats",
+        {
+            "match_id": match_id,
+        },
+    )
+
+
+@mcp.tool()
+async def get_zyla_match_odds(match_id: str):
+    """
+    Get available match odds from Zyla.
+    """
+
+    return await zyla_get(
+        23865,
+        "get+match+odds",
+        {
+            "match_id": match_id,
         },
     )
 
@@ -156,7 +219,8 @@ async def get_zyla_live_matches():
 
 @mcp.tool()
 async def get_live_matches():
-    """Get all football matches that are live right now."""
+    """Get all API-Football matches that are live right now."""
+
     return await api_get(
         "/fixtures",
         {
@@ -167,7 +231,8 @@ async def get_live_matches():
 
 @mcp.tool()
 async def get_fixture_details(fixture_id: int):
-    """Get current details for a specific fixture."""
+    """Get fixture details from API-Football."""
+
     return await api_get(
         "/fixtures",
         {
@@ -178,11 +243,8 @@ async def get_fixture_details(fixture_id: int):
 
 @mcp.tool()
 async def get_fixture_statistics(fixture_id: int):
-    """
-    Get live match statistics:
-    shots, shots on target, possession,
-    corners, fouls and other available data.
-    """
+    """Get fixture live statistics from API-Football."""
+
     return await api_get(
         "/fixtures/statistics",
         {
@@ -193,11 +255,8 @@ async def get_fixture_statistics(fixture_id: int):
 
 @mcp.tool()
 async def get_fixture_events(fixture_id: int):
-    """
-    Get match events:
-    goals, cards, substitutions,
-    penalties and VAR events when available.
-    """
+    """Get goals, cards, substitutions and VAR events."""
+
     return await api_get(
         "/fixtures/events",
         {
@@ -208,7 +267,8 @@ async def get_fixture_events(fixture_id: int):
 
 @mcp.tool()
 async def get_fixture_lineups(fixture_id: int):
-    """Get lineups, formations and available player information."""
+    """Get lineups and formations."""
+
     return await api_get(
         "/fixtures/lineups",
         {
@@ -223,7 +283,7 @@ async def get_head_to_head(
     team2_id: int,
     last: int = 10,
 ):
-    """Get recent head-to-head matches between two teams."""
+    """Get recent head-to-head matches."""
 
     return await api_get(
         "/fixtures/headtohead",
@@ -240,7 +300,7 @@ async def get_team_last_matches(
     season: int,
     last: int = 10,
 ):
-    """Get a team's latest matches for form analysis."""
+    """Get latest matches for a team."""
 
     return await api_get(
         "/fixtures",
@@ -254,7 +314,7 @@ async def get_team_last_matches(
 
 @mcp.tool()
 async def get_injuries(fixture_id: int):
-    """Get available injury information for a fixture."""
+    """Get injury information."""
 
     return await api_get(
         "/injuries",
@@ -266,7 +326,7 @@ async def get_injuries(fixture_id: int):
 
 @mcp.tool()
 async def get_prematch_odds(fixture_id: int):
-    """Get available bookmaker pre-match odds for a fixture."""
+    """Get pre-match bookmaker odds."""
 
     return await api_get(
         "/odds",
@@ -278,7 +338,7 @@ async def get_prematch_odds(fixture_id: int):
 
 @mcp.tool()
 async def get_live_odds(fixture_id: int):
-    """Get available live/in-play odds for a fixture."""
+    """Get live bookmaker odds."""
 
     return await api_get(
         "/odds/live",
@@ -287,86 +347,7 @@ async def get_live_odds(fixture_id: int):
         },
     )
 
-# =========================
-# ZYLA MATCH DATA
-# =========================
 
-async def zyla_get(endpoint_id: int, endpoint_slug: str, params: dict):
-    """Send a request to Zyla API."""
-    if not ZYLA_API_KEY:
-        return {"error": "ZYLA_API_KEY is not configured"}
-
-    url = (
-        f"https://zylalabs.com/api/12518/"
-        f"flashscore+-+live+api/{endpoint_id}/{endpoint_slug}"
-    )
-
-    headers = {
-        "Authorization": f"Bearer {ZYLA_API_KEY}",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                url,
-                headers=headers,
-                params=params,
-            )
-
-            try:
-                data = response.json()
-            except Exception:
-                data = {"raw_response": response.text}
-
-            return {
-                "http_status": response.status_code,
-                "data": data,
-            }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-async def get_zyla_match_details(match_id: str):
-    """Get Zyla details for a specific live match."""
-    return await zyla_get(
-        23859,
-        "get+match+details",
-        {"match_id": match_id},
-    )
-
-
-@mcp.tool()
-async def get_zyla_match_stats(match_id: str):
-    """Get Zyla live statistics including xG, shots and possession."""
-    return await zyla_get(
-        23861,
-        "get+match+stats",
-        {"match_id": match_id},
-    )
-
-
-@mcp.tool()
-async def get_zyla_match_summary(match_id: str):
-    """Get Zyla goals, cards, substitutions and match events."""
-    return await zyla_get(
-        23860,
-        "get+match+summary",
-        {"match_id": match_id},
-    )
-
-
-@mcp.tool()
-async def get_zyla_live_matches():
-    """Get all live football matches from Zyla."""
-    return await zyla_get(
-        23856,
-        "get+live+matches",
-        {
-            "sport_id": 1,
-        },
-    )
 # =========================
 # START SERVER
 # =========================
