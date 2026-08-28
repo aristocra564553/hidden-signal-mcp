@@ -5,11 +5,7 @@ from mcp.server.fastmcp import FastMCP
 API_KEY = os.environ.get("API_FOOTBALL_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
 
-mcp = FastMCP(
-    "Hidden Signal Live",
-    host="0.0.0.0",
-    port=int(os.environ.get("PORT", "10000")),
-)
+mcp = FastMCP("Hidden Signal Live")
 
 
 async def api_get(endpoint: str, params: dict | None = None):
@@ -97,4 +93,8 @@ async def get_live_odds(fixture_id: int):
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+   mcp.run(
+    transport="streamable-http",
+    host="0.0.0.0",
+    port=int(os.environ.get("PORT", "10000")),
+)
