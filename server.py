@@ -358,12 +358,14 @@ async def get_zyla_match_summary(match_id: str):
 
 
 @mcp.tool()
-async def get_zyla_match_odds(match_id: str):
-    """Get Zyla odds for a specific match."""
+async def get_zyla_live_matches():
+    """Get all live football matches from Zyla."""
     return await zyla_get(
-        23865,
-        "get+match+odds",
-        {"match_id": match_id},
+        23856,
+        "get+live+matches",
+        {
+            "sport_id": 1,
+        },
     )
 # =========================
 # START SERVER
