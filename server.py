@@ -13,9 +13,9 @@ async def api_get(endpoint: str, params: dict | None = None):
         return {"error": "API_FOOTBALL_KEY is not configured"}
 
     headers = {
-        "x-apisports-key": API_KEY,
-        "x-rapidapi-key": API_KEY,
-    }
+   headers = {
+    "API-KEY": API_KEY,
+}
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         response = await client.get(
