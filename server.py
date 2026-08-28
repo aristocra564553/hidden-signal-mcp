@@ -4,17 +4,34 @@ from mcp.server import MCPServer
 
 
 # =========================
-# НАСТРОЙКИ API-FOOTBALL
+# API-FOOTBALL
 # =========================
 
 API_KEY = (os.environ.get("API_FOOTBALL_KEY") or "").strip()
 BASE_URL = "https://v3.football.api-sports.io"
 
+
+# =========================
+# ZYLA / FLASHSCORE
+# =========================
+
+ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
+
+ZYLA_LIVE_URL = (
+    "https://zylalabs.com/api/12518/"
+    "flashscore+-+live+api/23856/get+live+matches"
+)
+
+
+# =========================
+# MCP SERVER
+# =========================
+
 mcp = MCPServer("Hidden Signal Live")
 
 
 # =========================
-# ОСНОВНОЙ ЗАПРОС К API
+# API-FOOTBALL REQUEST
 # =========================
 
 async def api_get(endpoint: str, params: dict | None = None):
@@ -47,12 +64,12 @@ async def api_get(endpoint: str, params: dict | None = None):
                 }
 
             return {
+                "source": "api-football",
                 "diagnostic": {
                     "key_loaded": True,
                     "key_length": len(API_KEY),
                     "http_status": response.status_code,
                     "header_used": "x-apisports-key",
-                    "base_url": BASE_URL,
                 },
                 "api_response": data,
             }
@@ -60,16 +77,82 @@ async def api_get(endpoint: str, params: dict | None = None):
     except Exception as e:
         return {
             "error": str(e),
-            "diagnostic": {
-                "key_loaded": True,
-                "key_length": len(API_KEY),
-            },
+            "source": "api-football",
         }
 
 
 # =========================
-# LIVE МАТЧИ
+# ZYLA REQUEST
 # =========================
+
+async def zyla_get(url: str, params: dict | None = None):
+    if not ZYLA_API_KEY:
+        return {
+            "error": "ZYLA_API_KEY is not configured",
+            "diagnostic": {
+                "key_loaded": False,
+                "key_length": 0,
+            },
+        }
+
+    headers = {
+        "Authorization": f"Bearer {ZYLA_API_KEY}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params or {},
+            )
+
+            try:
+                data = response.json()
+            except Exception:
+                data = {
+                    "raw_response": response.text
+                }
+
+            return {
+                "source": "zyla-flashscore",
+                "diagnostic": {
+                    "key_loaded": True,
+                    "key_length": len(ZYLA_API_KEY),
+                    "http_status": response.status_code,
+                },
+                "api_response": data,
+            }
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "source": "zyla-flashscore",
+        }
+
+
+# ==================================================
+# ZYLA / FLASHSCORE LIVE
+# ==================================================
+
+@mcp.tool()
+async def get_zyla_live_matches():
+    """
+    Get all football matches currently live
+    from the Zyla FlashScore Live API.
+    """
+
+    return await zyla_get(
+        ZYLA_LIVE_URL,
+        {
+            "sport_id": 1,
+        },
+    )
+
+
+# ==================================================
+# API-FOOTBALL TOOLS
+# ==================================================
 
 @mcp.tool()
 async def get_live_matches():
@@ -82,10 +165,6 @@ async def get_live_matches():
     )
 
 
-# =========================
-# ДЕТАЛИ МАТЧА
-# =========================
-
 @mcp.tool()
 async def get_fixture_details(fixture_id: int):
     """Get current details for a specific fixture."""
@@ -96,10 +175,6 @@ async def get_fixture_details(fixture_id: int):
         },
     )
 
-
-# =========================
-# LIVE СТАТИСТИКА
-# =========================
 
 @mcp.tool()
 async def get_fixture_statistics(fixture_id: int):
@@ -116,10 +191,6 @@ async def get_fixture_statistics(fixture_id: int):
     )
 
 
-# =========================
-# СОБЫТИЯ МАТЧА
-# =========================
-
 @mcp.tool()
 async def get_fixture_events(fixture_id: int):
     """
@@ -135,10 +206,6 @@ async def get_fixture_events(fixture_id: int):
     )
 
 
-# =========================
-# СОСТАВЫ
-# =========================
-
 @mcp.tool()
 async def get_fixture_lineups(fixture_id: int):
     """Get lineups, formations and available player information."""
@@ -149,10 +216,6 @@ async def get_fixture_lineups(fixture_id: int):
         },
     )
 
-
-# =========================
-# ЛИЧНЫЕ ВСТРЕЧИ
-# =========================
 
 @mcp.tool()
 async def get_head_to_head(
@@ -170,10 +233,6 @@ async def get_head_to_head(
         },
     )
 
-
-# =========================
-# ПОСЛЕДНИЕ МАТЧИ КОМАНДЫ
-# =========================
 
 @mcp.tool()
 async def get_team_last_matches(
@@ -193,10 +252,6 @@ async def get_team_last_matches(
     )
 
 
-# =========================
-# ТРАВМЫ
-# =========================
-
 @mcp.tool()
 async def get_injuries(fixture_id: int):
     """Get available injury information for a fixture."""
@@ -209,10 +264,6 @@ async def get_injuries(fixture_id: int):
     )
 
 
-# =========================
-# ПРЕМАТЧ КОЭФФИЦИЕНТЫ
-# =========================
-
 @mcp.tool()
 async def get_prematch_odds(fixture_id: int):
     """Get available bookmaker pre-match odds for a fixture."""
@@ -224,10 +275,6 @@ async def get_prematch_odds(fixture_id: int):
         },
     )
 
-
-# =========================
-# LIVE КОЭФФИЦИЕНТЫ
-# =========================
 
 @mcp.tool()
 async def get_live_odds(fixture_id: int):
@@ -242,7 +289,7 @@ async def get_live_odds(fixture_id: int):
 
 
 # =========================
-# ЗАПУСК MCP
+# START SERVER
 # =========================
 
 if __name__ == "__main__":
