@@ -12,6 +12,7 @@ async def api_get(endpoint: str, params: dict | None = None):
 
     headers = {
         "x-apisports-key": API_KEY,
+        "x-rapidapi-key": API_KEY,
     }
 
     async with httpx.AsyncClient(timeout=20.0) as client:
