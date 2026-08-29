@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.4b-FINAL-SNAPSHOT-RECOVERY"
-MODEL_TYPE = "heuristic-v5.7.4b-final-snapshot-recovery-not-calibrated"
+VERSION = "V5.7.5-FINAL-SNAPSHOT-GUARD"
+MODEL_TYPE = "heuristic-v5.7.5-final-snapshot-guard-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -298,6 +298,8 @@ PROVIDER_LIVE_CACHE_TTL = float(os.environ.get("PROVIDER_LIVE_CACHE_TTL", "8"))
 PROVIDER_MIN_GAP = float(os.environ.get("PROVIDER_MIN_GAP", "0.45"))
 PROVIDER_MAX_CALLS_PER_MINUTE = int(os.environ.get("PROVIDER_MAX_CALLS_PER_MINUTE", "24"))
 PROVIDER_MAX_CALLS_PER_SCAN = int(os.environ.get("PROVIDER_MAX_CALLS_PER_SCAN", "14"))
+PROVIDER_FINAL_SNAPSHOT_RESERVE = int(os.environ.get("PROVIDER_FINAL_SNAPSHOT_RESERVE", "1"))
+PROVIDER_TARGETED_VERIFY_RESERVE = int(os.environ.get("PROVIDER_TARGETED_VERIFY_RESERVE", "1"))
 
 _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROVIDER_CALL_TIMES: List[float] = []
@@ -348,17 +350,56 @@ def _v573_scan_budget_start() -> None:
 def _v573_scan_budget_status() -> Dict[str, Any]:
     used = int(_SCAN_BUDGET.get("used") or 0)
     limit = int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN)
-    return {"active": bool(_SCAN_BUDGET.get("active")), "used": used, "limit": limit, "remaining": max(0, limit-used)}
+    final_reserve = max(0, int(PROVIDER_FINAL_SNAPSHOT_RESERVE))
+    targeted_reserve = max(0, int(PROVIDER_TARGETED_VERIFY_RESERVE))
+    normal_ceiling = max(0, limit - final_reserve - targeted_reserve)
+    return {
+        "active": bool(_SCAN_BUDGET.get("active")),
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit-used),
+        "normal_call_ceiling": normal_ceiling,
+        "final_snapshot_reserve": final_reserve,
+        "targeted_verify_reserve": targeted_reserve,
+    }
 
-async def _v573_provider_gate(name: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+async def _v573_provider_gate(
+    name: str,
+    params: Optional[Dict[str, Any]],
+    purpose: str = "normal",
+) -> Dict[str, Any]:
     global _PROVIDER_LAST_CALL_AT
 
     rs = _v572_rate_status()
     if rs.get("active"):
         return {"allowed": False, "reason": "RATE_LIMIT_COOLDOWN", "rate_limit": rs}
 
-    if _SCAN_BUDGET.get("active") and int(_SCAN_BUDGET.get("used") or 0) >= int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN):
-        return {"allowed": False, "reason": "SCAN_API_BUDGET_EXHAUSTED", "budget": _v573_scan_budget_status()}
+    if _SCAN_BUDGET.get("active"):
+        used = int(_SCAN_BUDGET.get("used") or 0)
+        limit = int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN)
+        final_reserve = max(0, int(PROVIDER_FINAL_SNAPSHOT_RESERVE))
+        targeted_reserve = max(0, int(PROVIDER_TARGETED_VERIFY_RESERVE))
+        normal_ceiling = max(0, limit - final_reserve - targeted_reserve)
+        final_ceiling = max(0, limit - targeted_reserve)
+
+        if purpose == "normal" and used >= normal_ceiling:
+            return {
+                "allowed": False,
+                "reason": "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+                "budget": _v573_scan_budget_status(),
+            }
+        if purpose == "final_snapshot" and used >= final_ceiling:
+            return {
+                "allowed": False,
+                "reason": "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
+                "budget": _v573_scan_budget_status(),
+            }
+        if purpose == "targeted_verify" and used >= limit:
+            return {
+                "allowed": False,
+                "reason": "TARGETED_VERIFY_RESERVE_EXHAUSTED",
+                "budget": _v573_scan_budget_status(),
+            }
 
     async with _PROVIDER_LOCK:
         now = _v572_epoch()
@@ -384,7 +425,11 @@ async def _v573_provider_gate(name: str, params: Optional[Dict[str, Any]]) -> Di
         if _SCAN_BUDGET.get("active"):
             _SCAN_BUDGET["used"] = int(_SCAN_BUDGET.get("used") or 0) + 1
 
-        return {"allowed": True, "budget": _v573_scan_budget_status()}
+        return {
+            "allowed": True,
+            "purpose": purpose,
+            "budget": _v573_scan_budget_status(),
+        }
 
 class ZylaClient:
     def __init__(self) -> None:
@@ -393,13 +438,20 @@ class ZylaClient:
     async def close(self) -> None:
         await self.client.aclose()
 
-    async def get(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get(
+        self,
+        name: str,
+        params: Optional[Dict[str, Any]] = None,
+        force_refresh: bool = False,
+        purpose: str = "normal",
+    ) -> Dict[str, Any]:
         if not ZYLA_API_KEY:
             return {"ok": False, "status": 0, "data": None, "error": "ZYLA_API_KEY missing"}
 
-        cached = _v573_cache_get(name, params)
-        if cached is not None:
-            return cached
+        if not force_refresh:
+            cached = _v573_cache_get(name, params)
+            if cached is not None:
+                return cached
 
         # V5.7.2 shared quota protection. The live guard itself is allowed
         # to make the recovery probe; deep endpoints are blocked in cooldown.
@@ -415,7 +467,7 @@ class ZylaClient:
                     "error": "RATE_LIMIT_COOLDOWN",
                     "rate_limit": rs,
                 }
-        gate = await _v573_provider_gate(name, params)
+        gate = await _v573_provider_gate(name, params, purpose=purpose)
         if not gate.get("allowed"):
             return {
                 "ok": False,
@@ -451,8 +503,17 @@ class ZylaClient:
         except Exception as e:
             return {"ok": False, "status": 0, "data": None, "error": repr(e)}
 
-    async def live(self) -> Dict[str, Any]:
-        return await self.get("live", {"sport_id": 1})
+    async def live(
+        self,
+        force_refresh: bool = False,
+        purpose: str = "normal",
+    ) -> Dict[str, Any]:
+        return await self.get(
+            "live",
+            {"sport_id": 1},
+            force_refresh=force_refresh,
+            purpose=purpose,
+        )
 
     async def details(self, match_id: str) -> Dict[str, Any]:
         return await self.get("details", {"match_id": match_id})
@@ -6123,7 +6184,7 @@ async def _v574_verify_match_id(match_id: str) -> Dict[str, Any]:
     try:
         for endpoint in ("details", "summary"):
             try:
-                r = await client.get(endpoint, {"match_id": match_id})
+                r = await client.get(endpoint, {"match_id": match_id}, purpose="targeted_verify")
             except Exception as e:
                 attempts.append({"endpoint": endpoint, "ok": False, "error": f"{type(e).__name__}: {str(e)[:160]}"})
                 continue
@@ -6354,21 +6415,41 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     _v55_save_history(scan_history)
 
     # ---------- Final broad refresh ----------
+    # V5.7.5 root-cause fix:
+    # reserve budget for this call and bypass the short live cache so the final
+    # snapshot is a real provider refresh, not a blocked/old pseudo-snapshot.
+    final_budget_before = _v573_scan_budget_status()
     final_client = ZylaClient()
     try:
-        final_r = await final_client.live()
+        final_r = await final_client.live(
+            force_refresh=True,
+            purpose="final_snapshot",
+        )
         final_matches = flatten_live(final_r.get("data"))
     finally:
         await final_client.close()
+    final_budget_after = _v573_scan_budget_status()
 
-    # V5.7.4b:
-    # A zero-sized second snapshot after a healthy first snapshot is treated as
-    # FINAL_SNAPSHOT_DEGRADED, not as proof that all matches disappeared.
-    final_snapshot_status = (
-        "FINAL_SNAPSHOT_DEGRADED"
-        if len(matches) > 0 and len(final_matches) == 0
-        else "FINAL_SNAPSHOT_OK"
-    )
+    final_http_status = int(final_r.get("status") or 0)
+    final_error = final_r.get("error")
+    final_cache_hit = bool(final_r.get("cache_hit", False))
+    final_payload_is_list = isinstance(final_r.get("data"), list)
+
+    if final_r.get("ok") and len(final_matches) > 0:
+        final_snapshot_status = "FINAL_SNAPSHOT_OK"
+    elif final_r.get("ok") and final_payload_is_list and len(matches) > 0 and len(final_matches) == 0:
+        final_snapshot_status = "FINAL_SNAPSHOT_DEGRADED_EMPTY_200"
+    elif final_error in {
+        "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+        "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
+        "SCAN_API_BUDGET_EXHAUSTED",
+    }:
+        final_snapshot_status = "FINAL_SNAPSHOT_GUARD_BLOCKED"
+    elif final_http_status == 429:
+        final_snapshot_status = "FINAL_SNAPSHOT_RATE_LIMITED"
+    else:
+        final_snapshot_status = "FINAL_SNAPSHOT_REQUEST_FAILED"
+
     targeted_final_verify = {"recovered": {}, "checked": []}
     targeted_checked_count = 0
 
@@ -6783,8 +6864,16 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "scan_memory_matches": len(new_state),
         "final_live_matches_found": len(final_matches),
         "FINAL_SNAPSHOT_STATUS": final_snapshot_status,
+        "FINAL_SNAPSHOT_HTTP": final_http_status,
+        "FINAL_SNAPSHOT_ERROR": final_error,
+        "FINAL_SNAPSHOT_CACHE_HIT": final_cache_hit,
+        "FINAL_SNAPSHOT_PAYLOAD_IS_LIST": final_payload_is_list,
+        "FINAL_SNAPSHOT_BUDGET_BEFORE": final_budget_before,
+        "FINAL_SNAPSHOT_BUDGET_AFTER": final_budget_after,
         "FINAL_MATCH_VERIFY": targeted_final_verify,
         "TARGETED_MATCH_VERIFY": targeted_final_verify.get("checked") or [],
+        "scan_budget_end": _v573_scan_budget_status(),
+        "calls_last_60s_end": len(_PROVIDER_CALL_TIMES),
 
         "stage1_top": [
             {
@@ -6850,6 +6939,8 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "cache_ttl_seconds": PROVIDER_CACHE_TTL,
         "live_cache_ttl_seconds": PROVIDER_LIVE_CACHE_TTL,
         "max_calls_per_scan": PROVIDER_MAX_CALLS_PER_SCAN,
+        "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+        "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "cache_entries": len(_PROVIDER_CACHE),
         "scan_budget": _v573_scan_budget_status(),
         "note": "Provider-side exhausted account quota cannot be bypassed; this layer removes duplicate/burst traffic.",
