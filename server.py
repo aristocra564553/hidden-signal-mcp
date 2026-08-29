@@ -2,7 +2,6 @@ import os
 import re
 import math
 import time
-import json
 import asyncio
 from typing import Any
 
@@ -11,11 +10,12 @@ from mcp.server import MCPServer
 
 
 # ============================================================
-# HIDDEN SIGNAL V2 — ZYLA ONLY
+# HIDDEN SIGNAL LIVE V2.2 — ZYLA ONLY
 # ============================================================
 
-ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
+VERSION = "V2.2-ZYLA"
 
+ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
 ZYLA_BASE_URL = (
     "https://zylalabs.com/api/12518/"
     "flashscore+-+live+api"
@@ -28,8 +28,6 @@ mcp = MCPServer("Hidden Signal Live")
 # SETTINGS
 # ============================================================
 
-VERSION = "V2.0-ZYLA"
-
 STRONG_SIGNAL_THRESHOLD = 75.0
 MEDIUM_SIGNAL_THRESHOLD = 62.0
 
@@ -38,11 +36,11 @@ DEFAULT_DEEP_LIMIT = 4
 MAX_PREFILTER_LIMIT = 14
 MAX_DEEP_LIMIT = 6
 
-LIVE_CACHE_TTL = 15
-STATS_CACHE_TTL = 25
-DETAILS_CACHE_TTL = 30
-SUMMARY_CACHE_TTL = 35
-ODDS_CACHE_TTL = 25
+LIVE_CACHE_TTL = 12
+STATS_CACHE_TTL = 22
+DETAILS_CACHE_TTL = 25
+SUMMARY_CACHE_TTL = 30
+ODDS_CACHE_TTL = 22
 
 REPEAT_SIGNAL_DELTA = 4.0
 
@@ -80,12 +78,12 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
 
     if isinstance(value, str):
-        m = re.search(r"-?\d+(?:[.,]\d+)?", value)
-        if not m:
+        match = re.search(r"-?\d+(?:[.,]\d+)?", value)
+        if not match:
             return default
 
         try:
-            return float(m.group(0).replace(",", "."))
+            return float(match.group(0).replace(",", "."))
         except Exception:
             return default
 
@@ -102,7 +100,6 @@ def normalize_key(value: Any) -> str:
 def walk(value: Any):
     if isinstance(value, dict):
         yield value
-
         for child in value.values():
             yield from walk(child)
 
@@ -114,7 +111,6 @@ def walk(value: Any):
 def unwrap(payload: Any):
     if isinstance(payload, dict) and "api_response" in payload:
         return payload.get("api_response")
-
     return payload
 
 
@@ -133,17 +129,17 @@ def parse_pair_string(value: Any) -> tuple[float, float] | None:
     if not isinstance(value, str):
         return None
 
-    m = re.search(
+    match = re.search(
         r"(-?\d+(?:[.,]\d+)?)\s*[:\-–—]\s*(-?\d+(?:[.,]\d+)?)",
         value,
     )
 
-    if not m:
+    if not match:
         return None
 
     return (
-        float(m.group(1).replace(",", ".")),
-        float(m.group(2).replace(",", ".")),
+        float(match.group(1).replace(",", ".")),
+        float(match.group(2).replace(",", ".")),
     )
 
 
@@ -170,7 +166,6 @@ def cache_set(key: str, value: Any, ttl: int):
 def http_status(payload: Any):
     if not isinstance(payload, dict):
         return None
-
     return payload.get("diagnostic", {}).get("http_status")
 
 
@@ -217,18 +212,14 @@ async def zyla_get(
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 url,
-                headers={
-                    "Authorization": f"Bearer {ZYLA_API_KEY}",
-                },
+                headers={"Authorization": f"Bearer {ZYLA_API_KEY}"},
                 params=params or {},
             )
 
         try:
             data = response.json()
         except Exception:
-            data = {
-                "raw_response": response.text,
-            }
+            data = {"raw_response": response.text}
 
         result = {
             "source": "zyla",
@@ -262,13 +253,13 @@ async def zyla_get(
         }
 
 
-async def zyla_live():
+async def zyla_live(use_cache: bool = True):
     return await zyla_get(
         23856,
         "get+live+matches",
         {"sport_id": 1},
-        cache_key="live",
-        cache_ttl=LIVE_CACHE_TTL,
+        cache_key="live" if use_cache else None,
+        cache_ttl=LIVE_CACHE_TTL if use_cache else 0,
     )
 
 
@@ -318,31 +309,31 @@ async def zyla_odds(match_id: str):
 
 @mcp.tool()
 async def get_zyla_live_matches():
-    """Get all live football matches from Zyla."""
-    return await zyla_live()
+    """Get all football matches currently live from Zyla."""
+    return await zyla_live(use_cache=False)
 
 
 @mcp.tool()
 async def get_zyla_match_details(match_id: str):
-    """Get Zyla details for one match."""
+    """Get Zyla match details."""
     return await zyla_details(match_id)
 
 
 @mcp.tool()
 async def get_zyla_match_stats(match_id: str):
-    """Get Zyla live statistics for one match."""
+    """Get Zyla live statistics including xG when available."""
     return await zyla_stats(match_id)
 
 
 @mcp.tool()
 async def get_zyla_match_summary(match_id: str):
-    """Get Zyla goals, cards, substitutions and match events."""
+    """Get goals, cards, substitutions and match events."""
     return await zyla_summary(match_id)
 
 
 @mcp.tool()
 async def get_zyla_match_odds(match_id: str):
-    """Get Zyla bookmaker odds for one match."""
+    """Get Zyla live bookmaker odds."""
     return await zyla_odds(match_id)
 
 
@@ -374,9 +365,9 @@ def parse_team_names(payload: Any) -> tuple[str, str]:
 
     for node in walk(payload):
         for key, value in node.items():
-            nk = normalize_key(key)
+            normalized = normalize_key(key)
 
-            if not home and nk in {
+            if not home and normalized in {
                 "home",
                 "home team",
                 "home team name",
@@ -386,7 +377,7 @@ def parse_team_names(payload: Any) -> tuple[str, str]:
             }:
                 home = extract_team_name(value)
 
-            if not away and nk in {
+            if not away and normalized in {
                 "away",
                 "away team",
                 "away team name",
@@ -400,7 +391,6 @@ def parse_team_names(payload: Any) -> tuple[str, str]:
 
 
 def parse_score(payload: Any) -> tuple[int, int]:
-    # Explicit home/away score keys.
     home = first_value_by_keys(
         payload,
         [
@@ -428,7 +418,6 @@ def parse_score(payload: Any) -> tuple[int, int]:
     if home is not None and away is not None:
         return int(safe_float(home)), int(safe_float(away))
 
-    # Score-like pair strings.
     for node in walk(payload):
         for key, value in node.items():
             if normalize_key(key) in {
@@ -525,7 +514,6 @@ def extract_live_candidates(payload: Any) -> list[dict]:
         score_home, score_away = parse_score(node)
         red_home, red_away = parse_live_red_cards(node)
 
-        # A real live match object should have at least teams or live state.
         if not (
             (home and away)
             or minute > 0
@@ -552,8 +540,19 @@ def extract_live_candidates(payload: Any) -> list[dict]:
     return results
 
 
+def find_live_candidate(
+    live_candidates: list[dict],
+    match_id: str,
+):
+    for candidate in live_candidates:
+        if str(candidate.get("match_id")) == str(match_id):
+            return candidate
+
+    return None
+
+
 # ============================================================
-# ROBUST ZYLA STAT PARSER V2.1
+# ROBUST ZYLA STAT PARSER V2.2
 # ============================================================
 
 LABEL_KEYS = (
@@ -602,15 +601,6 @@ AWAY_VALUE_KEYS = (
 
 
 def clean_stat_value(value: Any) -> float:
-    """
-    Convert Zyla values like:
-    0.32
-    "0.32"
-    "72%"
-    "14"
-    into floats.
-    """
-
     if value is None:
         return 0.0
 
@@ -623,8 +613,7 @@ def clean_stat_value(value: Any) -> float:
         if not text or text in ("-", "—", "N/A", "null"):
             return 0.0
 
-        text = text.replace("%", "")
-        text = text.replace(",", ".")
+        text = text.replace("%", "").replace(",", ".")
 
         match = re.search(r"-?\d+(?:\.\d+)?", text)
 
@@ -643,18 +632,11 @@ def label_matches(label: str, aliases: list[str]) -> bool:
     if not label:
         return False
 
-    aliases_normalized = [
-        normalize_key(alias)
-        for alias in aliases
-    ]
-
-    for alias in aliases_normalized:
+    for alias in [normalize_key(a) for a in aliases]:
         if label == alias:
             return True
-
         if alias in label:
             return True
-
         if label in alias:
             return True
 
@@ -664,34 +646,18 @@ def label_matches(label: str, aliases: list[str]) -> bool:
 def direct_pair_from_dict(
     node: dict,
 ) -> tuple[float, float] | None:
-    """
-    Main Zyla V2.1 format:
-
-    {
-        "name": "Expected goals (xG)",
-        "home_team": "0.32",
-        "away_team": "0.40"
-    }
-    """
-
     home_value = None
     away_value = None
 
     for key in HOME_VALUE_KEYS:
-        if key in node:
-            value = node.get(key)
-
-            if not isinstance(value, (dict, list)):
-                home_value = value
-                break
+        if key in node and not isinstance(node[key], (dict, list)):
+            home_value = node[key]
+            break
 
     for key in AWAY_VALUE_KEYS:
-        if key in node:
-            value = node.get(key)
-
-            if not isinstance(value, (dict, list)):
-                away_value = value
-                break
+        if key in node and not isinstance(node[key], (dict, list)):
+            away_value = node[key]
+            break
 
     if home_value is not None and away_value is not None:
         return (
@@ -699,13 +665,7 @@ def direct_pair_from_dict(
             clean_stat_value(away_value),
         )
 
-    # Some APIs wrap values inside another object.
-    for container_key in (
-        "value",
-        "values",
-        "data",
-        "stats",
-    ):
+    for container_key in ("value", "values", "data", "stats"):
         value = node.get(container_key)
 
         if isinstance(value, dict):
@@ -714,18 +674,15 @@ def direct_pair_from_dict(
 
             for key in HOME_VALUE_KEYS:
                 if key in value:
-                    nested_home = value.get(key)
+                    nested_home = value[key]
                     break
 
             for key in AWAY_VALUE_KEYS:
                 if key in value:
-                    nested_away = value.get(key)
+                    nested_away = value[key]
                     break
 
-            if (
-                nested_home is not None
-                and nested_away is not None
-            ):
+            if nested_home is not None and nested_away is not None:
                 return (
                     clean_stat_value(nested_home),
                     clean_stat_value(nested_away),
@@ -743,7 +700,6 @@ def direct_pair_from_dict(
 
         if isinstance(value, str):
             pair = parse_pair_string(value)
-
             if pair:
                 return pair
 
@@ -754,19 +710,7 @@ def find_metric_pair(
     payload: Any,
     aliases: list[str],
 ) -> tuple[float, float] | None:
-    """
-    Parse Zyla stats using several possible response layouts.
-    """
-
-    # ========================================================
-    # FORMAT 1
-    # {
-    #   "name": "Total shots",
-    #   "home_team": "6",
-    #   "away_team": "9"
-    # }
-    # ========================================================
-
+    # Format 1: {"name": "...", "home_team": "...", "away_team": "..."}
     for node in walk(payload):
         if not isinstance(node, dict):
             continue
@@ -780,20 +724,10 @@ def find_metric_pair(
 
         if label and label_matches(label, aliases):
             pair = direct_pair_from_dict(node)
-
             if pair is not None:
                 return pair
 
-    # ========================================================
-    # FORMAT 2
-    # {
-    #   "Total shots": {
-    #       "home_team": 6,
-    #       "away_team": 9
-    #   }
-    # }
-    # ========================================================
-
+    # Format 2: {"Total shots": {"home_team": 6, "away_team": 9}}
     for node in walk(payload):
         if not isinstance(node, dict):
             continue
@@ -804,7 +738,6 @@ def find_metric_pair(
 
             if isinstance(value, dict):
                 pair = direct_pair_from_dict(value)
-
                 if pair is not None:
                     return pair
 
@@ -820,7 +753,6 @@ def find_metric_pair(
 
             if isinstance(value, str):
                 pair = parse_pair_string(value)
-
                 if pair:
                     return pair
 
@@ -831,16 +763,14 @@ def metric(
     payload: Any,
     aliases: list[str],
 ) -> tuple[float, float]:
-    pair = find_metric_pair(
-        payload,
-        aliases,
-    )
+    pair = find_metric_pair(payload, aliases)
+    return pair if pair is not None else (0.0, 0.0)
 
-    if pair is None:
-        return (0.0, 0.0)
 
-    return pair
-def parse_red_cards(stats_raw: Any, summary_raw: Any) -> tuple[int, int]:
+def parse_red_cards(
+    stats_raw: Any,
+    summary_raw: Any,
+) -> tuple[int, int]:
     pair = find_metric_pair(
         stats_raw,
         ["red cards", "red card", "reds"],
@@ -859,6 +789,10 @@ def parse_red_cards(stats_raw: Any, summary_raw: Any) -> tuple[int, int]:
 
     return 0, 0
 
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
 
 def normalize_match(
     live_candidate: dict | None,
@@ -880,21 +814,29 @@ def normalize_match(
         "summary": summary_raw,
     }
 
-    # Live list is authoritative fallback for identity, minute and score.
-    detail_home, detail_away = parse_team_names(combined)
+    details_home, details_away = parse_team_names(combined)
 
-    home = live_candidate.get("home") or detail_home
-    away = live_candidate.get("away") or detail_away
+    home = live_candidate.get("home") or details_home
+    away = live_candidate.get("away") or details_away
 
-    score_home = int(live_candidate.get("score_home", 0))
-    score_away = int(live_candidate.get("score_away", 0))
+    # Live list is authoritative for current score/minute when available.
+    live_score = (
+        int(live_candidate.get("score_home", 0)),
+        int(live_candidate.get("score_away", 0)),
+    )
 
-    detail_score = parse_score(combined)
+    details_score = parse_score(combined)
 
-    if score_home == 0 and score_away == 0 and detail_score != (0, 0):
-        score_home, score_away = detail_score
+    if live_candidate:
+        score_home, score_away = live_score
+    else:
+        score_home, score_away = details_score
 
-    minute = int(live_candidate.get("minute", 0)) or parse_minute(combined)
+    minute = (
+        int(live_candidate.get("minute", 0))
+        if live_candidate
+        else 0
+    ) or parse_minute(combined)
 
     xg = metric(
         stats_raw,
@@ -906,12 +848,12 @@ def normalize_match(
         ["shots", "total shots", "shots total", "total attempts"],
     )
 
-    sot = metric(
+    shots_on_target = metric(
         stats_raw,
         ["shots on target", "shots on goal", "on target"],
     )
 
-    box_shots = metric(
+    shots_in_box = metric(
         stats_raw,
         [
             "shots inside box",
@@ -921,7 +863,7 @@ def normalize_match(
         ],
     )
 
-    touches_box = metric(
+    touches_in_box = metric(
         stats_raw,
         [
             "touches in opposition box",
@@ -951,22 +893,34 @@ def normalize_match(
         ["fouls", "fouls committed"],
     )
 
-    red_home, red_away = parse_red_cards(stats_raw, summary_raw)
+    red_home, red_away = parse_red_cards(
+        stats_raw,
+        summary_raw,
+    )
 
-    if red_home == 0 and red_away == 0:
+    if red_home == 0 and red_away == 0 and live_candidate:
         red_home = int(live_candidate.get("red_home", 0))
         red_away = int(live_candidate.get("red_away", 0))
 
     core_total = (
         xg[0] + xg[1]
         + shots[0] + shots[1]
-        + sot[0] + sot[1]
-        + touches_box[0] + touches_box[1]
+        + shots_on_target[0] + shots_on_target[1]
+        + touches_in_box[0] + touches_in_box[1]
         + corners[0] + corners[1]
     )
 
     stats_have_data = response_nonempty(stats_payload)
-    parser_ok = not (stats_have_data and core_total == 0)
+
+    parser_ok = not (
+        stats_have_data
+        and core_total == 0
+    )
+
+    score_conflict = (
+        bool(live_candidate)
+        and details_score != live_score
+    )
 
     return {
         "home": home,
@@ -976,6 +930,18 @@ def normalize_match(
             "home": score_home,
             "away": score_away,
             "total": score_home + score_away,
+        },
+        "score_sync": {
+            "ok": not score_conflict,
+            "conflict": score_conflict,
+            "live_score": {
+                "home": live_score[0],
+                "away": live_score[1],
+            } if live_candidate else None,
+            "details_score": {
+                "home": details_score[0],
+                "away": details_score[1],
+            },
         },
         "xg": {
             "home": xg[0],
@@ -988,19 +954,19 @@ def normalize_match(
             "total": shots[0] + shots[1],
         },
         "shots_on_target": {
-            "home": sot[0],
-            "away": sot[1],
-            "total": sot[0] + sot[1],
+            "home": shots_on_target[0],
+            "away": shots_on_target[1],
+            "total": shots_on_target[0] + shots_on_target[1],
         },
         "shots_in_box": {
-            "home": box_shots[0],
-            "away": box_shots[1],
-            "total": box_shots[0] + box_shots[1],
+            "home": shots_in_box[0],
+            "away": shots_in_box[1],
+            "total": shots_in_box[0] + shots_in_box[1],
         },
         "touches_in_box": {
-            "home": touches_box[0],
-            "away": touches_box[1],
-            "total": touches_box[0] + touches_box[1],
+            "home": touches_in_box[0],
+            "away": touches_in_box[1],
+            "total": touches_in_box[0] + touches_in_box[1],
         },
         "corners": {
             "home": corners[0],
@@ -1053,8 +1019,10 @@ def parse_odds_snapshot(payload: Any) -> dict:
         )
 
         if isinstance(name, str) and len(name) <= 80:
+            lower = name.lower()
+
             if any(
-                token in name.lower()
+                token in lower
                 for token in (
                     "bet",
                     "1xbet",
@@ -1088,7 +1056,7 @@ def parse_odds_snapshot(payload: Any) -> dict:
 
 
 # ============================================================
-# MODEL
+# HEURISTIC MODEL
 # ============================================================
 
 def build_pressure(metrics: dict) -> dict:
@@ -1157,9 +1125,9 @@ def logistic(value: float) -> float:
 
 
 def probability_goal_next_5(metrics: dict, pressure: dict) -> float:
-    p = pressure["score_0_100"] / 100
+    pressure_factor = pressure["score_0_100"] / 100
 
-    logit = -2.05 + 2.35 * p
+    logit = -2.05 + 2.35 * pressure_factor
 
     minute = metrics["minute"]
 
@@ -1179,7 +1147,10 @@ def probability_goal_next_5(metrics: dict, pressure: dict) -> float:
     return clamp(logistic(logit) * 100, 5, 92)
 
 
-def probability_from_interval(p5: float, minutes: float) -> float:
+def probability_from_interval(
+    p5: float,
+    minutes: float,
+) -> float:
     p5 = clamp(p5 / 100, 0.001, 0.95)
     intervals = max(minutes / 5, 0)
 
@@ -1269,7 +1240,7 @@ def result_probabilities(metrics: dict) -> dict:
 
 
 def build_signals(metrics: dict) -> list[dict]:
-    # Safety rule: never score broken normalized data.
+    # Fail closed if parser is bad.
     if not metrics["parser_ok"]:
         return []
 
@@ -1339,8 +1310,9 @@ def build_signals(metrics: dict) -> list[dict]:
             )
         )
 
+    # This is an "another goal" line: current total + 0.5.
     if SIGNALS["over_under"] and minute < 90:
-        over_line = total_goals + 0.5
+        line = total_goals + 0.5
         p_over = probability_from_interval(
             p5,
             max(1, 90 - minute),
@@ -1350,7 +1322,7 @@ def build_signals(metrics: dict) -> list[dict]:
         signals.append(
             make_signal(
                 "OVER_UNDER",
-                f"Over {over_line:.1f}",
+                f"Over {line:.1f}",
                 p_over,
                 common,
             )
@@ -1359,10 +1331,10 @@ def build_signals(metrics: dict) -> list[dict]:
         signals.append(
             make_signal(
                 "OVER_UNDER",
-                f"Under {over_line:.1f}",
+                f"Under {line:.1f}",
                 p_under,
                 [
-                    f"current score total {total_goals}",
+                    f"current total {total_goals}",
                     f"minute {minute}",
                     f"another-goal estimate {p_over:.1f}%",
                 ],
@@ -1422,9 +1394,8 @@ def build_signals(metrics: dict) -> list[dict]:
         home_scored = metrics["score"]["home"] > 0
         away_scored = metrics["score"]["away"] > 0
 
-        if home_scored and away_scored:
-            p_btts = 100.0
-        else:
+        # Do not emit a settled BTTS market as a new signal.
+        if not (home_scored and away_scored):
             remaining = max(1, 90 - minute)
             p_any = probability_from_interval(p5, remaining)
 
@@ -1449,19 +1420,19 @@ def build_signals(metrics: dict) -> list[dict]:
                     88,
                 )
 
-        signals.append(
-            make_signal(
-                "BTTS",
-                "Both teams to score - YES",
-                p_btts,
-                [
-                    f"score {metrics['score']['home']}-{metrics['score']['away']}",
-                    f"home attack {home_attack * 100:.0f}/100",
-                    f"away attack {away_attack * 100:.0f}/100",
-                    f"xG {metrics['xg']['home']:.2f}-{metrics['xg']['away']:.2f}",
-                ],
+            signals.append(
+                make_signal(
+                    "BTTS",
+                    "Both teams to score - YES",
+                    p_btts,
+                    [
+                        f"score {metrics['score']['home']}-{metrics['score']['away']}",
+                        f"home attack {home_attack * 100:.0f}/100",
+                        f"away attack {away_attack * 100:.0f}/100",
+                        f"xG {metrics['xg']['home']:.2f}-{metrics['xg']['away']:.2f}",
+                    ],
+                )
             )
-        )
 
     if SIGNALS["match_result"]:
         rp = result_probabilities(metrics)
@@ -1512,7 +1483,10 @@ def build_signals(metrics: dict) -> list[dict]:
     return signals
 
 
-def apply_repeat_guard(match_id: str, signals: list[dict]):
+def apply_repeat_guard(
+    match_id: str,
+    signals: list[dict],
+):
     state = _LAST_SIGNAL_STATE.setdefault(match_id, {})
     output = []
 
@@ -1537,97 +1511,86 @@ def apply_repeat_guard(match_id: str, signals: list[dict]):
     return output
 
 
+def downgrade_for_score_conflict(
+    signals: list[dict],
+) -> list[dict]:
+    guarded = []
+
+    for signal in signals:
+        signal = dict(signal)
+
+        if signal.get("decision") == "ENTER":
+            signal["decision"] = "WAIT"
+            signal["signal"] = "🟡"
+            signal["risk"] = "high"
+
+            reasons = list(signal.get("reasons", []))
+            reasons.append(
+                "score conflict between fresh live list and match details"
+            )
+            signal["reasons"] = reasons[:5]
+
+        guarded.append(signal)
+
+    return guarded
+
+
 # ============================================================
-# MATCH LOOKUP
+# MATCH ANALYSIS
 # ============================================================
-
-def find_live_candidate(
-    live_candidates: list[dict],
-    match_id: str,
-):
-    for candidate in live_candidates:
-        if str(candidate.get("match_id")) == str(match_id):
-            return candidate
-
-    return None
-
 
 async def analyze_match_internal(
     match_id: str,
     live_candidate: dict | None = None,
+    refresh_live: bool = True,
     include_details: bool = True,
     include_summary: bool = True,
     include_odds: bool = True,
 ):
-    # Всегда берём СВЕЖИЙ live-list без кэша.
-    fresh_live = await zyla_get(
-        23856,
-        "get+live+matches",
-        {"sport_id": 1},
-        cache_key=None,
-        cache_ttl=0,
-    )
+    fresh_live = None
 
-    fresh_candidates = extract_live_candidates(fresh_live)
+    # Direct single-match analysis must refresh score from live list.
+    if refresh_live:
+        fresh_live = await zyla_live(use_cache=False)
+        candidates = extract_live_candidates(fresh_live)
 
-    fresh_candidate = find_live_candidate(
-        fresh_candidates,
-        match_id,
-    )
+        fresh_candidate = find_live_candidate(
+            candidates,
+            match_id,
+        )
 
-    # Свежий live имеет приоритет.
-    if fresh_candidate is not None:
-        live_candidate = fresh_candidate
+        if fresh_candidate is not None:
+            live_candidate = fresh_candidate
+
+    elif live_candidate is None:
+        cached_live = await zyla_live(use_cache=True)
+        candidates = extract_live_candidates(cached_live)
+        live_candidate = find_live_candidate(candidates, match_id)
 
     tasks = [
         zyla_stats(match_id),
     ]
-
-    task_names = ["stats"]
+    names = ["stats"]
 
     if include_details:
         tasks.append(zyla_details(match_id))
-        task_names.append("details")
+        names.append("details")
 
     if include_summary:
         tasks.append(zyla_summary(match_id))
-        task_names.append("summary")
+        names.append("summary")
 
     if include_odds:
         tasks.append(zyla_odds(match_id))
-        task_names.append("odds")
+        names.append("odds")
 
     results = await asyncio.gather(*tasks)
-
-    mapped = dict(zip(task_names, results))
+    mapped = dict(zip(names, results))
 
     stats = mapped.get("stats", {})
     details = mapped.get("details", {})
     summary = mapped.get("summary", {})
     odds = mapped.get("odds", {})
-
-    # Проверяем конфликт счёта.
-    live_score = None
-    details_score = None
-    score_conflict = False
-
-    if live_candidate is not None:
-        live_score = (
-            int(live_candidate.get("score_home", 0)),
-            int(live_candidate.get("score_away", 0)),
-        )
-
-    if details:
-        details_score = parse_score(
-            unwrap(details)
-        )
-
-    if (
-        live_score is not None
-        and details_score is not None
-        and live_score != details_score
-    ):
-        score_conflict = True
 
     normalized = normalize_match(
         live_candidate,
@@ -1648,26 +1611,8 @@ async def analyze_match_internal(
         build_signals(normalized),
     )
 
-    # Если endpoints расходятся по счёту,
-    # никаких ENTER не разрешаем.
-    if score_conflict:
-        guarded_signals = []
-
-        for signal in signals:
-            signal = dict(signal)
-
-            if signal.get("decision") == "ENTER":
-                signal["decision"] = "WAIT"
-                signal["signal"] = "🟡"
-                signal["risk"] = "high"
-                signal["reasons"] = (
-                    signal.get("reasons", [])
-                    + ["score conflict between live list and match details"]
-                )[:5]
-
-            guarded_signals.append(signal)
-
-        signals = guarded_signals
+    if normalized["score_sync"]["conflict"]:
+        signals = downgrade_for_score_conflict(signals)
 
     strong = [
         item
@@ -1677,39 +1622,18 @@ async def analyze_match_internal(
     ]
 
     return {
+        "source": "hidden-signal-v2.2",
+        "version": VERSION,
         "match_id": match_id,
-
         "match": {
             "home": normalized["home"],
             "away": normalized["away"],
             "minute": normalized["minute"],
             "score": normalized["score"],
         },
-
-        "score_sync": {
-            "ok": not score_conflict,
-            "live_score": (
-                {
-                    "home": live_score[0],
-                    "away": live_score[1],
-                }
-                if live_score is not None
-                else None
-            ),
-            "details_score": (
-                {
-                    "home": details_score[0],
-                    "away": details_score[1],
-                }
-                if details_score is not None
-                else None
-            ),
-            "conflict": score_conflict,
-        },
-
         "parser_ok": normalized["parser_ok"],
         "parser_warning": normalized["parser_warning"],
-
+        "score_sync": normalized["score_sync"],
         "metrics": {
             "xg": normalized["xg"],
             "shots": normalized["shots"],
@@ -1720,48 +1644,33 @@ async def analyze_match_internal(
             "possession": normalized["possession"],
             "red_cards": normalized["red_cards"],
         },
-
         "pressure": pressure,
-
-        "odds_snapshot": parse_odds_snapshot(
-            odds
-        ),
-
-        "top_candidate": (
-            signals[0]
-            if signals
-            else None
-        ),
-
+        "odds_snapshot": parse_odds_snapshot(odds),
+        "top_candidate": signals[0] if signals else None,
+        "top_3_signals": signals[:3],
         "strong_signals": strong,
         "all_signals": signals,
-
         "diagnostic": {
-            "live_http": http_status(fresh_live),
+            "fresh_live_http": http_status(fresh_live) if fresh_live else None,
             "stats_http": http_status(stats),
-            "details_http": (
-                http_status(details)
-                if details
-                else None
-            ),
-            "summary_http": (
-                http_status(summary)
-                if summary
-                else None
-            ),
-            "odds_http": (
-                http_status(odds)
-                if odds
-                else None
-            ),
+            "details_http": http_status(details) if details else None,
+            "summary_http": http_status(summary) if summary else None,
+            "odds_http": http_status(odds) if odds else None,
         },
     }
+
+
+@mcp.tool()
 async def analyze_zyla_match(match_id: str):
     """
-    Analyze one Zyla live match with normalized stats, events, odds and signals.
+    Full Hidden Signal analysis of one Zyla live match.
+
+    Always refreshes the live score first, normalizes statistics,
+    checks score synchronization, and returns Top-3 signals.
     """
     return await analyze_match_internal(
         match_id,
+        refresh_live=True,
         include_details=True,
         include_summary=True,
         include_odds=True,
@@ -1774,6 +1683,7 @@ async def analyze_zyla_match(match_id: str):
 
 def live_prefilter_score(candidate: dict) -> float:
     minute = candidate.get("minute", 0)
+
     total_goals = (
         candidate.get("score_home", 0)
         + candidate.get("score_away", 0)
@@ -1810,12 +1720,12 @@ async def scan_zyla_live(
     deep_limit: int = DEFAULT_DEEP_LIMIT,
 ):
     """
-    Efficient Zyla-only Hidden Signal scanner.
+    Efficient Zyla-only live scanner.
 
-    1 live request.
-    Stats only for prefiltered candidates.
-    Details + events + odds only for the strongest deep candidates.
-    Returns compact JSON only.
+    1) One fresh live-list request.
+    2) Stats for prefiltered matches.
+    3) Details + events + odds only for best deep candidates.
+    4) Compact output with Top-5 and all strong 75%+ signals.
     """
 
     prefilter_limit = int(
@@ -1834,12 +1744,12 @@ async def scan_zyla_live(
         )
     )
 
-    live = await zyla_live()
+    live = await zyla_live(use_cache=False)
     live_http = http_status(live)
 
     if live_http != 200:
         return {
-            "source": "hidden-signal-v2",
+            "source": "hidden-signal-v2.2",
             "version": VERSION,
             "status": "ZYLA_ERROR",
             "live_http_status": live_http,
@@ -1848,19 +1758,19 @@ async def scan_zyla_live(
             "cheap_analyzed": 0,
             "fully_analyzed": 0,
             "parser_failures": 0,
+            "score_conflicts": 0,
             "strong_signals": [],
             "top_candidates": [],
-            "api_call_estimate": 1,
+            "estimated_api_calls_this_scan": 1,
             "error": unwrap(live),
         }
 
     candidates = extract_live_candidates(live)
-
     total_live = len(candidates)
 
     if not candidates:
         return {
-            "source": "hidden-signal-v2",
+            "source": "hidden-signal-v2.2",
             "version": VERSION,
             "status": "NO_LIVE_MATCHES_OR_PARSE_FAILED",
             "live_http_status": 200,
@@ -1869,9 +1779,10 @@ async def scan_zyla_live(
             "cheap_analyzed": 0,
             "fully_analyzed": 0,
             "parser_failures": 0,
+            "score_conflicts": 0,
             "strong_signals": [],
             "top_candidates": [],
-            "api_call_estimate": 1,
+            "estimated_api_calls_this_scan": 1,
         }
 
     candidates.sort(
@@ -1881,14 +1792,15 @@ async def scan_zyla_live(
 
     selected = candidates[:prefilter_limit]
 
-    sem = asyncio.Semaphore(3)
+    semaphore = asyncio.Semaphore(3)
 
     async def cheap(candidate):
-        async with sem:
+        async with semaphore:
             try:
                 return await analyze_match_internal(
                     candidate["match_id"],
                     live_candidate=candidate,
+                    refresh_live=False,
                     include_details=False,
                     include_summary=False,
                     include_odds=False,
@@ -1931,7 +1843,7 @@ async def scan_zyla_live(
     deep_seed = valid[:deep_limit]
 
     async def deep(item):
-        async with sem:
+        async with semaphore:
             candidate = find_live_candidate(
                 selected,
                 item["match_id"],
@@ -1941,6 +1853,7 @@ async def scan_zyla_live(
                 return await analyze_match_internal(
                     item["match_id"],
                     live_candidate=candidate,
+                    refresh_live=False,
                     include_details=True,
                     include_summary=True,
                     include_odds=True,
@@ -1988,6 +1901,10 @@ async def scan_zyla_live(
                 "away": match.get("away"),
                 "minute": match.get("minute"),
                 "score": match.get("score"),
+                "score_sync_ok": (
+                    analysis.get("score_sync", {})
+                    .get("ok")
+                ),
                 "market": top.get("market"),
                 "selection": top.get("selection"),
                 "probability": top.get("probability"),
@@ -2002,6 +1919,10 @@ async def scan_zyla_live(
                 "away": match.get("away"),
                 "minute": match.get("minute"),
                 "score": match.get("score"),
+                "score_sync_ok": (
+                    analysis.get("score_sync", {})
+                    .get("ok")
+                ),
                 "market": signal.get("market"),
                 "selection": signal.get("selection"),
                 "probability": signal.get("probability"),
@@ -2027,7 +1948,15 @@ async def scan_zyla_live(
         and not item.get("error")
     )
 
-    # 1 live + N stats + deep*(details+summary+odds)
+    score_conflicts = sum(
+        1
+        for item in deep_results
+        if isinstance(item, dict)
+        and item.get("score_sync", {}).get("conflict") is True
+    )
+
+    # 1 live list + one stats call per selected match
+    # + details/summary/odds for fully analyzed deep matches.
     api_estimate = (
         1
         + len(selected)
@@ -2035,7 +1964,7 @@ async def scan_zyla_live(
     )
 
     return {
-        "source": "hidden-signal-v2",
+        "source": "hidden-signal-v2.2",
         "version": VERSION,
         "status": "OK",
         "live_http_status": 200,
@@ -2044,33 +1973,37 @@ async def scan_zyla_live(
         "cheap_analyzed": len(valid),
         "fully_analyzed": fully_analyzed,
         "parser_failures": parser_failures,
+        "score_conflicts": score_conflicts,
         "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
         "strong_signals": strong_signals,
         "top_candidates": top_candidates[:5],
-        "api_call_estimate": api_estimate,
+        "estimated_api_calls_this_scan": api_estimate,
         "note": (
-            "Cache hits can make actual API usage lower. "
-            "Matches with parser failure are excluded from signals."
+            "Score conflicts are automatically downgraded to WAIT. "
+            "Parser failures are excluded from signals."
         ),
     }
 
 
 # ============================================================
-# PARSER DIAGNOSTIC
+# DEBUG
 # ============================================================
 
 @mcp.tool()
 async def debug_zyla_parser(match_id: str):
     """
-    Debug one match parser without exposing the API key.
-    Shows normalized values and limited raw structure hints.
+    Debug parser and score synchronization for one match.
+    Does not expose the API key.
     """
-    live = await zyla_live()
+
+    live = await zyla_live(use_cache=False)
     candidates = extract_live_candidates(live)
     candidate = find_live_candidate(candidates, match_id)
 
-    stats = await zyla_stats(match_id)
-    details = await zyla_details(match_id)
+    stats, details = await asyncio.gather(
+        zyla_stats(match_id),
+        zyla_details(match_id),
+    )
 
     normalized = normalize_match(
         candidate,
@@ -2081,8 +2014,6 @@ async def debug_zyla_parser(match_id: str):
     )
 
     raw_stats = unwrap(stats)
-
-    # Limited structure sample: first labelled objects, no giant payload.
     samples = []
 
     for node in walk(raw_stats):
@@ -2092,8 +2023,8 @@ async def debug_zyla_parser(match_id: str):
         label = None
 
         for key in LABEL_KEYS:
-            if key in node and isinstance(node[key], str):
-                label = node[key]
+            if key in node and isinstance(node.get(key), str):
+                label = node.get(key)
                 break
 
         if label:
@@ -2103,10 +2034,12 @@ async def debug_zyla_parser(match_id: str):
             })
 
     return {
+        "version": VERSION,
         "match_id": match_id,
         "live_candidate": candidate,
         "parser_ok": normalized["parser_ok"],
         "parser_warning": normalized["parser_warning"],
+        "score_sync": normalized["score_sync"],
         "normalized": {
             "score": normalized["score"],
             "minute": normalized["minute"],
@@ -2131,7 +2064,7 @@ async def debug_zyla_parser(match_id: str):
 
 @mcp.tool()
 async def hidden_signal_status():
-    """Check Hidden Signal V2 configuration."""
+    """Check Hidden Signal V2.2 status and configuration."""
 
     return {
         "service": "Hidden Signal Live",
@@ -2156,15 +2089,14 @@ async def hidden_signal_status():
         },
         "safety": {
             "parser_fail_closed": True,
-            "meaning": (
-                "If Zyla returns stats but the parser cannot normalize them, "
-                "the match is excluded instead of producing a false signal."
-            ),
+            "score_conflict_blocks_enter": True,
+            "fresh_score_before_direct_analysis": True,
         },
-        "model_type": "heuristic-v2-not-calibrated",
+        "model_type": "heuristic-v2.2-not-calibrated",
         "note": (
-            "Percentages are heuristic ranking estimates until calibrated "
-            "against a sufficiently large history of real outcomes."
+            "Signal percentages are heuristic ranking estimates. "
+            "They should be calibrated on real historical outcomes "
+            "before being treated as statistical probabilities."
         ),
     }
 
