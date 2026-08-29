@@ -347,7 +347,94 @@ async def get_live_odds(fixture_id: int):
         },
     )
 
+# ==================================================
+# HIDDEN SIGNAL - ZYLA MATCH ANALYZER
+# ==================================================
 
+def _dedupe_zyla(value):
+    """
+    Remove exact duplicate items from Zyla responses.
+    Works recursively with dictionaries and lists.
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: _dedupe_zyla(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, list):
+        cleaned = []
+        seen = set()
+
+        for item in value:
+            item = _dedupe_zyla(item)
+
+            try:
+                marker = repr(item)
+            except Exception:
+                marker = str(item)
+
+            if marker not in seen:
+                seen.add(marker)
+                cleaned.append(item)
+
+        return cleaned
+
+    return value
+
+
+@mcp.tool()
+async def analyze_zyla_match(match_id: str):
+    """
+    Collect all available live data for one Zyla match:
+    details, statistics, events and live odds.
+
+    Returns one cleaned data package for Hidden Signal analysis.
+    """
+
+    details = await zyla_get(
+        23859,
+        "get+match+details",
+        {
+            "match_id": match_id,
+        },
+    )
+
+    stats = await zyla_get(
+        23861,
+        "get+match+stats",
+        {
+            "match_id": match_id,
+        },
+    )
+
+    summary = await zyla_get(
+        23860,
+        "get+match+summary",
+        {
+            "match_id": match_id,
+        },
+    )
+
+    odds = await zyla_get(
+        23865,
+        "get+match+odds",
+        {
+            "match_id": match_id,
+        },
+    )
+
+    package = {
+        "source": "hidden-signal-zyla",
+        "match_id": match_id,
+        "details": details,
+        "statistics": stats,
+        "events": summary,
+        "odds": odds,
+    }
+
+    return _dedupe_zyla(package)
 # =========================
 # START SERVER
 # =========================
