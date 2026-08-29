@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5a-PERSISTENCE-EMPTY-FEED-GUARD"
-MODEL_TYPE = "heuristic-v5.7.5a-persistence-empty-feed-guard-not-calibrated"
+VERSION = "V5.7.5b-ATOMIC-BUDGET-GUARD"
+MODEL_TYPE = "heuristic-v5.7.5b-atomic-budget-priority-analysis-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -379,33 +379,9 @@ async def _v573_provider_gate(
     if rs.get("active"):
         return {"allowed": False, "reason": "RATE_LIMIT_COOLDOWN", "rate_limit": rs}
 
-    if _SCAN_BUDGET.get("active"):
-        used = int(_SCAN_BUDGET.get("used") or 0)
-        limit = int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN)
-        final_reserve = max(0, int(PROVIDER_FINAL_SNAPSHOT_RESERVE))
-        targeted_reserve = max(0, int(PROVIDER_TARGETED_VERIFY_RESERVE))
-        normal_ceiling = max(0, limit - final_reserve - targeted_reserve)
-        final_ceiling = max(0, limit - targeted_reserve)
-
-        if purpose == "normal" and used >= normal_ceiling:
-            return {
-                "allowed": False,
-                "reason": "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
-                "budget": _v573_scan_budget_status(),
-            }
-        if purpose == "final_snapshot" and used >= final_ceiling:
-            return {
-                "allowed": False,
-                "reason": "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
-                "budget": _v573_scan_budget_status(),
-            }
-        if purpose == "targeted_verify" and used >= limit:
-            return {
-                "allowed": False,
-                "reason": "TARGETED_VERIFY_RESERVE_EXHAUSTED",
-                "budget": _v573_scan_budget_status(),
-            }
-
+    # V5.7.5b: admission, budget reservation, rolling-minute rate check and
+    # request spacing are serialized under one lock. No coroutine can observe
+    # an old `used` value and then increment after another coroutine has spent it.
     async with _PROVIDER_LOCK:
         now = _v572_epoch()
         _v573_trim_calls(now)
@@ -420,11 +396,39 @@ async def _v573_provider_gate(
                 "limit_per_minute": PROVIDER_MAX_CALLS_PER_MINUTE,
             }
 
+        if _SCAN_BUDGET.get("active"):
+            used = int(_SCAN_BUDGET.get("used") or 0)
+            limit = int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN)
+            final_reserve = max(0, int(PROVIDER_FINAL_SNAPSHOT_RESERVE))
+            targeted_reserve = max(0, int(PROVIDER_TARGETED_VERIFY_RESERVE))
+            normal_ceiling = max(0, limit - final_reserve - targeted_reserve)
+            final_ceiling = max(0, limit - targeted_reserve)
+
+            if purpose == "normal" and used >= normal_ceiling:
+                return {
+                    "allowed": False,
+                    "reason": "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+                    "budget": _v573_scan_budget_status(),
+                }
+            if purpose == "final_snapshot" and used >= final_ceiling:
+                return {
+                    "allowed": False,
+                    "reason": "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
+                    "budget": _v573_scan_budget_status(),
+                }
+            if purpose == "targeted_verify" and used >= limit:
+                return {
+                    "allowed": False,
+                    "reason": "TARGETED_VERIFY_RESERVE_EXHAUSTED",
+                    "budget": _v573_scan_budget_status(),
+                }
+
         gap = now - _PROVIDER_LAST_CALL_AT
         if gap < PROVIDER_MIN_GAP:
             await asyncio.sleep(PROVIDER_MIN_GAP - gap)
             now = _v572_epoch()
 
+        # Atomic reservation happens BEFORE releasing the lock.
         _PROVIDER_LAST_CALL_AT = now
         _PROVIDER_CALL_TIMES.append(now)
         if _SCAN_BUDGET.get("active"):
@@ -435,6 +439,7 @@ async def _v573_provider_gate(
             "purpose": purpose,
             "budget": _v573_scan_budget_status(),
         }
+
 
 class ZylaClient:
     def __init__(self) -> None:
@@ -1661,6 +1666,42 @@ def historical_confirmation(home_hist: Dict[str, Any], away_hist: Dict[str, Any]
 # Match analyzer
 # -------------------------
 
+def _v575b_not_requested(reason: str = "NOT_REQUESTED_BY_PRIORITY") -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "status": 0,
+        "data": None,
+        "error": reason,
+        "cache_hit": False,
+    }
+
+
+def _v575b_real_call_count(*responses: Dict[str, Any]) -> int:
+    """
+    Diagnostic only: count requests that appear to have reached provider.
+    Cached responses and locally blocked requests do not count.
+    """
+    total = 0
+    for r in responses:
+        if not isinstance(r, dict):
+            continue
+        if r.get("cache_hit"):
+            continue
+        if r.get("quota_guard"):
+            continue
+        status = int(r.get("status") or 0)
+        if status > 0:
+            total += 1
+    return total
+
+
+def _v575b_normal_budget_remaining() -> int:
+    st = _v573_scan_budget_status()
+    used = int(st.get("used") or 0)
+    ceiling = int(st.get("normal_call_ceiling") or 0)
+    return max(0, ceiling - used)
+
+
 async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     client = ZylaClient()
     api_calls = 0
@@ -1702,34 +1743,134 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                 "reason": "Live minute failed sanity validation; analysis blocked fail-closed.",
             }
 
-        # Parallel deep fetch
-        details_r, summary_r, stats_r, lineups_r, player_r, odds_r, h2h_r = await asyncio.gather(
-            client.details(match_id),
-            client.summary(match_id),
-            client.stats(match_id),
-            client.lineups(match_id),
-            client.player_stats(match_id),
-            client.odds(match_id),
-            client.h2h(match_id),
-        )
-        api_calls += 7
+        # V5.7.5b PRIORITY ANALYSIS
+        # Tier 1: fetch only live stats for every selected match. This is the
+        # main signal-producing endpoint and lets the scan cover more matches
+        # without spending 7 requests on weak candidates.
+        details_r = _v575b_not_requested()
+        summary_r = _v575b_not_requested()
+        lineups_r = _v575b_not_requested()
+        player_r = _v575b_not_requested()
+        odds_r = _v575b_not_requested()
+        h2h_r = _v575b_not_requested()
+
+        stats_r = await client.stats(match_id)
+        api_calls += _v575b_real_call_count(stats_r)
+
+        # If the core stats request was locally blocked because the normal
+        # budget is reserved for final guards, stop cleanly instead of building
+        # a fake analysis from missing data.
+        if (
+            not stats_r.get("ok")
+            and stats_r.get("error") in {
+                "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+                "SCAN_API_BUDGET_EXHAUSTED",
+                "LOCAL_RATE_LIMIT",
+                "RATE_LIMIT_COOLDOWN",
+            }
+        ):
+            return {
+                "source": "football-reactor-v5",
+                "version": VERSION,
+                "model_type": MODEL_TYPE,
+                "match_id": match_id,
+                "status": "CORE_STATS_GUARD_BLOCKED",
+                "error": stats_r.get("error"),
+                "match": {
+                    "home": live.get("home"),
+                    "away": live.get("away"),
+                    "minute": live.get("minute"),
+                    "score": live.get("score"),
+                },
+                "diagnostic": {
+                    "stats_http": stats_r.get("status"),
+                    "scan_budget": _v573_scan_budget_status(),
+                    "analysis_tier": "CORE_BLOCKED",
+                    "estimated_api_calls": api_calls,
+                },
+            }
 
         parsed = parse_metrics(stats_r.get("data"), live)
         metrics = parsed["metrics"]
         q = quality_guard(metrics)
-        lineups = parse_lineups(lineups_r.get("data"))
-        players = parse_player_stats(player_r.get("data"))
-        odds = compact_odds(odds_r.get("data"))
-        h2h = h2h_context(h2h_r.get("data"))
         pressure = pressure_score(metrics, int(live["minute"]))
+
+        # Preliminary model intentionally uses no lineup modifier. A 65%+
+        # candidate earns enrichment; weak matches consume no extra endpoints.
+        lineups = parse_lineups(None)
+        players = parse_player_stats(None)
+        odds = compact_odds(None)
+        h2h = h2h_context(None)
         signals = build_signals(live, metrics, q, pressure, lineups)
+
+        preliminary_best = max(
+            [
+                max(
+                    float(s.get("probability") or 0),
+                    float(s.get("live_probability") or 0),
+                )
+                for s in signals
+            ] or [0.0]
+        )
+
+        analysis_tier = "CORE_STATS_ONLY"
+
+        # Tier 2: only a visible 65%+ candidate gets freshness/lineup/market
+        # context. These endpoints may run concurrently, but the atomic budget
+        # gate guarantees they cannot consume the final reserves.
+        if preliminary_best >= VISIBLE_SIGNAL_MIN:
+            details_r, lineups_r, odds_r = await asyncio.gather(
+                client.details(match_id),
+                client.lineups(match_id),
+                client.odds(match_id),
+            )
+            api_calls += _v575b_real_call_count(details_r, lineups_r, odds_r)
+
+            lineups = parse_lineups(lineups_r.get("data"))
+            odds = compact_odds(odds_r.get("data"))
+
+            # Rebuild because lineup formation can make a small bounded change.
+            signals = build_signals(live, metrics, q, pressure, lineups)
+            analysis_tier = "VISIBLE_65_ENRICHED"
+
+        enriched_best = max(
+            [
+                max(
+                    float(s.get("probability") or 0),
+                    float(s.get("live_probability") or 0),
+                )
+                for s in signals
+            ] or [0.0]
+        )
+
+        # Tier 3: player/H2H context is descriptive, not required to create
+        # the signal. Spend it only on a very strong candidate and only if
+        # at least two normal-budget slots remain.
+        if enriched_best >= 78.0 and _v575b_normal_budget_remaining() >= 2:
+            player_r, h2h_r = await asyncio.gather(
+                client.player_stats(match_id),
+                client.h2h(match_id),
+            )
+            api_calls += _v575b_real_call_count(player_r, h2h_r)
+            players = parse_player_stats(player_r.get("data"))
+            h2h = h2h_context(h2h_r.get("data"))
+            analysis_tier = "STRONG_CONTEXT_ENRICHED"
+
         nearest_goal = nearest_goal_assessment(signals, live, q, pressure)
 
-        # Historical context is fetched only for meaningful candidates, keeping quota under control.
+        # Historical context has low model weight. It is now reserved only for
+        # exceptional candidates and only when two normal slots remain.
         top_pre_context = signals[0] if signals else None
-        history_context = {"available": False, "reason": "not_requested_for_weak_candidate"}
+        history_context = {"available": False, "reason": "not_requested_by_priority_budget"}
         history_http = {"home": None, "away": None}
-        if top_pre_context and float(top_pre_context.get("probability") or 0) >= 60.0:
+        if (
+            top_pre_context
+            and max(
+                float(top_pre_context.get("probability") or 0),
+                float(top_pre_context.get("live_probability") or 0),
+            ) >= 82.0
+            and _v575b_normal_budget_remaining() >= 2
+        ):
             home_id = live.get("home_team_id")
             away_id = live.get("away_team_id")
             if home_id and away_id:
@@ -1737,7 +1878,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                     client.team_results(str(home_id), 1),
                     client.team_results(str(away_id), 1),
                 )
-                api_calls += 2
+                api_calls += _v575b_real_call_count(home_hist_r, away_hist_r)
                 history_http = {"home": home_hist_r.get("status"), "away": away_hist_r.get("status")}
                 home_hist = parse_team_history(home_hist_r.get("data"), str(home_id))
                 away_hist = parse_team_history(away_hist_r.get("data"), str(away_id))
@@ -1833,16 +1974,20 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             "all_signals": signals,
             "diagnostic": {
                 "fresh_live_http": live_http,
-                "details_http": details_r["status"],
-                "summary_http": summary_r["status"],
-                "stats_http": stats_r["status"],
+                "analysis_tier": analysis_tier,
+                "preliminary_best_probability": round(preliminary_best, 1),
+                "enriched_best_probability": round(enriched_best, 1),
+                "details_http": details_r.get("status"),
+                "summary_http": summary_r.get("status"),
+                "stats_http": stats_r.get("status"),
                 "stats_rows_count": len(parsed["rows"]),
-                "lineups_http": lineups_r["status"],
-                "player_stats_http": player_r["status"],
-                "odds_http": odds_r["status"],
-                "h2h_http": h2h_r["status"],
+                "lineups_http": lineups_r.get("status"),
+                "player_stats_http": player_r.get("status"),
+                "odds_http": odds_r.get("status"),
+                "h2h_http": h2h_r.get("status"),
                 "team_history_http": history_http,
                 "estimated_api_calls": api_calls,
+                "scan_budget_at_report": _v573_scan_budget_status(),
             },
         }
 
@@ -6925,6 +7070,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "FINAL_MATCH_VERIFY": targeted_final_verify,
         "TARGETED_MATCH_VERIFY": targeted_final_verify.get("checked") or [],
         "scan_budget_end": _v573_scan_budget_status(),
+        "SCAN_BUDGET_INVARIANT_OK": int(_SCAN_BUDGET.get("used") or 0) <= int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN),
         "calls_last_60s_end": len(_PROVIDER_CALL_TIMES),
 
         "stage1_top": [
@@ -6993,6 +7139,14 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "max_calls_per_scan": PROVIDER_MAX_CALLS_PER_SCAN,
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+        "atomic_budget_guard": True,
+        "priority_analysis": {
+            "tier_1": "stats_only",
+            "tier_2_threshold": VISIBLE_SIGNAL_MIN,
+            "tier_2": "details+lineups+odds",
+            "tier_3_threshold": 78.0,
+            "tier_3": "player_stats+h2h_if_budget",
+        },
         "cache_entries": len(_PROVIDER_CACHE),
         "persistence_paths": {
             "scan_state": SCAN_STATE_PATH,
