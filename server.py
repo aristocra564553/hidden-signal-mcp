@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.0-GOAL-HUNTER-FULL"
-MODEL_TYPE = "heuristic-v5-goal-hunter-full-not-calibrated"
+VERSION = "V5.2-FINAL-REACTOR"
+MODEL_TYPE = "heuristic-v5.2-final-reactor-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -119,7 +119,7 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 # Lightweight journal
 # -------------------------
 
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_signals.jsonl")
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_2_signals.jsonl")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -1729,6 +1729,13 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "anti_stale_final_refresh",
             "our_analysis_engine",
             "goal_hunter_old_style",
+            "smart_live_scout",
+            "two_stage_live_collection",
+            "short_term_scan_memory",
+            "momentum_delta_engine",
+            "rising_pressure_detection",
+            "phase_quota_selection",
+            "tournament_diversity_prefilter",
             "goal_chain_board",
             "quick_screenshot_goal_hunter",
             "final_freshness_after_deep_scan",
@@ -2655,7 +2662,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5",
+            "source": "hidden-signal-v5.2",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
@@ -2663,7 +2670,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
             "final_freshness": freshness,
         }
     return {
-        "source": "hidden-signal-v5",
+        "source": "hidden-signal-v5.2",
         "version": VERSION,
         "report": structured_market_report(rep),
         "technical": {
@@ -2787,7 +2794,7 @@ async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
 
     total = sum(len(v) for v in sections.values())
     return {
-        "source": "hidden-signal-v5",
+        "source": "hidden-signal-v5.2",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_matches_found": len(matches),
@@ -2899,7 +2906,7 @@ async def analyze_screenshot_quick(
     )
     report = _quick_screenshot_report(live, metrics, source_note)
     return {
-        "source": "hidden-signal-v5-screenshot",
+        "source": "hidden-signal-v5.2.1-screenshot",
         "version": VERSION,
         "latency_ms": int((time.time() - started) * 1000),
         "live_match_found": bool(best_match and best_similarity >= 0.58),
@@ -3013,7 +3020,7 @@ async def scan_thinking_live(limit: int = 12, concurrency: int = 2) -> Dict[str,
     )
 
     return {
-        "source": "hidden-signal-v5",
+        "source": "hidden-signal-v5.2",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -3227,6 +3234,622 @@ def _goal_hunter_view(rep: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+def _odds_balance_score(m: Dict[str, Any]) -> float:
+    """Cheap prefilter signal from 1X2 odds: balanced/live games tend to stay competitive."""
+    odds = m.get("live_odds_1x2") or {}
+    vals = []
+    for k in ("1", "X", "2"):
+        v = safe_float(odds.get(k))
+        if v and v > 1:
+            vals.append(v)
+    if len(vals) < 2:
+        return 0.0
+    spread = max(vals) - min(vals)
+    if spread <= 1.5:
+        return 10.0
+    if spread <= 3.0:
+        return 6.0
+    if spread <= 6.0:
+        return 2.0
+    return -2.0
+
+
+def smart_scout_rank(m: Dict[str, Any]) -> float:
+    """
+    Better live prefilter.
+    It does NOT predict a goal by itself; it only decides which matches deserve expensive deep analysis.
+    """
+    minute = int(m.get("minute") or 0)
+    score = m.get("score") or {}
+    h = int(score.get("home") or 0)
+    a = int(score.get("away") or 0)
+    total = h + a
+    diff = abs(h - a)
+    stage = str(m.get("stage") or "").lower()
+
+    s = 0.0
+
+    # Best live windows for goal hunting.
+    if 16 <= minute <= 43:
+        s += 34
+    elif 8 <= minute <= 15:
+        s += 20
+    elif 46 <= minute <= 72:
+        s += 32
+    elif 73 <= minute <= 84:
+        s += 26
+    elif 85 <= minute <= 91:
+        s += 12
+    elif minute < 8:
+        s -= 12
+
+    # Halftime should not consume deep-analysis quota ahead of active play.
+    if "half time" in stage or "halftime" in stage:
+        s -= 18
+
+    # Score states that often keep motivation alive.
+    if total == 0:
+        s += 14
+    elif total == 1:
+        s += 18
+    elif total == 2 and diff <= 1:
+        s += 12
+    elif total <= 3 and diff <= 1:
+        s += 8
+    elif diff >= 3:
+        s -= 10
+
+    # Competitive scoreline > already dead game.
+    if diff == 0:
+        s += 10
+    elif diff == 1:
+        s += 8
+    elif diff == 2:
+        s -= 2
+
+    # Red card can create pressure, but also destabilizes model assumptions.
+    rc = m.get("red_cards") or {}
+    reds = int(rc.get("home") or 0) + int(rc.get("away") or 0)
+    if reds == 1:
+        s += 3
+    elif reds >= 2:
+        s -= 5
+
+    s += _odds_balance_score(m)
+
+    if m.get("match_id"):
+        s += 5
+    if m.get("is_in_progress"):
+        s += 7
+
+    # Small bonus for known tournament metadata.
+    if m.get("tournament"):
+        s += 2
+
+    return round1(s)
+
+
+def _scout_bucket(m: Dict[str, Any]) -> str:
+    minute = int(m.get("minute") or 0)
+    stage = str(m.get("stage") or "").lower()
+    if "half time" in stage or "halftime" in stage:
+        return "HT"
+    if minute <= 15:
+        return "EARLY_1H"
+    if minute <= 45:
+        return "PRIME_1H"
+    if minute <= 72:
+        return "PRIME_2H"
+    if minute <= 84:
+        return "LATE_2H"
+    return "VERY_LATE"
+
+
+def _diversified_scout_selection(matches: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """
+    Do not waste the whole quota on similar matches or one league.
+    Prefer prime 1H/2H windows, then broaden.
+    """
+    ranked = sorted(matches, key=smart_scout_rank, reverse=True)
+    target = max(1, min(int(limit), 20))
+
+    quotas = {
+        "PRIME_1H": max(3, target // 3),
+        "PRIME_2H": max(3, target // 3),
+        "LATE_2H": max(2, target // 5),
+        "EARLY_1H": max(1, target // 8),
+        "VERY_LATE": max(1, target // 8),
+        "HT": 1,
+    }
+
+    selected = []
+    per_bucket = {k: 0 for k in quotas}
+    per_tournament = {}
+
+    # Pass 1: balanced, diversified.
+    for m in ranked:
+        if len(selected) >= target:
+            break
+        bucket = _scout_bucket(m)
+        tid = str(m.get("tournament_id") or m.get("tournament") or "")
+        if per_bucket.get(bucket, 0) >= quotas.get(bucket, 0):
+            continue
+        if tid and per_tournament.get(tid, 0) >= 2:
+            continue
+        selected.append(m)
+        per_bucket[bucket] = per_bucket.get(bucket, 0) + 1
+        if tid:
+            per_tournament[tid] = per_tournament.get(tid, 0) + 1
+
+    # Pass 2: fill remaining slots by pure scout rank.
+    ids = {str(x.get("match_id")) for x in selected}
+    for m in ranked:
+        if len(selected) >= target:
+            break
+        if str(m.get("match_id")) in ids:
+            continue
+        selected.append(m)
+        ids.add(str(m.get("match_id")))
+
+    return selected
+
+
+
+# -------------------------
+# V5.2 FINAL — scan memory + short-term momentum + two-stage live collection
+# -------------------------
+
+def _load_scan_state() -> Dict[str, Any]:
+    try:
+        with open(SCAN_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_scan_state(state: Dict[str, Any]) -> None:
+    try:
+        tmp = SCAN_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, SCAN_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _metric_snapshot(metrics: Dict[str, Any], key: str) -> Optional[Dict[str, float]]:
+    m = metrics.get(key) or {}
+    if not isinstance(m, dict) or not m.get("present"):
+        return None
+    try:
+        return {
+            "home": float(m.get("home") or 0),
+            "away": float(m.get("away") or 0),
+        }
+    except Exception:
+        return None
+
+
+def _build_scan_snapshot(rep: Dict[str, Any]) -> Dict[str, Any]:
+    match = rep.get("match") or {}
+    metrics = rep.get("metrics") or {}
+    return {
+        "ts": time.time(),
+        "minute": int(match.get("minute") or 0),
+        "score": match.get("score") or {},
+        "xg": _metric_snapshot(metrics, "xg"),
+        "shots": _metric_snapshot(metrics, "shots"),
+        "shots_on_target": _metric_snapshot(metrics, "shots_on_target"),
+        "touches_in_box": _metric_snapshot(metrics, "touches_in_box"),
+        "shots_in_box": _metric_snapshot(metrics, "shots_in_box"),
+        "big_chances": _metric_snapshot(metrics, "big_chances"),
+        "corners": _metric_snapshot(metrics, "corners"),
+        "pressure": rep.get("pressure") or {},
+    }
+
+
+def _delta_pair(now: Optional[Dict[str, float]], prev: Optional[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    if not now or not prev:
+        return None
+    return {
+        "home": round1(now.get("home", 0) - prev.get("home", 0)),
+        "away": round1(now.get("away", 0) - prev.get("away", 0)),
+    }
+
+
+def _momentum_from_history(rep: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Compare current deep report with the previous scan.
+    This is the missing 'is pressure rising right now?' layer.
+    """
+    current = _build_scan_snapshot(rep)
+    if not prev:
+        return {
+            "available": False,
+            "label": "нет предыдущего скана",
+            "score": 0.0,
+            "current": current,
+        }
+
+    dt_sec = max(1.0, current["ts"] - float(prev.get("ts") or current["ts"]))
+    dmin = int(current.get("minute") or 0) - int(prev.get("minute") or 0)
+    # Ignore stale history or impossible minute jumps.
+    if dt_sec > 45 * 60 or dmin < 0 or dmin > 20:
+        return {
+            "available": False,
+            "label": "предыдущий скан слишком старый",
+            "score": 0.0,
+            "current": current,
+        }
+
+    deltas = {}
+    for k in ("xg", "shots", "shots_on_target", "touches_in_box", "shots_in_box", "big_chances", "corners"):
+        deltas[k] = _delta_pair(current.get(k), prev.get(k))
+
+    home_m = away_m = 0.0
+    weights = {
+        "xg": 34.0,
+        "shots_on_target": 26.0,
+        "touches_in_box": 18.0,
+        "shots_in_box": 10.0,
+        "shots": 6.0,
+        "big_chances": 8.0,
+        "corners": 4.0,
+    }
+    normalizers = {
+        "xg": 0.45,
+        "shots_on_target": 2.0,
+        "touches_in_box": 6.0,
+        "shots_in_box": 4.0,
+        "shots": 5.0,
+        "big_chances": 1.0,
+        "corners": 2.0,
+    }
+
+    for key, weight in weights.items():
+        d = deltas.get(key)
+        if not d:
+            continue
+        norm = normalizers[key]
+        home_m += weight * min(1.5, max(0.0, d["home"]) / norm)
+        away_m += weight * min(1.5, max(0.0, d["away"]) / norm)
+
+    # Pressure delta if available.
+    cp = current.get("pressure") or {}
+    pp = prev.get("pressure") or {}
+    try:
+        pdelta_h = float(cp.get("home") or 0) - float(pp.get("home") or 0)
+        pdelta_a = float(cp.get("away") or 0) - float(pp.get("away") or 0)
+        home_m += max(0.0, pdelta_h) * 0.35
+        away_m += max(0.0, pdelta_a) * 0.35
+    except Exception:
+        pass
+
+    total = home_m + away_m
+    if total >= 75:
+        label = "резкий рост голевого давления"
+    elif total >= 45:
+        label = "давление заметно растёт"
+    elif total >= 22:
+        label = "есть свежий атакующий импульс"
+    else:
+        label = "свежего ускорения почти нет"
+
+    if home_m - away_m >= 12:
+        rising_side = (rep.get("match") or {}).get("home")
+    elif away_m - home_m >= 12:
+        rising_side = (rep.get("match") or {}).get("away")
+    else:
+        rising_side = "обе/неясно"
+
+    return {
+        "available": True,
+        "seconds_since_previous": int(dt_sec),
+        "minutes_since_previous": dmin,
+        "label": label,
+        "rising_side": rising_side,
+        "home_momentum": round1(home_m),
+        "away_momentum": round1(away_m),
+        "score": round1(min(99.0, total)),
+        "deltas": deltas,
+        "current": current,
+    }
+
+
+def _apply_momentum_to_goal_board(board: List[Dict[str, Any]], momentum: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Momentum is a modifier, not a replacement for the base model.
+    Boost only when fresh attacking growth is observed; cap total display at 99.
+    """
+    if not momentum.get("available"):
+        return board
+
+    mscore = float(momentum.get("score") or 0)
+    if mscore < 15:
+        return board
+
+    boost = 0.0
+    if mscore >= 75:
+        boost = 6.0
+    elif mscore >= 45:
+        boost = 4.0
+    elif mscore >= 25:
+        boost = 2.0
+
+    updated = []
+    for item in board:
+        x = dict(item)
+        market = x.get("market")
+        local_boost = boost
+        if market == "GOAL_NEXT_5":
+            local_boost *= 1.10
+        elif market == "GOAL_NEXT_10":
+            local_boost *= 1.00
+        elif market == "GOAL_BEFORE_FULLTIME":
+            local_boost *= 0.75
+        elif market == "BTTS":
+            local_boost *= 0.55
+
+        p = round1(clamp(float(x.get("probability") or 0) + local_boost, 0, 99))
+        x["base_probability"] = x.get("probability")
+        x["momentum_boost"] = round1(local_boost)
+        x["probability"] = p
+        band = _signal_band(p)
+        x["emoji"] = band["emoji"]
+        x["strength"] = band["label"]
+        if x.get("decision") != "WAIT":
+            x["decision"] = "ENTER" if p >= 75 else ("WATCH" if p >= 65 else "PASS")
+        updated.append(x)
+
+    updated.sort(key=lambda x: (x["probability"], x.get("priority", 0)), reverse=True)
+    return updated
+
+
+def _final_goal_hunter_view(rep: Dict[str, Any], momentum: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    view = _goal_hunter_view(rep)
+    board = view.get("goal_board_65_99") or []
+
+    if momentum:
+        board = _apply_momentum_to_goal_board(board, momentum)
+        view["goal_board_65_99"] = board
+        view["SHORT_TERM_MOMENTUM"] = momentum
+
+        # Rebuild human reasoning so the new best option is reflected.
+        reasoning = _old_style_reasoning(rep, board)
+        if momentum.get("available"):
+            reasoning["fresh_momentum"] = {
+                "label": momentum.get("label"),
+                "rising_side": momentum.get("rising_side"),
+                "score": momentum.get("score"),
+                "deltas": momentum.get("deltas"),
+            }
+            if momentum.get("score", 0) >= 45:
+                reasoning["our_voice"] += " Плюс есть свежий рост давления относительно прошлого скана."
+        view["OUR_THINKING"] = reasoning
+        view["final_decision"] = (
+            "PASS — не натягиваем."
+            if not board else
+            f"{board[0]['decision']} — {board[0]['title']} — {board[0]['probability']}%"
+        )
+
+    return view
+
+
+def _stage1_live_pool(matches: List[Dict[str, Any]], max_pool: int = 80) -> List[Dict[str, Any]]:
+    """
+    Stage 1: scan the whole live list cheaply and keep a broad pool.
+    This avoids deep-calling random matches too early.
+    """
+    active = []
+    for m in matches:
+        if not m.get("minute_valid", True):
+            continue
+        stage = str(m.get("stage") or "").lower()
+        if any(x in stage for x in ("finished", "cancelled", "postponed", "not started")):
+            continue
+        minute = int(m.get("minute") or 0)
+        if minute <= 0 or minute > 100:
+            continue
+        active.append(m)
+
+    ranked = sorted(active, key=smart_scout_rank, reverse=True)
+    return ranked[:max(1, min(int(max_pool), 120))]
+
+
+def _stage2_deep_selection(pool: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """
+    Stage 2: diversified deep-analysis set.
+    Use the smarter V5.1 selector on the already-cleaned pool.
+    """
+    return _diversified_scout_selection(pool, max(1, min(int(limit), 20)))
+
+
+@mcp.tool()
+async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
+    """
+    V5.2 final scanner:
+    1) broad cheap live collection
+    2) smart deep selection
+    3) deep stats/signals
+    4) compare with previous scan for short-term momentum
+    5) final live refresh to block stale score/minute
+    """
+    started = time.time()
+    previous_state = _load_scan_state()
+
+    client = ZylaClient()
+    try:
+        live_r = await client.live()
+        matches = flatten_live(live_r.get("data"))
+    finally:
+        await client.close()
+
+    pool = _stage1_live_pool(matches, max_pool=max_pool)
+    chosen = _stage2_deep_selection(pool, limit=limit)
+
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
+
+    async def analyze_one(m):
+        async with sem:
+            try:
+                return await analyze_match_internal(str(m["match_id"]), exact_live=m)
+            except Exception as e:
+                return {"status": "ERROR", "match_id": m.get("match_id"), "error": repr(e)}
+
+    deep_reports = await asyncio.gather(*(analyze_one(m) for m in chosen))
+
+    # Final single refresh after all deep calls.
+    final_client = ZylaClient()
+    try:
+        final_r = await final_client.live()
+        final_matches = flatten_live(final_r.get("data"))
+    finally:
+        await final_client.close()
+    final_map = {str(m.get("match_id")): m for m in final_matches if m.get("match_id")}
+
+    new_state = {}
+    candidates = []
+    stale_blocked = []
+    quality_blocked = []
+    parser_failures = []
+
+    for rep in deep_reports:
+        if rep.get("status") != "OK":
+            parser_failures.append({
+                "match_id": rep.get("match_id"),
+                "error": rep.get("error") or rep.get("status"),
+            })
+            continue
+
+        mid = str(rep.get("match_id") or "")
+        freshness = final_freshness_check(
+            rep.get("match") or {},
+            final_map.get(mid)
+        )
+        if not freshness.get("ok"):
+            stale_blocked.append({
+                "match_id": mid,
+                "match": f"{(rep.get('match') or {}).get('home')} — {(rep.get('match') or {}).get('away')}",
+                "reason": freshness.get("reason"),
+            })
+            continue
+
+        q = rep.get("data_quality") or {}
+        if not q.get("basic_ok"):
+            quality_blocked.append({
+                "match_id": mid,
+                "match": f"{(rep.get('match') or {}).get('home')} — {(rep.get('match') or {}).get('away')}",
+                "data_quality": q.get("score"),
+                "missing": q.get("missing"),
+            })
+            continue
+
+        prev = previous_state.get(mid)
+        momentum = _momentum_from_history(rep, prev)
+        view = _final_goal_hunter_view(rep, momentum)
+
+        snap = momentum.get("current") if momentum else _build_scan_snapshot(rep)
+        new_state[mid] = snap
+
+        board = view.get("goal_board_65_99") or []
+        if not board:
+            continue
+
+        best = board[0]
+        # Keep duplicate suppression but allow renewed signal when momentum changed strongly.
+        pseudo = {
+            "market": best.get("market"),
+            "selection": best.get("title"),
+            "probability": best.get("probability"),
+            "decision": best.get("decision"),
+        }
+        new_or_changed = is_new_or_changed(mid, pseudo)
+        if momentum.get("available") and float(momentum.get("score") or 0) >= 45:
+            new_or_changed = True
+
+        candidates.append({
+            "match_id": mid,
+            **view,
+            "new_or_changed": new_or_changed,
+            "scout_score": smart_scout_rank(rep.get("match") or {}),
+        })
+
+    # Preserve some recent previous states for matches not selected this time.
+    now_ts = time.time()
+    for mid, snap in previous_state.items():
+        if mid in new_state:
+            continue
+        try:
+            if now_ts - float(snap.get("ts") or 0) <= 45 * 60:
+                new_state[mid] = snap
+        except Exception:
+            pass
+    _save_scan_state(new_state)
+
+    candidates.sort(
+        key=lambda x: (
+            float(((x.get("goal_board_65_99") or [{}])[0]).get("probability") or 0),
+            float(((x.get("SHORT_TERM_MOMENTUM") or {}).get("score") or 0)),
+        ),
+        reverse=True
+    )
+
+    enter_now = [
+        c for c in candidates
+        if (c.get("goal_board_65_99") or [{}])[0].get("decision") == "ENTER"
+    ]
+    rising_now = [
+        c for c in candidates
+        if float((c.get("SHORT_TERM_MOMENTUM") or {}).get("score") or 0) >= 45
+    ]
+
+    return {
+        "source": "hidden-signal-v5.2-final",
+        "version": VERSION,
+        "live_snapshot_at": now_iso(),
+        "live_matches_found": len(matches),
+        "stage1_pool_size": len(pool),
+        "selected_for_deep_analysis": len(chosen),
+        "stage1_top": [
+            {
+                "match_id": m.get("match_id"),
+                "match": f"{m.get('home')} — {m.get('away')}",
+                "minute": m.get("minute"),
+                "score": m.get("score"),
+                "bucket": _scout_bucket(m),
+                "scout_score": smart_scout_rank(m),
+            }
+            for m in pool[:12]
+        ],
+        "ENTER_NOW": enter_now,
+        "RISING_PRESSURE_NOW": rising_now,
+        "ALL_65_99": candidates,
+        "stale_blocked": stale_blocked,
+        "quality_blocked": quality_blocked,
+        "parser_failures": parser_failures,
+        "scan_memory_matches": len(new_state),
+        "latency_ms": int((time.time() - started) * 1000),
+        "message": (
+            "Сигналов 65-99% после полного V5.2 скана нет — пропускаем."
+            if not candidates else
+            "V5.2: сначала смотри ENTER_NOW и RISING_PRESSURE_NOW, затем OUR_THINKING."
+        ),
+        "mode": "FINAL_TWO_STAGE_PLUS_MOMENTUM_MEMORY",
+    }
+
+
+@mcp.tool()
+async def reset_scan_memory() -> Dict[str, Any]:
+    """Clear short-term scan memory used for momentum comparison."""
+    try:
+        if os.path.exists(SCAN_STATE_PATH):
+            os.remove(SCAN_STATE_PATH)
+        return {"ok": True, "message": "Память предыдущего лайв-скана очищена."}
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
+
 @mcp.tool()
 async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -3253,18 +3876,10 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
             continue
         valid.append(m)
 
-    # Balance 1H/2H so we do not miss first-half goals.
-    first = sorted([m for m in valid if int(m.get("minute") or 0) <= 45], key=cheap_rank, reverse=True)
-    second = sorted([m for m in valid if int(m.get("minute") or 0) > 45], key=cheap_rank, reverse=True)
+    # V5.1 Smart Live Scout:
+    # rank the whole live pool by goal-hunting usefulness, keep phase balance and league diversity.
     n = max(1, min(int(limit), 20))
-    chosen = []
-    while len(chosen) < n and (first or second):
-        if first:
-            chosen.append(first.pop(0))
-            if len(chosen) >= n:
-                break
-        if second:
-            chosen.append(second.pop(0))
+    chosen = _diversified_scout_selection(valid, n)
 
     sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
 
@@ -3363,11 +3978,23 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
     ]
 
     return {
-        "source": "hidden-signal-v5-goal-hunter",
+        "source": "hidden-signal-v5.2.1-goal-hunter",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
         "selected_for_deep_analysis": len(chosen),
+        "smart_scout_top": [
+            {
+                "match_id": m.get("match_id"),
+                "match": f"{m.get('home')} — {m.get('away')}",
+                "minute": m.get("minute"),
+                "score": m.get("score"),
+                "bucket": _scout_bucket(m),
+                "scout_score": smart_scout_rank(m),
+                "tournament": m.get("tournament"),
+            }
+            for m in chosen[:10]
+        ],
         "invalid_minute": invalid_minute,
         "parser_failures": parser_failures,
         "quality_blocked": quality_blocked,
@@ -3377,12 +4004,12 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
         "ENTER_NOW": enter,
         "ALL_65_99": candidates,
         "message": (
-            "Сигналов 65-99% сейчас нет — пропускаем."
+            "Сигналов 65-99% после умного отбора сейчас нет — пропускаем."
             if not candidates else
             "Нашёл голевые кандидаты. Смотри OUR_THINKING и лучший рынок, а не только цифру."
         ),
         "latency_ms": int((time.time() - started) * 1000),
-        "mode": "OLD_STYLE_PLUS_STRONG_PROGRAM",
+        "mode": "OLD_STYLE_PLUS_SMART_LIVE_SCOUT",
     }
 
 
@@ -3396,14 +4023,14 @@ async def analyze_goal_hunter_match(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5",
+            "source": "hidden-signal-v5.2",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
             "message": "Сигнал скрыт: live уже изменился.",
         }
     return {
-        "source": "hidden-signal-v5",
+        "source": "hidden-signal-v5.2",
         "version": VERSION,
         "report": _goal_hunter_view(rep),
         "technical": {
@@ -3505,7 +4132,7 @@ async def quick_screenshot_goal_hunter(
     }
 
     return {
-        "source": "hidden-signal-v5-screenshot",
+        "source": "hidden-signal-v5.2.1-screenshot",
         "version": VERSION,
         "live_match_found": bool(best_match and best_similarity >= 0.58),
         "match_similarity": round1(best_similarity * 100),
