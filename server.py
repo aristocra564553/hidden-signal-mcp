@@ -30,7 +30,7 @@ mcp = MCPServer("Hidden Signal Live")
 
 STRONG_SIGNAL_THRESHOLD = 75.0
 MEDIUM_SIGNAL_THRESHOLD = 62.0
-MAX_SCAN_MATCHES = 6
+MAX_SCAN_MATCHES = 8
 
 SIGNALS = {
     "goal_next_5": True,
@@ -46,6 +46,10 @@ SIGNALS = {
 # Повторный сигнал не считается новым, пока его вероятность
 # не изменилась хотя бы на это количество процентных пунктов.
 REPEAT_SIGNAL_DELTA = 4.0
+
+# Scanner cache (seconds)
+ZYLA_CACHE_TTL = 30
+_ZYLA_CACHE: dict[str, dict[str, Any]] = {}
 
 # Простая память процесса Render. После перезапуска сервера очищается.
 _LAST_SIGNAL_STATE: dict[str, dict[str, float]] = {}
@@ -419,6 +423,43 @@ async def zyla_get(
             "source": "zyla-flashscore",
             "error": str(exc),
         }
+
+
+
+async def zyla_get_cached(
+    endpoint_id: int,
+    endpoint_slug: str,
+    params: dict | None = None,
+    cache_ttl: int = ZYLA_CACHE_TTL,
+):
+    """
+    Small in-memory cache for scanner calls.
+    Render restart clears it automatically.
+    """
+    params = params or {}
+    cache_key = f"{endpoint_id}:{endpoint_slug}:{json.dumps(params, sort_keys=True, ensure_ascii=False)}"
+    now = time.time()
+
+    cached = _ZYLA_CACHE.get(cache_key)
+    if cached and now < cached["expires_at"]:
+        value = cached["value"]
+        if isinstance(value, dict):
+            value = dict(value)
+            value["cache_hit"] = True
+        return value
+
+    value = await zyla_get(endpoint_id, endpoint_slug, params)
+
+    if (
+        isinstance(value, dict)
+        and value.get("diagnostic", {}).get("http_status") == 200
+    ):
+        _ZYLA_CACHE[cache_key] = {
+            "expires_at": now + max(1, int(cache_ttl)),
+            "value": value,
+        }
+
+    return value
 
 
 # ============================================================
@@ -1166,121 +1207,341 @@ async def analyze_zyla_match(match_id: str):
 
 
 # ============================================================
-# LIVE SCANNER
+# OPTIMIZED LIVE SCANNER
 # ============================================================
 
-def extract_live_match_candidates(payload: Any) -> list[dict]:
-    raw = unwrap_api_response(payload)
-    candidates = []
-    seen = set()
+def _compact_candidate_from_analysis(analysis: dict) -> dict:
+    match = analysis.get("match", {})
+    signals = analysis.get("all_signals", [])
+    top = signals[0] if signals else None
 
-    for node in walk(raw):
-        match_id = None
+    return {
+        "match_id": analysis.get("match_id"),
+        "home": match.get("home"),
+        "away": match.get("away"),
+        "minute": match.get("minute"),
+        "score": match.get("score"),
+        "top_signal": top,
+        "pressure": analysis.get("pressure"),
+    }
 
-        for key in ("match_id", "matchId", "id"):
-            if key in node and node.get(key) not in (None, ""):
-                match_id = str(node.get(key))
-                break
 
-        if not match_id or match_id in seen:
-            continue
+async def _light_analyze_zyla_match(match_id: str) -> dict:
+    """
+    Cheap stage for the scanner:
+    only Details + Stats (2 calls, often less with cache).
+    No giant raw payload is returned.
+    """
+    details, stats = await asyncio.gather(
+        zyla_get_cached(
+            23859,
+            "get+match+details",
+            {"match_id": match_id},
+            cache_ttl=30,
+        ),
+        zyla_get_cached(
+            23861,
+            "get+match+stats",
+            {"match_id": match_id},
+            cache_ttl=30,
+        ),
+    )
 
-        home, away = find_team_names(node)
+    metrics = parse_match_metrics(
+        details,
+        stats,
+        {},
+        {},
+    )
 
-        # Чтобы не принять ID команды/лиги за match_id,
-        # желательно наличие команд, статуса, счёта или live-поля.
-        has_match_shape = bool(
-            home
-            or away
-            or first_value_by_keys(
-                node,
-                ["live_time", "minute", "stage", "status", "score"]
-            ) is not None
-        )
+    pressure = build_pressure(metrics)
+    signals = build_signals(metrics)
 
-        if not has_match_shape:
-            continue
+    return {
+        "match_id": match_id,
+        "match": {
+            "home": metrics["home"],
+            "away": metrics["away"],
+            "minute": metrics["minute"],
+            "score": metrics["score"],
+        },
+        "metrics": {
+            "xg": metrics["xg"],
+            "shots": metrics["shots"],
+            "shots_on_target": metrics["shots_on_target"],
+            "shots_in_box": metrics["shots_in_box"],
+            "touches_in_box": metrics["touches_in_box"],
+            "corners": metrics["corners"],
+            "possession": metrics["possession"],
+            "red_cards": metrics["red_cards"],
+        },
+        "pressure": pressure,
+        "all_signals": signals,
+        "diagnostic": {
+            "details_http": details.get("diagnostic", {}).get("http_status")
+            if isinstance(details, dict) else None,
+            "stats_http": stats.get("diagnostic", {}).get("http_status")
+            if isinstance(stats, dict) else None,
+        },
+    }
 
-        seen.add(match_id)
 
-        candidates.append({
-            "match_id": match_id,
-            "home": home,
-            "away": away,
-            "minute": parse_minute(node),
-            "score": parse_score(node),
-        })
+async def _deep_confirm_zyla_match(match_id: str) -> dict:
+    """
+    Deep confirmation only for genuinely strong candidates:
+    Events + Odds (2 extra calls, often less with cache).
+    """
+    summary, odds = await asyncio.gather(
+        zyla_get_cached(
+            23860,
+            "get+match+summary",
+            {"match_id": match_id},
+            cache_ttl=45,
+        ),
+        zyla_get_cached(
+            23865,
+            "get+match+odds",
+            {"match_id": match_id},
+            cache_ttl=30,
+        ),
+    )
 
-    return candidates
+    return {
+        "events_http": summary.get("diagnostic", {}).get("http_status")
+        if isinstance(summary, dict) else None,
+        "odds_http": odds.get("diagnostic", {}).get("http_status")
+        if isinstance(odds, dict) else None,
+        "events_available": bool(unwrap_api_response(summary)),
+        "odds_available": bool(unwrap_api_response(odds)),
+    }
 
 
 @mcp.tool()
 async def scan_zyla_live(max_matches: int = MAX_SCAN_MATCHES):
     """
-    Scan current Zyla live football matches and run Hidden Signal V1.
+    Economical Hidden Signal scanner.
 
-    To protect API quota, analyses at most MAX_SCAN_MATCHES by default.
-    Returns strongest new signals first.
+    1. One request gets all live football matches.
+    2. At most max_matches candidates get Details + Stats.
+    3. Events + Odds are requested only for matches that already have
+       at least one 75%+ signal.
+    4. Returns compact JSON only: counters, strong signals and top-5.
     """
 
     max_matches = int(clamp(max_matches, 1, 12))
 
-    live = await get_zyla_live_matches()
-    candidates = extract_live_match_candidates(live)
+    live = await zyla_get_cached(
+        23856,
+        "get+live+matches",
+        {"sport_id": 1},
+        cache_ttl=20,
+    )
 
-    if not candidates:
+    live_http = (
+        live.get("diagnostic", {}).get("http_status")
+        if isinstance(live, dict) else None
+    )
+
+    if live_http != 200:
         return {
-            "source": "hidden-signal-v1",
-            "status": "NO_LIVE_MATCHES_OR_PARSE_FAILED",
-            "live_response": live,
-            "analyses": [],
+            "source": "hidden-signal-v1.1",
+            "status": "ZYLA_LIVE_ERROR",
+            "live_http_status": live_http,
+            "live_matches_found": 0,
+            "matches_light_analyzed": 0,
+            "fully_analyzed": 0,
+            "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
+            "strong_signals": [],
+            "top_candidates": [],
+            "zyla_error": (
+                live.get("api_response")
+                if isinstance(live, dict)
+                else str(live)
+            ),
         }
 
-    candidates = candidates[:max_matches]
+    all_candidates = extract_live_match_candidates(live)
+    total_live_found = len(all_candidates)
+
+    if not all_candidates:
+        return {
+            "source": "hidden-signal-v1.1",
+            "status": "NO_LIVE_MATCHES_OR_PARSE_FAILED",
+            "live_http_status": 200,
+            "live_matches_found": 0,
+            "matches_light_analyzed": 0,
+            "fully_analyzed": 0,
+            "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
+            "strong_signals": [],
+            "top_candidates": [],
+        }
+
+    # Prefer useful live windows and matches whose minute parsed correctly.
+    def pre_score(item: dict):
+        minute = int(item.get("minute") or 0)
+        score_home, score_away = item.get("score") or (0, 0)
+        total_goals = int(score_home) + int(score_away)
+
+        value = 0
+        if 8 <= minute <= 88:
+            value += 50
+        if 30 <= minute < 45:
+            value += 12
+        if 55 <= minute <= 85:
+            value += 18
+        if total_goals <= 3:
+            value += 8
+        if item.get("home") and item.get("away"):
+            value += 10
+        return value
+
+    all_candidates.sort(key=pre_score, reverse=True)
+    selected = all_candidates[:max_matches]
 
     semaphore = asyncio.Semaphore(3)
 
-    async def run_one(item):
+    async def run_light(item):
         async with semaphore:
             try:
-                result = await analyze_zyla_match(item["match_id"])
-                return result
+                return await _light_analyze_zyla_match(item["match_id"])
             except Exception as exc:
                 return {
                     "match_id": item["match_id"],
                     "error": str(exc),
                 }
 
-    analyses = await asyncio.gather(
-        *(run_one(item) for item in candidates)
+    light_results = await asyncio.gather(
+        *(run_light(item) for item in selected)
     )
 
-    strong = []
+    valid = [
+        item for item in light_results
+        if isinstance(item, dict)
+        and "error" not in item
+        and item.get("all_signals")
+    ]
 
-    for analysis in analyses:
-        if not isinstance(analysis, dict):
-            continue
-
-        for signal in analysis.get("strong_signals", []):
-            strong.append({
-                "match_id": analysis.get("match_id"),
-                "match": analysis.get("match"),
-                **signal,
-            })
-
-    strong.sort(
-        key=lambda item: item.get("probability", 0),
+    # Sort by best signal even if below 75%.
+    valid.sort(
+        key=lambda x: x.get("all_signals", [{}])[0].get("probability", 0),
         reverse=True,
     )
 
+    strong_match_ids = []
+    strong_signals = []
+
+    for analysis in valid:
+        match = analysis.get("match", {})
+
+        for signal in analysis.get("all_signals", []):
+            if signal.get("decision") != "ENTER":
+                continue
+
+            strong_match_ids.append(analysis["match_id"])
+            strong_signals.append({
+                "match_id": analysis.get("match_id"),
+                "home": match.get("home"),
+                "away": match.get("away"),
+                "minute": match.get("minute"),
+                "score": match.get("score"),
+                "market": signal.get("market"),
+                "selection": signal.get("selection"),
+                "probability": signal.get("probability"),
+                "risk": signal.get("risk"),
+                "decision": signal.get("decision"),
+                "reasons": signal.get("reasons"),
+            })
+
+    # Deep confirmation only for unique matches with a strong signal.
+    unique_strong_ids = list(dict.fromkeys(strong_match_ids))[:4]
+
+    async def run_deep(match_id):
+        async with semaphore:
+            try:
+                confirmation = await _deep_confirm_zyla_match(match_id)
+                return match_id, confirmation
+            except Exception as exc:
+                return match_id, {"error": str(exc)}
+
+    deep_pairs = await asyncio.gather(
+        *(run_deep(match_id) for match_id in unique_strong_ids)
+    ) if unique_strong_ids else []
+
+    confirmations = dict(deep_pairs)
+
+    for signal in strong_signals:
+        signal["deep_confirmation"] = confirmations.get(
+            signal["match_id"],
+            {"not_requested": True},
+        )
+
+    # Repeat guard is applied only to strong signals that are about to surface.
+    final_strong = []
+    for signal in strong_signals:
+        match_id = signal["match_id"]
+        key = f"{signal['market']}::{signal['selection']}"
+        p = float(signal["probability"])
+
+        state = _LAST_SIGNAL_STATE.setdefault(match_id, {})
+        previous = state.get(key)
+
+        is_new = (
+            previous is None
+            or abs(p - previous) >= REPEAT_SIGNAL_DELTA
+        )
+
+        signal["new_or_changed"] = is_new
+
+        if is_new:
+            state[key] = p
+            final_strong.append(signal)
+
+    final_strong.sort(
+        key=lambda x: x.get("probability", 0),
+        reverse=True,
+    )
+
+    top_candidates = []
+
+    for analysis in valid[:5]:
+        match = analysis.get("match", {})
+        top = analysis.get("all_signals", [{}])[0]
+
+        top_candidates.append({
+            "match_id": analysis.get("match_id"),
+            "home": match.get("home"),
+            "away": match.get("away"),
+            "minute": match.get("minute"),
+            "score": match.get("score"),
+            "market": top.get("market"),
+            "selection": top.get("selection"),
+            "probability": top.get("probability"),
+            "decision": top.get("decision"),
+            "reasons": top.get("reasons"),
+        })
+
     return {
-        "source": "hidden-signal-v1",
+        "source": "hidden-signal-v1.1",
+        "status": "OK",
         "model_type": "heuristic-v1-not-calibrated",
-        "live_matches_found": len(candidates),
-        "matches_analyzed": len(analyses),
+        "live_http_status": 200,
+        "live_matches_found": total_live_found,
+        "matches_selected_for_stats": len(selected),
+        "matches_light_analyzed": len(valid),
+        "fully_analyzed": len(confirmations),
         "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
-        "strong_signals": strong,
-        "analyses": analyses,
+        "strong_signals": final_strong,
+        "top_candidates": top_candidates,
+        "estimated_max_api_calls_without_cache": (
+            1
+            + len(selected) * 2
+            + len(unique_strong_ids) * 2
+        ),
+        "cache_ttl_seconds": ZYLA_CACHE_TTL,
+        "note": (
+            "Scanner returns compact JSON only. "
+            "Events and odds are fetched only for 75%+ candidates."
+        ),
     }
 
 
@@ -1294,7 +1555,7 @@ async def hidden_signal_status():
 
     return {
         "service": "Hidden Signal Live",
-        "version": "V1",
+        "version": "V1.1",
         "zyla_key_loaded": bool(ZYLA_API_KEY),
         "api_football_key_loaded": bool(API_KEY),
         "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
@@ -1302,6 +1563,7 @@ async def hidden_signal_status():
         "max_scan_matches": MAX_SCAN_MATCHES,
         "signals": SIGNALS,
         "model_type": "heuristic-v1-not-calibrated",
+        "scanner_mode": "optimized-compact-cache",
         "note": (
             "Percentages are heuristic estimates. "
             "They must be calibrated against real results before "
