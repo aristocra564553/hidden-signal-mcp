@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.1-SELF-LEARNING-FEED-GUARD"
-MODEL_TYPE = "heuristic-v5.7.1-self-learning-feed-guard-not-calibrated"
+VERSION = "V5.7.2-RATE-LIMIT-GUARD"
+MODEL_TYPE = "heuristic-v5.7.2-rate-limit-guard-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -300,6 +300,21 @@ class ZylaClient:
     async def get(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not ZYLA_API_KEY:
             return {"ok": False, "status": 0, "data": None, "error": "ZYLA_API_KEY missing"}
+
+        # V5.7.2 shared quota protection. The live guard itself is allowed
+        # to make the recovery probe; deep endpoints are blocked in cooldown.
+        if name != "live" and "_v572_rate_status" in globals():
+            rs = _v572_rate_status()
+            if rs.get("active"):
+                return {
+                    "ok": False,
+                    "status": 429,
+                    "data": None,
+                    "headers": {},
+                    "retry_after": rs.get("remaining_seconds"),
+                    "error": "RATE_LIMIT_COOLDOWN",
+                    "rate_limit": rs,
+                }
         try:
             r = await self.client.get(endpoint_url(name), params=params or {})
             data: Any
@@ -307,10 +322,16 @@ class ZylaClient:
                 data = r.json()
             except Exception:
                 data = r.text
+
+            if r.status_code == 429 and "_v572_activate_cooldown" in globals():
+                _v572_activate_cooldown(r.headers.get("retry-after"))
+
             return {
                 "ok": 200 <= r.status_code < 300,
                 "status": r.status_code,
                 "data": data,
+                "headers": dict(r.headers),
+                "retry_after": r.headers.get("retry-after"),
                 "error": None if 200 <= r.status_code < 300 else str(data)[:500],
             }
         except Exception as e:
@@ -5660,9 +5681,90 @@ def _v57_learning_report(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# ===== V5.7.1 LIVE FEED GUARD =====
+# ===== V5.7.2 RATE LIMIT + LIVE FEED GUARD =====
+# 429 is not retried aggressively. A shared cooldown prevents a single scan
+# from hammering the provider through live/stats/odds/detail calls.
+
+RATE_LIMIT_STATE_PATH = os.environ.get(
+    "RATE_LIMIT_STATE_PATH", "/tmp/hidden_signal_v5_7_2_rate_limit.json"
+)
 FEED_GUARD_RETRIES = 3
-FEED_GUARD_DELAYS = (0.8, 1.6)
+FEED_GUARD_NORMAL_DELAYS = (1.0, 2.0)
+RATE_LIMIT_BACKOFF = (15, 30, 60)
+RATE_LIMIT_MAX_WAIT_INSIDE_SCAN = 18.0
+RATE_LIMIT_DEFAULT_COOLDOWN = 60
+
+
+def _v572_load_rate_state() -> Dict[str, Any]:
+    try:
+        with open(RATE_LIMIT_STATE_PATH, "r", encoding="utf-8") as f:
+            x = json.load(f)
+            return x if isinstance(x, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v572_save_rate_state(state: Dict[str, Any]) -> None:
+    try:
+        tmp = RATE_LIMIT_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, RATE_LIMIT_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _v572_epoch() -> float:
+    return time.time()
+
+
+def _v572_retry_after_seconds(value: Any, fallback: int) -> int:
+    try:
+        if value is not None:
+            return max(1, min(300, int(float(str(value).strip()))))
+    except Exception:
+        pass
+    return int(fallback)
+
+
+def _v572_rate_status() -> Dict[str, Any]:
+    st = _v572_load_rate_state()
+    until = float(st.get("cooldown_until") or 0)
+    remaining = max(0, int(round(until - _v572_epoch())))
+    return {
+        "active": remaining > 0,
+        "remaining_seconds": remaining,
+        "cooldown_until": until or None,
+        "last_429_at": st.get("last_429_at"),
+        "consecutive_429": int(st.get("consecutive_429") or 0),
+    }
+
+
+def _v572_activate_cooldown(retry_after: Any = None) -> Dict[str, Any]:
+    st = _v572_load_rate_state()
+    consecutive = int(st.get("consecutive_429") or 0) + 1
+    fallback = RATE_LIMIT_BACKOFF[min(consecutive - 1, len(RATE_LIMIT_BACKOFF) - 1)]
+    seconds = _v572_retry_after_seconds(retry_after, fallback)
+    # Never shorten an already-active cooldown.
+    until = max(float(st.get("cooldown_until") or 0), _v572_epoch() + seconds)
+    st.update({
+        "cooldown_until": until,
+        "last_429_at": now_iso(),
+        "consecutive_429": consecutive,
+        "last_retry_after": retry_after,
+        "last_cooldown_seconds": seconds,
+    })
+    _v572_save_rate_state(st)
+    return _v572_rate_status()
+
+
+def _v572_clear_rate_limit() -> None:
+    st = _v572_load_rate_state()
+    st["cooldown_until"] = 0
+    st["consecutive_429"] = 0
+    st["recovered_at"] = now_iso()
+    _v572_save_rate_state(st)
+
 
 def _v571_previous_live_count() -> int:
     try:
@@ -5670,6 +5772,7 @@ def _v571_previous_live_count() -> int:
         return int(st.get("last_live_matches_found") or 0)
     except Exception:
         return 0
+
 
 def _v571_store_live_count(n: int) -> None:
     try:
@@ -5680,6 +5783,7 @@ def _v571_store_live_count(n: int) -> None:
     except Exception:
         pass
 
+
 async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
     prev = _v571_previous_live_count()
     attempts = []
@@ -5687,17 +5791,69 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
     best_count = -1
     best_status = None
 
+    # If another request recently hit 429, do not send more requests yet.
+    pre = _v572_rate_status()
+    if pre["active"]:
+        return {
+            "status": "RATE_LIMIT_COOLDOWN",
+            "matches": [],
+            "live_matches_found": 0,
+            "previous_live_matches_found": prev,
+            "attempts": [],
+            "safe_for_signals": False,
+            "safe_for_learning": False,
+            "rate_limit": pre,
+            "message": "Provider cooldown is active. No request was sent.",
+        }
+
     for i in range(FEED_GUARD_RETRIES):
         client = ZylaClient()
         err = None
         try:
             r = await client.live()
             http_status = r.get("status")
+            retry_after = r.get("retry_after")
             raw_data = r.get("data")
-            # Malformed payload must not silently become a trusted zero.
+
+            # Special handling: 429 must not be hammered with rapid retries.
+            if int(http_status or 0) == 429:
+                rate = _v572_activate_cooldown(retry_after)
+                attempts.append({
+                    "attempt": i + 1,
+                    "http_status": 429,
+                    "live_matches_found": -1,
+                    "retry_after": retry_after,
+                    "rate_limit": rate,
+                    "suspicious": True,
+                })
+
+                # Wait inside this scan only if the server explicitly asks for
+                # a short enough delay. Otherwise stop and let the next scan retry.
+                wait_s = int(rate.get("remaining_seconds") or 0)
+                if wait_s <= RATE_LIMIT_MAX_WAIT_INSIDE_SCAN and i < FEED_GUARD_RETRIES - 1:
+                    await asyncio.sleep(max(1, wait_s))
+                    # Clear only the elapsed cooldown; next request may still return 429.
+                    st = _v572_load_rate_state()
+                    st["cooldown_until"] = 0
+                    _v572_save_rate_state(st)
+                    continue
+
+                return {
+                    "status": "RATE_LIMIT_COOLDOWN",
+                    "matches": [],
+                    "live_matches_found": 0,
+                    "previous_live_matches_found": prev,
+                    "attempts": attempts,
+                    "safe_for_signals": False,
+                    "safe_for_learning": False,
+                    "rate_limit": rate,
+                    "message": "Zyla returned HTTP 429. Scan stopped to protect the quota.",
+                }
+
             structurally_valid = isinstance(raw_data, list)
             matches = flatten_live(raw_data) if structurally_valid else []
             n = len(matches) if structurally_valid else -1
+
         except Exception as e:
             matches = []
             n = -1
@@ -5723,6 +5879,7 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
             best_count, best_matches, best_status = n, matches, http_status
 
         if not suspicious:
+            _v572_clear_rate_limit()
             status = "LIVE_FEED_OK"
             if prev >= 20 and n < prev * 0.5:
                 status = "LIVE_FEED_DEGRADED"
@@ -5735,10 +5892,11 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
                 "attempts": attempts,
                 "safe_for_signals": True,
                 "safe_for_learning": True,
+                "rate_limit": _v572_rate_status(),
             }
 
         if i < FEED_GUARD_RETRIES - 1:
-            await asyncio.sleep(FEED_GUARD_DELAYS[min(i, len(FEED_GUARD_DELAYS)-1)])
+            await asyncio.sleep(FEED_GUARD_NORMAL_DELAYS[min(i, len(FEED_GUARD_NORMAL_DELAYS)-1)])
 
     return {
         "status": "LIVE_FEED_OUTAGE" if best_count <= 0 else "LIVE_FEED_DEGRADED",
@@ -5749,7 +5907,8 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
         "attempts": attempts,
         "safe_for_signals": False,
         "safe_for_learning": False,
-        "message": "Live feed remained suspicious after retries. Stale signals are not reused and Self Learning is frozen for this scan.",
+        "rate_limit": _v572_rate_status(),
+        "message": "Live feed remained suspicious after retries. Signals and Self Learning are frozen.",
     }
 
 @mcp.tool()
