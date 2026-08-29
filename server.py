@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.3-COMPLETE-LIVE-REACTOR"
-MODEL_TYPE = "heuristic-v5.3-complete-live-reactor-not-calibrated"
+VERSION = "V5.4-TIMING-SIGNALS"
+MODEL_TYPE = "heuristic-v5.4-timing-signals-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -119,7 +119,7 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 # Lightweight journal
 # -------------------------
 
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_3_signals.jsonl")
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_4_signals.jsonl")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -1739,6 +1739,10 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "memory_before_freshness_filter",
             "rising_radar_55_64",
             "human_market_comparison",
+            "first_half_goal_section",
+            "second_half_goal_section",
+            "take_now_soon_later",
+            "timed_entry_guidance",
             "phase_quota_selection",
             "tournament_diversity_prefilter",
             "goal_chain_board",
@@ -2667,7 +2671,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5.3",
+            "source": "hidden-signal-v5.4",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
@@ -2675,7 +2679,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
             "final_freshness": freshness,
         }
     return {
-        "source": "hidden-signal-v5.3",
+        "source": "hidden-signal-v5.4",
         "version": VERSION,
         "report": structured_market_report(rep),
         "technical": {
@@ -2799,7 +2803,7 @@ async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
 
     total = sum(len(v) for v in sections.values())
     return {
-        "source": "hidden-signal-v5.3",
+        "source": "hidden-signal-v5.4",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_matches_found": len(matches),
@@ -2911,7 +2915,7 @@ async def analyze_screenshot_quick(
     )
     report = _quick_screenshot_report(live, metrics, source_note)
     return {
-        "source": "hidden-signal-v5.3.1-screenshot",
+        "source": "hidden-signal-v5.4.1-screenshot",
         "version": VERSION,
         "latency_ms": int((time.time() - started) * 1000),
         "live_match_found": bool(best_match and best_similarity >= 0.58),
@@ -3025,7 +3029,7 @@ async def scan_thinking_live(limit: int = 12, concurrency: int = 2) -> Dict[str,
     )
 
     return {
-        "source": "hidden-signal-v5.3",
+        "source": "hidden-signal-v5.4",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -4101,6 +4105,158 @@ def _v53_compact_deep_summary(rep: Dict[str, Any], momentum: Optional[Dict[str, 
         "data_quality": (rep.get("data_quality") or {}).get("score"),
     }
 
+
+# ============================================================
+# V5.4 TIMING SIGNALS
+# Human split: FIRST HALF / SECOND HALF / BTTS / NEXT GOAL
+# and action timing: TAKE_NOW / SOON / LATER / WATCH_ONLY
+# ============================================================
+
+def _v54_timing_action(item: Dict[str, Any], minute: int, stage: str, momentum: Dict[str, Any], freshness: Dict[str, Any]) -> Dict[str, Any]:
+    p = float(item.get("probability") or 0)
+    market = str(item.get("market") or "")
+    decision = str(item.get("decision") or "")
+    mscore = float(momentum.get("score") or 0)
+    fresh = freshness.get("status") == "CONFIRMED"
+    stage_l = str(stage or "").lower()
+    halftime = "half time" in stage_l or "halftime" in stage_l
+
+    action = "WATCH_ONLY"
+    wait_for = None
+    reason = ""
+
+    if halftime:
+        action = "LATER"
+        wait_for = "дождаться начала 2-го тайма и первых 3–5 минут"
+        reason = "На перерыве не входим вслепую."
+    elif decision == "ENTER" and fresh:
+        action = "TAKE_NOW"
+        reason = "Сигнал уже подтверждён свежим live и моделью."
+    elif p >= 75 and not fresh:
+        action = "SOON"
+        wait_for = "подтверждение свежего счёта/минуты"
+        reason = "Процент высокий, но freshness ещё не подтверждён."
+    elif 65 <= p < 75:
+        if mscore >= 45:
+            action = "SOON"
+            wait_for = "ещё 1–2 атакующих подтверждения: створ/xG/штрафная"
+            reason = "Сигнал уже хороший и давление растёт."
+        else:
+            action = "LATER"
+            wait_for = "рост давления на следующем скане"
+            reason = "Сигнал есть, но свежего ускорения пока мало."
+    elif 55 <= p < 65:
+        action = "LATER"
+        wait_for = "переход выше 65% + рост давления"
+        reason = "Это ранний радар, не вход."
+    else:
+        action = "WATCH_ONLY"
+        reason = "Сигнал слишком слабый."
+
+    # First-half timing should be stricter as the clock runs.
+    if market == "GOAL_BEFORE_HALFTIME" and minute >= 40 and action == "LATER":
+        action = "SOON"
+        wait_for = "следующий опасный эпизод в ближайшие 1–2 минуты"
+        reason = "До перерыва мало времени, ждать долго уже нельзя."
+
+    if market in {"GOAL_NEXT_5", "GOAL_NEXT_10"} and p >= 75 and fresh and not halftime:
+        action = "TAKE_NOW"
+        reason = "Короткое окно: если брать, то только сейчас."
+
+    return {
+        "action": action,
+        "wait_for": wait_for,
+        "reason": reason,
+    }
+
+
+def _v54_market_section(view: Dict[str, Any]) -> Dict[str, Any]:
+    minute = int(view.get("minute") or 0)
+    stage = str(view.get("stage") or "")
+    freshness = view.get("freshness") or {}
+    momentum = view.get("SHORT_TERM_MOMENTUM") or {}
+    board = list(view.get("goal_board_65_99") or [])
+    radar = list(view.get("RISING_RADAR_55_64") or [])
+
+    sections = {
+        "FIRST_HALF_GOAL": [],
+        "SECOND_HALF_OR_FT_GOAL": [],
+        "BTTS": [],
+        "NEXT_GOAL_5_10": [],
+        "TEAM_GOAL": [],
+        "RADAR_LATER": [],
+    }
+
+    for item in board:
+        x = dict(item)
+        x["timing"] = _v54_timing_action(x, minute, stage, momentum, freshness)
+        market = x.get("market")
+        if market == "GOAL_BEFORE_HALFTIME":
+            sections["FIRST_HALF_GOAL"].append(x)
+        elif market == "GOAL_BEFORE_FULLTIME":
+            sections["SECOND_HALF_OR_FT_GOAL"].append(x)
+        elif market == "BTTS":
+            sections["BTTS"].append(x)
+        elif market in {"GOAL_NEXT_5", "GOAL_NEXT_10"}:
+            sections["NEXT_GOAL_5_10"].append(x)
+        elif market == "TEAM_GOAL":
+            sections["TEAM_GOAL"].append(x)
+        else:
+            sections["SECOND_HALF_OR_FT_GOAL"].append(x)
+
+    for item in radar:
+        x = dict(item)
+        x["timing"] = _v54_timing_action(x, minute, stage, momentum, freshness)
+        sections["RADAR_LATER"].append(x)
+
+    for key in sections:
+        sections[key].sort(key=lambda z: float(z.get("probability") or 0), reverse=True)
+
+    # Best action across sections.
+    flat = []
+    for key, vals in sections.items():
+        if key != "RADAR_LATER":
+            flat.extend(vals)
+
+    priority = {"TAKE_NOW": 4, "SOON": 3, "LATER": 2, "WATCH_ONLY": 1}
+    flat.sort(
+        key=lambda z: (
+            priority.get((z.get("timing") or {}).get("action"), 0),
+            float(z.get("probability") or 0)
+        ),
+        reverse=True
+    )
+
+    best = flat[0] if flat else None
+    return {
+        "sections": sections,
+        "BEST_TIMING_ACTION": best,
+    }
+
+
+def _v54_attach_timing(view: Dict[str, Any]) -> Dict[str, Any]:
+    timing = _v54_market_section(view)
+    view["TIMING_SECTIONS"] = timing["sections"]
+    view["BEST_TIMING_ACTION"] = timing["BEST_TIMING_ACTION"]
+
+    best = timing["BEST_TIMING_ACTION"]
+    if best:
+        t = best.get("timing") or {}
+        action = t.get("action")
+        if action == "TAKE_NOW":
+            human = f"БРАТЬ СЕЙЧАС: {best.get('title')} — {best.get('probability')}%"
+        elif action == "SOON":
+            human = f"СКОРО: {best.get('title')} — {best.get('probability')}%; ждём {t.get('wait_for')}"
+        elif action == "LATER":
+            human = f"ПОЗЖЕ: {best.get('title')} — {best.get('probability')}%; ждём {t.get('wait_for')}"
+        else:
+            human = "ТОЛЬКО НАБЛЮДЕНИЕ"
+    else:
+        human = "Сильного сигнала нет — пропускаем."
+
+    view["WHEN_TO_ENTER"] = human
+    return view
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -4234,7 +4390,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             })
             continue
 
-        view = _v53_human_view(rep, momentum, freshness)
+        view = _v54_attach_timing(_v53_human_view(rep, momentum, freshness))
         visible = view.get("goal_board_65_99") or []
         radar = view.get("RISING_RADAR_55_64") or []
 
@@ -4317,8 +4473,37 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         if float((c.get("SHORT_TERM_MOMENTUM") or {}).get("score") or 0) >= 22
     ]
 
+
+    first_half_now = []
+    second_half_now = []
+    btts_now = []
+    next_goal_now = []
+    take_now = []
+    take_soon = []
+    take_later = []
+
+    for c in candidates:
+        ts = c.get("TIMING_SECTIONS") or {}
+        if ts.get("FIRST_HALF_GOAL"):
+            first_half_now.append(c)
+        if ts.get("SECOND_HALF_OR_FT_GOAL"):
+            second_half_now.append(c)
+        if ts.get("BTTS"):
+            btts_now.append(c)
+        if ts.get("NEXT_GOAL_5_10"):
+            next_goal_now.append(c)
+
+        best_t = c.get("BEST_TIMING_ACTION") or {}
+        action = (best_t.get("timing") or {}).get("action")
+        if action == "TAKE_NOW":
+            take_now.append(c)
+        elif action == "SOON":
+            take_soon.append(c)
+        elif action == "LATER":
+            take_later.append(c)
+
     return {
-        "source": "hidden-signal-v5.3-complete-live",
+        "source": "hidden-signal-v5.4-complete-live",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_snapshot_at": now_iso(),
@@ -4333,6 +4518,15 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "RISING_PRESSURE_NOW": rising_now,
         "ALL_65_99": candidates,
         "RISING_RADAR_55_64": radar_rising[:10],
+
+        # V5.4 human timing split:
+        "GOAL_FIRST_HALF": first_half_now,
+        "GOAL_SECOND_HALF_OR_FT": second_half_now,
+        "BTTS_NOW": btts_now,
+        "NEXT_GOAL_5_10": next_goal_now,
+        "TAKE_NOW": take_now,
+        "TAKE_SOON": take_soon,
+        "TAKE_LATER": take_later,
 
         # Useful fallback so a scan is never 'dry' without explanation:
         "TOP_ANALYZED": analyzed_summaries[:8],
@@ -4374,7 +4568,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             f"memory {len(new_state)}."
         ),
 
-        "mode": "COMPLETE_LIVE_MEMORY_SOFT_FRESHNESS_RADAR",
+        "mode": "TIMING_SPLIT_NOW_SOON_LATER",
     }
 
 
@@ -4516,7 +4710,7 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
     ]
 
     return {
-        "source": "hidden-signal-v5.3.1-goal-hunter",
+        "source": "hidden-signal-v5.4.1-goal-hunter",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -4561,14 +4755,14 @@ async def analyze_goal_hunter_match(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5.3",
+            "source": "hidden-signal-v5.4",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
             "message": "Сигнал скрыт: live уже изменился.",
         }
     return {
-        "source": "hidden-signal-v5.3",
+        "source": "hidden-signal-v5.4",
         "version": VERSION,
         "report": _goal_hunter_view(rep),
         "technical": {
@@ -4670,7 +4864,7 @@ async def quick_screenshot_goal_hunter(
     }
 
     return {
-        "source": "hidden-signal-v5.3.1-screenshot",
+        "source": "hidden-signal-v5.4.1-screenshot",
         "version": VERSION,
         "live_match_found": bool(best_match and best_similarity >= 0.58),
         "match_similarity": round1(best_similarity * 100),
