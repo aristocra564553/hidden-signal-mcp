@@ -15,7 +15,7 @@ from starlette.responses import JSONResponse, Response
 # HIDDEN SIGNAL LIVE V3.0 — ZYLA ONLY
 # ============================================================
 
-VERSION = "V3.1-ZYLA-DQ"
+VERSION = "V3.2-ZYLA-DIAG"
 
 ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
 ZYLA_BASE_URL = (
@@ -772,6 +772,7 @@ def normalize_match(
         },
         "score_sync": score_sync,
         "parser_ok": parser_ok,
+        "stats_rows_count": stats["rows_count"],
         "parser_warning": (
             None
             if parser_ok
@@ -1021,15 +1022,20 @@ def apply_data_quality_guard(
     market = item.get("market")
 
     probability = float(item.get("probability", 0))
+    pre_guard_probability = probability
+    pre_guard_decision = item.get("decision")
     reasons = list(item.get("reasons", []))
+    dq_block_reasons = []
 
     # General completeness penalty.
     if dq["level"] == "MEDIUM":
         probability -= 5.0
         reasons.append(f"data quality {dq['score']}/100")
+        dq_block_reasons.append("medium data quality penalty")
     elif dq["level"] == "LOW":
         probability -= 12.0
         reasons.append(f"low data quality {dq['score']}/100")
+        dq_block_reasons.append("low data quality penalty")
 
     # Conservative unders are especially dangerous if chance-quality
     # metrics are missing: absence of xG is NOT xG=0.
@@ -1037,16 +1043,19 @@ def apply_data_quality_guard(
         if not metrics["availability"].get("xg", False):
             probability = min(probability, 69.0)
             reasons.append("xG unavailable: under cannot be strong")
+            dq_block_reasons.append("xG unavailable for under")
 
         if not metrics["availability"].get("touches_in_box", False):
             probability = min(probability, 72.0)
             reasons.append("box touches unavailable")
+            dq_block_reasons.append("box touches unavailable for under")
 
     # Team goal / BTTS needs at least one advanced attacking metric.
     if market in {"TEAM_GOAL", "BTTS"}:
         if metrics["data_quality"]["advanced_count"] == 0:
             probability = min(probability, 69.0)
             reasons.append("no advanced attack metric available")
+            dq_block_reasons.append("no advanced attack metric")
 
     probability = clamp(probability, 1, 94)
     color, decision = classify(probability)
@@ -1057,7 +1066,19 @@ def apply_data_quality_guard(
         color = "🟡"
         probability = min(probability, 74.0)
         reasons.append("strong signal blocked by data-quality guard")
+        dq_block_reasons.append("strong ENTER blocked: insufficient data quality")
 
+    # A signal counts as quality-blocked when it would have been ENTER before
+    # the Data Quality Guard, but the guard reduced it below ENTER / to WAIT.
+    data_quality_blocked = (
+        pre_guard_decision == "ENTER"
+        and decision != "ENTER"
+    )
+
+    item["pre_guard_probability"] = round(pre_guard_probability, 1)
+    item["pre_guard_decision"] = pre_guard_decision
+    item["data_quality_blocked"] = data_quality_blocked
+    item["data_quality_block_reasons"] = list(dict.fromkeys(dq_block_reasons))
     item["probability"] = round(probability, 1)
     item["signal"] = color
     item["decision"] = decision
@@ -1431,6 +1452,7 @@ async def analyze_match_internal(
         "diagnostic": {
             "fresh_live_http": http_status(fresh_live) if fresh_live else None,
             "stats_http": http_status(stats_payload),
+            "stats_rows_count": normalized.get("stats_rows_count", 0),
             "details_http": http_status(details_payload) if details_payload else None,
             "summary_http": http_status(summary_payload) if summary_payload else None,
             "odds_http": http_status(odds_payload) if odds_payload else None,
@@ -1525,6 +1547,9 @@ async def scan_zyla_live(
             "parser_failures": 0,
             "score_conflicts": 0,
             "quality_blocked": 0,
+            "parser_failure_details": [],
+            "analysis_errors": [],
+            "quality_blocked_signals": [],
             "strong_signals": [],
             "top_candidates": [],
             "estimated_api_calls_this_scan": 1,
@@ -1563,22 +1588,51 @@ async def scan_zyla_live(
         *(cheap(candidate) for candidate in selected)
     )
 
-    parser_failures = sum(
-        1
-        for item in cheap_results
-        if isinstance(item, dict)
-        and not item.get("error")
-        and item.get("parser_ok") is False
-    )
+    parser_failure_details = []
+    analysis_errors = []
 
-    quality_blocked = sum(
-        1
-        for item in cheap_results
-        if isinstance(item, dict)
-        and not item.get("error")
-        and item.get("parser_ok") is True
-        and not item.get("data_quality", {}).get("strong_eligible", False)
-    )
+    for candidate, item in zip(selected, cheap_results):
+        if not isinstance(item, dict):
+            analysis_errors.append({
+                "match_id": candidate.get("match_id"),
+                "home": candidate.get("home"),
+                "away": candidate.get("away"),
+                "error": "cheap analysis returned non-dict result",
+            })
+            continue
+
+        if item.get("error"):
+            analysis_errors.append({
+                "match_id": candidate.get("match_id"),
+                "home": candidate.get("home"),
+                "away": candidate.get("away"),
+                "minute": candidate.get("minute"),
+                "score": {
+                    "home": candidate.get("score_home"),
+                    "away": candidate.get("score_away"),
+                },
+                "error": item.get("error"),
+            })
+            continue
+
+        if item.get("parser_ok") is False:
+            parser_failure_details.append({
+                "match_id": item.get("match_id") or candidate.get("match_id"),
+                "home": item.get("match", {}).get("home") or candidate.get("home"),
+                "away": item.get("match", {}).get("away") or candidate.get("away"),
+                "minute": item.get("match", {}).get("minute", candidate.get("minute")),
+                "score": item.get("match", {}).get("score") or {
+                    "home": candidate.get("score_home"),
+                    "away": candidate.get("score_away"),
+                },
+                "warning": item.get("parser_warning"),
+                "stats_http": item.get("diagnostic", {}).get("stats_http"),
+                "stats_rows_count": item.get("diagnostic", {}).get("stats_rows_count", 0),
+                "availability": item.get("availability", {}),
+                "missing": item.get("data_quality", {}).get("missing", []),
+            })
+
+    parser_failures = len(parser_failure_details)
 
     valid = [
         item
@@ -1626,6 +1680,14 @@ async def scan_zyla_live(
         if deep_seed
         else []
     )
+
+    for item in deep_results:
+        if isinstance(item, dict) and item.get("error"):
+            analysis_errors.append({
+                "match_id": item.get("match_id"),
+                "stage": "deep",
+                "error": item.get("error"),
+            })
 
     final_by_id = {
         item["match_id"]: item
@@ -1683,6 +1745,38 @@ async def scan_zyla_live(
                 "risk": signal["risk"],
                 "reasons": signal["reasons"],
             })
+
+    # Return EVERY potential ENTER that the Data Quality Guard downgraded.
+    # This list is independent of Top-5 truncation, so diagnostics are complete.
+    quality_blocked_signals = []
+
+    for analysis in final_results:
+        match = analysis["match"]
+        for signal in analysis.get("all_signals", []):
+            if not signal.get("data_quality_blocked"):
+                continue
+
+            quality_blocked_signals.append({
+                "match_id": analysis["match_id"],
+                "home": match["home"],
+                "away": match["away"],
+                "minute": match["minute"],
+                "score": match["score"],
+                "market": signal.get("market"),
+                "selection": signal.get("selection"),
+                "pre_guard_probability": signal.get("pre_guard_probability"),
+                "final_probability": signal.get("probability"),
+                "final_decision": signal.get("decision"),
+                "data_quality": analysis.get("data_quality"),
+                "block_reasons": signal.get("data_quality_block_reasons", []),
+                "reasons": signal.get("reasons", []),
+            })
+
+    quality_blocked_signals.sort(
+        key=lambda item: item.get("pre_guard_probability") or 0,
+        reverse=True,
+    )
+    quality_blocked = len(quality_blocked_signals)
 
     # Apply repeat guard only ONCE, after the scan has finished.
     strong_signals = []
@@ -1753,6 +1847,9 @@ async def scan_zyla_live(
         "parser_failures": parser_failures,
         "score_conflicts": score_conflicts,
         "quality_blocked": quality_blocked,
+        "parser_failure_details": parser_failure_details,
+        "analysis_errors": analysis_errors,
+        "quality_blocked_signals": quality_blocked_signals,
         "strong_signal_threshold": STRONG_THRESHOLD,
         "strong_signals": strong_signals,
         "top_candidates": top_candidates[:5],
@@ -1760,7 +1857,8 @@ async def scan_zyla_live(
         "note": (
             "The scanner uses the exact scores object from the same fresh "
             "Zyla live-list response for all candidates. Repeat filtering is "
-            "applied only after the scan is complete."
+            "applied only after the scan is complete. Parser failures and "
+            "all Data Quality Guard downgrades are returned explicitly."
         ),
     }
 
@@ -1842,8 +1940,10 @@ async def hidden_signal_status():
             "missing_stats_are_not_zero": True,
             "data_quality_guard": True,
             "strong_enter_requires_advanced_metric": True,
+            "parser_failure_details": True,
+            "all_quality_blocked_signals_returned": True,
         },
-        "model_type": "heuristic-v3.1-not-calibrated",
+        "model_type": "heuristic-v3.2-not-calibrated",
         "important_note": (
             "Signal percentages are heuristic ranking estimates, not "
             "calibrated statistical probabilities."
