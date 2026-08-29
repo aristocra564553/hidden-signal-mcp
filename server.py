@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V4.2-CONTEXT-REACTOR"
-MODEL_TYPE = "heuristic-v4.2-dual-safe-live-context-not-calibrated"
+VERSION = "V4.3-ANTI-STALE-NEXT-GOAL"
+MODEL_TYPE = "heuristic-v4.3-anti-stale-next-goal-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -42,6 +42,8 @@ STRONG_THRESHOLD = 75.0
 EARLY_MINUTE_HARD = 8
 EARLY_MINUTE_SOFT = 15
 STALE_SECONDS = 90
+GOAL_COOLDOWN_SECONDS = 150
+FINAL_MINUTE_DRIFT_MAX = 4
 
 mcp = FastMCP(
     "Hidden Signal Live",
@@ -118,6 +120,8 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 
 SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v4_signals.jsonl")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
+_MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
+_GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
 
 def log_event(payload: Dict[str, Any]) -> None:
     record = {"logged_at": now_iso(), **payload}
@@ -144,6 +148,141 @@ def is_new_or_changed(match_id: str, signal: Dict[str, Any]) -> bool:
     )
     _REPEAT_MEMORY[key] = current
     return changed
+
+
+def register_live_state(match: Dict[str, Any]) -> Dict[str, Any]:
+    """Track score changes between scans and activate a short post-goal cooldown."""
+    match_id = str(match.get("match_id") or "")
+    now_ts = time.time()
+    score = match.get("score") or {"home": 0, "away": 0, "total": 0}
+    minute = int(match.get("minute") or 0)
+    previous = _MATCH_STATE_MEMORY.get(match_id)
+    goal_detected = False
+    if previous:
+        prev_score = previous.get("score") or {}
+        if (
+            int(score.get("home", 0)) != int(prev_score.get("home", 0))
+            or int(score.get("away", 0)) != int(prev_score.get("away", 0))
+        ):
+            goal_detected = True
+            _GOAL_COOLDOWN_UNTIL[match_id] = now_ts + GOAL_COOLDOWN_SECONDS
+            log_event({
+                "type": "goal_state_change",
+                "match_id": match_id,
+                "previous_score": prev_score,
+                "new_score": score,
+                "minute": minute,
+                "cooldown_seconds": GOAL_COOLDOWN_SECONDS,
+            })
+    _MATCH_STATE_MEMORY[match_id] = {
+        "score": dict(score),
+        "minute": minute,
+        "seen_at": now_ts,
+    }
+    cooldown_until = float(_GOAL_COOLDOWN_UNTIL.get(match_id, 0.0))
+    remaining = max(0, int(round(cooldown_until - now_ts)))
+    if remaining <= 0:
+        _GOAL_COOLDOWN_UNTIL.pop(match_id, None)
+    return {
+        "goal_detected": goal_detected,
+        "cooldown_active": remaining > 0,
+        "cooldown_remaining_seconds": remaining,
+    }
+
+
+def score_equal(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return (
+        int((a or {}).get("home", 0)) == int((b or {}).get("home", 0))
+        and int((a or {}).get("away", 0)) == int((b or {}).get("away", 0))
+    )
+
+
+def final_freshness_check(
+    analyzed_match: Dict[str, Any],
+    fresh_match: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Fail closed if the match changed while analysis was running."""
+    if fresh_match is None:
+        return {
+            "ok": False,
+            "reason": "MATCH_NOT_IN_FINAL_LIVE_LIST",
+            "score_changed": False,
+            "minute_drift": None,
+            "cooldown_active": False,
+        }
+
+    state = register_live_state(fresh_match)
+    analyzed_score = analyzed_match.get("score") or {}
+    fresh_score = fresh_match.get("score") or {}
+    analyzed_minute = int(analyzed_match.get("minute") or 0)
+    fresh_minute = int(fresh_match.get("minute") or 0)
+    minute_drift = fresh_minute - analyzed_minute
+
+    if not score_equal(analyzed_score, fresh_score):
+        _GOAL_COOLDOWN_UNTIL[str(fresh_match.get("match_id") or "")] = time.time() + GOAL_COOLDOWN_SECONDS
+        return {
+            "ok": False,
+            "reason": "STALE_AFTER_GOAL",
+            "score_changed": True,
+            "analyzed_score": analyzed_score,
+            "fresh_score": fresh_score,
+            "analyzed_minute": analyzed_minute,
+            "fresh_minute": fresh_minute,
+            "minute_drift": minute_drift,
+            "cooldown_active": True,
+            "cooldown_remaining_seconds": GOAL_COOLDOWN_SECONDS,
+        }
+
+    if not fresh_match.get("is_in_progress"):
+        return {
+            "ok": False,
+            "reason": "MATCH_NOT_IN_PROGRESS",
+            "score_changed": False,
+            "minute_drift": minute_drift,
+            "cooldown_active": state["cooldown_active"],
+            "cooldown_remaining_seconds": state["cooldown_remaining_seconds"],
+        }
+
+    if not fresh_match.get("minute_valid", True):
+        return {
+            "ok": False,
+            "reason": "INVALID_FINAL_MINUTE",
+            "score_changed": False,
+            "minute_drift": minute_drift,
+            "cooldown_active": state["cooldown_active"],
+            "cooldown_remaining_seconds": state["cooldown_remaining_seconds"],
+        }
+
+    if minute_drift > FINAL_MINUTE_DRIFT_MAX:
+        return {
+            "ok": False,
+            "reason": "FINAL_SNAPSHOT_TOO_OLD",
+            "score_changed": False,
+            "minute_drift": minute_drift,
+            "cooldown_active": state["cooldown_active"],
+            "cooldown_remaining_seconds": state["cooldown_remaining_seconds"],
+        }
+
+    if state["cooldown_active"]:
+        return {
+            "ok": False,
+            "reason": "POST_GOAL_COOLDOWN",
+            "score_changed": False,
+            "minute_drift": minute_drift,
+            "cooldown_active": True,
+            "cooldown_remaining_seconds": state["cooldown_remaining_seconds"],
+        }
+
+    return {
+        "ok": True,
+        "reason": "FRESH",
+        "score_changed": False,
+        "minute_drift": minute_drift,
+        "fresh_score": fresh_score,
+        "fresh_minute": fresh_minute,
+        "cooldown_active": False,
+        "cooldown_remaining_seconds": 0,
+    }
 
 
 # -------------------------
@@ -853,10 +992,23 @@ def apply_live_guards(
     return round1(clamp(p)), reasons
 
 
-def live_decision_for(p: float, q: Dict[str, Any]) -> str:
-    if p >= 80 and q.get("basic_ok"):
+def live_decision_for(p: float, q: Dict[str, Any], market: str = "") -> str:
+    # LIVE is intentionally stricter than V4.2: completeness alone is not enough.
+    dq = float(q.get("score") or 0)
+    advanced = int(q.get("advanced_count") or 0)
+    robust = bool(q.get("robust_basic_sample"))
+    next_goal_market = market.startswith("NEXT_GOAL") or market.startswith("GOAL_NEXT_")
+
+    if next_goal_market:
+        if p >= 80 and q.get("basic_ok") and dq >= 65 and (advanced >= 1 or robust):
+            return "LIVE_ENTER"
+        if p >= 72 and q.get("basic_ok") and dq >= 50:
+            return "WATCH"
+        return "PASS"
+
+    if p >= 80 and q.get("basic_ok") and dq >= 60 and (advanced >= 1 or robust):
         return "LIVE_ENTER"
-    if p >= 72:
+    if p >= 72 and q.get("basic_ok") and dq >= 45:
         return "WATCH"
     return "PASS"
 
@@ -877,7 +1029,7 @@ def signal_obj(
     decision = decision_for(guarded_p, q)
     if live_p is None:
         live_p = raw_p
-    live_decision = live_decision_for(float(live_p), q)
+    live_decision = live_decision_for(float(live_p), q, market)
     return {
         "market": market,
         "selection": selection,
@@ -973,7 +1125,7 @@ def build_signals(
         team_name = live["home"] if side == "home" else live["away"]
         p, guards, blocked, tlive, tlr = dual_values(raw, "TEAM_GOAL")
         signals.append(signal_obj(
-            "TEAM_GOAL", f"{team_name} to score", raw, p, q,
+            "TEAM_GOAL", f"{team_name} to score another goal" if score[side] > 0 else f"{team_name} to score", raw, p, q,
             [
                 f"{side} share {share:.0f}%",
                 f"{side} xG {side_val(metrics,'xg',side):.2f}" if metrics["xg"]["present"] else f"{side} xG missing",
@@ -984,14 +1136,38 @@ def build_signals(
             blocked=blocked, live_p=tlive, live_guard_reasons=tlr
         ))
 
-    # next windows
-    for window in (5, 10):
+    # nearest-goal windows. 3' is ultra-fast; 5'/10' are progressively broader.
+    for window in (3, 5, 10):
         raw = next_window_probability(goal_raw, minute, window)
         p, guards, blocked, wlive, wlr = dual_values(raw, f"GOAL_NEXT_{window}")
         signals.append(signal_obj(
-            f"GOAL_NEXT_{window}", f"Goal in next {window} minutes", raw, p, q,
-            reasons_goal, guards, risk="high", blocked=blocked, live_p=wlive, live_guard_reasons=wlr
+            f"GOAL_NEXT_{window}", f"Any goal in next {window} minutes", raw, p, q,
+            reasons_goal + [f"nearest-goal window {window}m"], guards,
+            risk="high" if window <= 5 else "medium",
+            blocked=blocked, live_p=wlive, live_guard_reasons=wlr
         ))
+
+        # Team-specific next-goal estimate is unconditional: it includes the chance
+        # that there is no goal in the window, so it cannot exceed ANY-GOAL probability.
+        for side, share in (("home", hshare), ("away", ashare)):
+            team_name = live["home"] if side == "home" else live["away"]
+            team_raw = clamp(raw * (share / 100.0) * 1.08, 1, raw)
+            tp, tgr, tblocked, tlive, tlr = dual_values(team_raw, f"NEXT_GOAL_TEAM_{window}")
+            signals.append(signal_obj(
+                f"NEXT_GOAL_TEAM_{window}",
+                f"{team_name} next goal within {window} minutes",
+                team_raw, tp, q,
+                [
+                    f"any-goal window raw {raw:.1f}%",
+                    f"{team_name} attacking share {share:.0f}%",
+                    f"pressure {pressure[side]}/100",
+                ],
+                tgr,
+                risk="high",
+                blocked=tblocked,
+                live_p=min(tlive, wlive),
+                live_guard_reasons=tlr,
+            ))
 
     # first half goal only if applicable
     if minute < 45:
@@ -1004,27 +1180,72 @@ def build_signals(
             guards, blocked=blocked, live_p=hlive, live_guard_reasons=hlr
         ))
 
-    # BTTS YES only meaningful if neither/both state considered
-    if score["home"] > 0 and score["away"] > 0:
-        btts_raw = 100.0
-    elif score["home"] > 0:
-        btts_raw = away_raw
-    elif score["away"] > 0:
-        btts_raw = home_raw
-    else:
-        # both still need to score: strong dependence penalty
-        btts_raw = (home_raw / 100.0) * (away_raw / 100.0) * 100.0 * 0.82
+    # BTTS YES must never be emitted after it is already settled.
+    if not (score["home"] > 0 and score["away"] > 0):
+        if score["home"] > 0:
+            btts_raw = away_raw
+        elif score["away"] > 0:
+            btts_raw = home_raw
+        else:
+            # both still need to score: strong dependence penalty
+            btts_raw = (home_raw / 100.0) * (away_raw / 100.0) * 100.0 * 0.82
 
-    p, guards, blocked, blive, blr = dual_values(btts_raw, "BTTS")
-    signals.append(signal_obj(
-        "BTTS", "Both teams to score - YES", btts_raw, p, q,
-        [f"score {score['home']}-{score['away']}", f"team goal raw {home_raw:.1f}%/{away_raw:.1f}%"],
-        guards, blocked=blocked, live_p=blive, live_guard_reasons=blr
-    ))
+        p, guards, blocked, blive, blr = dual_values(btts_raw, "BTTS")
+        signals.append(signal_obj(
+            "BTTS", "Both teams to score - YES", btts_raw, p, q,
+            [f"score {score['home']}-{score['away']}", f"team goal raw {home_raw:.1f}%/{away_raw:.1f}%"],
+            guards, blocked=blocked, live_p=blive, live_guard_reasons=blr
+        ))
 
     # Sort strongest first
     signals.sort(key=lambda x: float(x["probability"]), reverse=True)
     return signals
+
+
+def nearest_goal_assessment(signals: List[Dict[str, Any]], live: Dict[str, Any], q: Dict[str, Any], pressure: Dict[str, float]) -> Dict[str, Any]:
+    windows: Dict[str, Any] = {}
+    for w in (3, 5, 10):
+        any_sig = next((s for s in signals if s.get("market") == f"GOAL_NEXT_{w}"), None)
+        team_sigs = [s for s in signals if s.get("market") == f"NEXT_GOAL_TEAM_{w}"]
+        team_sigs.sort(key=lambda x: float(x.get("live_probability") or 0), reverse=True)
+        windows[str(w)] = {
+            "any_goal": any_sig,
+            "best_team": team_sigs[0] if team_sigs else None,
+        }
+
+    home_p = float(pressure.get("home") or 0)
+    away_p = float(pressure.get("away") or 0)
+    if home_p > away_p + 8:
+        likely_side = live.get("home")
+    elif away_p > home_p + 8:
+        likely_side = live.get("away")
+    else:
+        likely_side = "unclear"
+
+    best_candidates = [
+        s for s in signals
+        if s.get("market") in {
+            "GOAL_NEXT_3", "GOAL_NEXT_5", "GOAL_NEXT_10",
+            "NEXT_GOAL_TEAM_3", "NEXT_GOAL_TEAM_5", "NEXT_GOAL_TEAM_10",
+        }
+    ]
+    best_candidates.sort(
+        key=lambda x: (
+            2 if x.get("live_decision") == "LIVE_ENTER" else 1 if x.get("live_decision") == "WATCH" else 0,
+            float(x.get("live_probability") or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "minute": live.get("minute"),
+        "score": live.get("score"),
+        "likely_next_goal_side": likely_side,
+        "data_quality_score": q.get("score"),
+        "data_quality_level": q.get("level"),
+        "windows": windows,
+        "best_nearest_goal_signal": best_candidates[0] if best_candidates else None,
+        "policy": "LIVE_ENTER requires fresh score, no post-goal cooldown, DQ>=65 and sufficient live sample.",
+    }
 
 
 # -------------------------
@@ -1209,7 +1430,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live:
             return {
-                "source": "football-reactor-v4.2",
+                "source": "football-reactor-v4.3",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "NOT_LIVE_OR_NOT_FOUND",
@@ -1218,7 +1439,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live.get("minute_valid", True):
             return {
-                "source": "football-reactor-v4.2",
+                "source": "football-reactor-v4.3",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "INVALID_LIVE_MINUTE",
@@ -1255,6 +1476,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         h2h = h2h_context(h2h_r.get("data"))
         pressure = pressure_score(metrics, int(live["minute"]))
         signals = build_signals(live, metrics, q, pressure, lineups)
+        nearest_goal = nearest_goal_assessment(signals, live, q, pressure)
 
         # Historical context is fetched only for meaningful candidates, keeping quota under control.
         top_pre_context = signals[0] if signals else None
@@ -1320,7 +1542,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         ]
 
         report = {
-            "source": "football-reactor-v4.2",
+            "source": "football-reactor-v4.3",
             "version": VERSION,
             "model_type": MODEL_TYPE,
             "match_id": match_id,
@@ -1355,6 +1577,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             "historical_context": history_context,
             "consensus": consensus,
             "correlation_groups": corr,
+            "nearest_goal": nearest_goal,
             "top_candidate": top3[0] if top3 else None,
             "top_3_signals": top3,
             "strong_signals": strong,
@@ -1432,6 +1655,10 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "small_sample_guard",
             "red_card_uncertainty_guard",
             "correlation_guard",
+            "final_freshness_guard",
+            "post_goal_cooldown_guard",
+            "settled_market_guard",
+            "next_goal_quality_guard",
         ],
         "modules": [
             "live_core",
@@ -1451,6 +1678,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "dual_safe_live_engine",
             "consensus_engine",
             "signal_journal",
+            "nearest_goal_engine",
+            "anti_stale_final_refresh",
         ],
         "notes": [
             "Probabilities are heuristic ranking estimates, not calibrated true probabilities.",
@@ -1467,7 +1696,7 @@ async def get_zyla_live_matches() -> Dict[str, Any]:
         r = await client.live()
         matches = flatten_live(r.get("data"))
         return {
-            "source": "football-reactor-v4.2",
+            "source": "football-reactor-v4.3",
             "version": VERSION,
             "http_status": r["status"],
             "live_matches_found": len(matches),
@@ -1498,7 +1727,7 @@ async def analyze_zyla_match(match_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def reactor_match_report(match_id: str) -> Dict[str, Any]:
-    """Full V4 reactor report for one live football match."""
+    """Full V4.3 reactor report for one live football match."""
     return await analyze_match_internal(match_id)
 
 @mcp.tool()
@@ -1535,12 +1764,55 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
                 "error": repr(e),
             })
 
+    # Final live refresh: no ENTER/WATCH leaves the scanner without a last score/minute check.
+    final_client = ZylaClient()
+    try:
+        final_live_r = await final_client.live()
+        final_matches = flatten_live(final_live_r.get("data"))
+    finally:
+        await final_client.close()
+    final_map = {str(m.get("match_id")): m for m in final_matches if m.get("match_id")}
+
+    stale_blocked_matches = []
+    cooldown_blocked_matches = []
+    for rep in reports:
+        if rep.get("status") != "OK":
+            continue
+        match_id = str(rep.get("match_id") or "")
+        freshness = final_freshness_check(rep.get("match") or {}, final_map.get(match_id))
+        rep["final_freshness"] = freshness
+        if not freshness.get("ok"):
+            reason = freshness.get("reason")
+            rep["strong_signals"] = []
+            rep["live_watchlist"] = []
+            rep["top_candidate"] = None
+            if isinstance(rep.get("nearest_goal"), dict):
+                rep["nearest_goal"]["best_nearest_goal_signal"] = None
+                rep["nearest_goal"]["blocked_by_freshness"] = reason
+            if reason in {"STALE_AFTER_GOAL", "FINAL_SNAPSHOT_TOO_OLD", "MATCH_NOT_IN_FINAL_LIVE_LIST", "MATCH_NOT_IN_PROGRESS", "INVALID_FINAL_MINUTE"}:
+                stale_blocked_matches.append({
+                    "match_id": match_id,
+                    "home": rep.get("match", {}).get("home"),
+                    "away": rep.get("match", {}).get("away"),
+                    "reason": reason,
+                    "freshness": freshness,
+                })
+            if reason == "POST_GOAL_COOLDOWN":
+                cooldown_blocked_matches.append({
+                    "match_id": match_id,
+                    "home": rep.get("match", {}).get("home"),
+                    "away": rep.get("match", {}).get("away"),
+                    "reason": reason,
+                    "freshness": freshness,
+                })
+
     parser_failures = []
     score_conflicts = []
     quality_blocked = []
     analysis_errors = []
     strong_signals = []
     live_watchlist = []
+    nearest_goal_signals = []
     top_candidates = []
 
     for rep in reports:
@@ -1593,6 +1865,21 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
                 "pressure": rep.get("pressure"),
                 **s,
             })
+        ng = rep.get("nearest_goal") or {}
+        ng_best = ng.get("best_nearest_goal_signal") if isinstance(ng, dict) else None
+        if ng_best and rep.get("final_freshness", {}).get("ok"):
+            nearest_goal_signals.append({
+                "match_id": rep.get("match_id"),
+                "home": rep.get("match", {}).get("home"),
+                "away": rep.get("match", {}).get("away"),
+                "minute": rep.get("final_freshness", {}).get("fresh_minute", rep.get("match", {}).get("minute")),
+                "score": rep.get("final_freshness", {}).get("fresh_score", rep.get("match", {}).get("score")),
+                "data_quality": rep.get("data_quality"),
+                "pressure": rep.get("pressure"),
+                "likely_next_goal_side": ng.get("likely_next_goal_side"),
+                **ng_best,
+            })
+
         if rep.get("top_candidate"):
             top_candidates.append({
                 "match_id": rep.get("match_id"),
@@ -1608,9 +1895,16 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
     top_candidates.sort(key=lambda x: float(x.get("probability") or 0), reverse=True)
     strong_signals.sort(key=lambda x: float(x.get("probability") or 0), reverse=True)
     live_watchlist.sort(key=lambda x: float(x.get("live_probability") or 0), reverse=True)
+    nearest_goal_signals.sort(
+        key=lambda x: (
+            2 if x.get("live_decision") == "LIVE_ENTER" else 1 if x.get("live_decision") == "WATCH" else 0,
+            float(x.get("live_probability") or 0),
+        ),
+        reverse=True,
+    )
 
     return {
-        "source": "football-reactor-v4.2",
+        "source": "football-reactor-v4.3",
         "version": VERSION,
         "status": "OK" if live_r.get("ok") else "LIVE_FETCH_ERROR",
         "live_http_status": live_r.get("status"),
@@ -1636,11 +1930,18 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
         "parser_failure_details": parser_failures,
         "analysis_errors": analysis_errors,
         "quality_blocked_signals": quality_blocked,
+        "final_live_http_status": final_live_r.get("status"),
+        "stale_blocked": len(stale_blocked_matches),
+        "stale_blocked_matches": stale_blocked_matches,
+        "post_goal_cooldown_blocked": len(cooldown_blocked_matches),
+        "post_goal_cooldown_matches": cooldown_blocked_matches,
         "strong_signal_threshold": STRONG_THRESHOLD,
         "strong_signals": strong_signals,
+        "nearest_goal_signals": nearest_goal_signals[:10],
+        "best_nearest_goal_signal": nearest_goal_signals[0] if nearest_goal_signals else None,
         "live_watchlist": live_watchlist[:10],
         "top_candidates": top_candidates[:8],
-        "estimated_api_calls_this_scan": 1 + sum(int(r.get("diagnostic", {}).get("estimated_api_calls") or 0) for r in reports if isinstance(r, dict)),
+        "estimated_api_calls_this_scan": 2 + sum(int(r.get("diagnostic", {}).get("estimated_api_calls") or 0) for r in reports if isinstance(r, dict)),
         "reactor_notes": [
             "Fresh live list is authoritative for score/minute.",
             "Lineups and match player stats are fetched for deep-analyzed matches.",
@@ -1648,9 +1949,39 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
             "SAFE probability applies data-quality gating; LIVE probability surfaces pressure-driven WATCH candidates without bypassing sample guards.",
             "Invalid live minutes are rejected before deep analysis.",
             "Correlated markets are grouped inside each match report.",
+            "A final live refresh blocks stale signals after a goal or material minute drift.",
+            "A short post-goal cooldown blocks signals while provider stats catch up.",
+            "Already-settled markets such as BTTS YES after both teams scored are never emitted.",
+            "Nearest-goal engine ranks ANY GOAL and likely scoring side for 3/5/10-minute windows.",
             "Probabilities are not calibrated until enough logged outcomes are collected.",
         ],
     }
+
+@mcp.tool()
+async def scan_next_goal(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict[str, Any]:
+    """Run the full scanner and return only fresh nearest-goal candidates."""
+    result = await scan_zyla_live(prefilter_limit=prefilter_limit, deep_limit=deep_limit)
+    return {
+        "source": result.get("source"),
+        "version": result.get("version"),
+        "status": result.get("status"),
+        "live_matches_found": result.get("live_matches_found"),
+        "fully_analyzed": result.get("fully_analyzed"),
+        "final_live_http_status": result.get("final_live_http_status"),
+        "stale_blocked": result.get("stale_blocked"),
+        "post_goal_cooldown_blocked": result.get("post_goal_cooldown_blocked"),
+        "parser_failures": result.get("parser_failures"),
+        "quality_blocked": result.get("quality_blocked"),
+        "best_nearest_goal_signal": result.get("best_nearest_goal_signal"),
+        "nearest_goal_signals": result.get("nearest_goal_signals", []),
+        "policy": {
+            "safe_enter": "SAFE >=75 with data-quality eligibility",
+            "live_enter": "LIVE >=80 with DQ>=65, basic live stats and sufficient sample",
+            "freshness": "final score/minute rechecked immediately before output",
+            "cooldown": f"{GOAL_COOLDOWN_SECONDS}s after detected score change",
+        },
+    }
+
 
 @mcp.tool()
 async def get_zyla_team_context(team_id: str, page: int = 1) -> Dict[str, Any]:
@@ -1662,7 +1993,7 @@ async def get_zyla_team_context(team_id: str, page: int = 1) -> Dict[str, Any]:
             client.team_fixtures(team_id, page),
         )
         return {
-            "source": "football-reactor-v4.2", "version": VERSION, "team_id": team_id,
+            "source": "football-reactor-v4.3", "version": VERSION, "team_id": team_id,
             "recent_results_http": results_r.get("status"),
             "fixtures_http": fixtures_r.get("status"),
             "recent_summary": parse_team_history(results_r.get("data"), team_id),
@@ -1682,7 +2013,7 @@ async def get_zyla_team_profile(team_url: str, include_squad: bool = False) -> D
         else:
             details_r = await client.team_details(team_url); squad_r = {"status": None, "data": None}
         return {
-            "source": "football-reactor-v4.2", "version": VERSION, "team_url": team_url,
+            "source": "football-reactor-v4.3", "version": VERSION, "team_url": team_url,
             "details_http": details_r.get("status"), "details": details_r.get("data"),
             "squad_http": squad_r.get("status"), "squad": squad_r.get("data"),
         }
@@ -1700,7 +2031,7 @@ async def get_zyla_tournament_context(tournament_id: str, tournament_stage_id: s
             client.tournament_over_under(tournament_id, tournament_stage_id, type_, sub_type),
         )
         return {
-            "source": "football-reactor-v4.2", "version": VERSION,
+            "source": "football-reactor-v4.3", "version": VERSION,
             "tournament_id": tournament_id, "tournament_stage_id": tournament_stage_id,
             "details_http": details_r.get("status"), "details": details_r.get("data"),
             "form_http": form_r.get("status"), "form": form_r.get("data"),
