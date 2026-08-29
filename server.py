@@ -1559,11 +1559,25 @@ async def analyze_match_internal(
     include_summary: bool = True,
     include_odds: bool = True,
 ):
-    # If no live fallback supplied, get it from the cached live list.
-    if live_candidate is None:
-        live = await zyla_live()
-        candidates = extract_live_candidates(live)
-        live_candidate = find_live_candidate(candidates, match_id)
+    # Всегда берём СВЕЖИЙ live-list без кэша.
+    fresh_live = await zyla_get(
+        23856,
+        "get+live+matches",
+        {"sport_id": 1},
+        cache_key=None,
+        cache_ttl=0,
+    )
+
+    fresh_candidates = extract_live_candidates(fresh_live)
+
+    fresh_candidate = find_live_candidate(
+        fresh_candidates,
+        match_id,
+    )
+
+    # Свежий live имеет приоритет.
+    if fresh_candidate is not None:
+        live_candidate = fresh_candidate
 
     tasks = [
         zyla_stats(match_id),
@@ -1592,6 +1606,29 @@ async def analyze_match_internal(
     summary = mapped.get("summary", {})
     odds = mapped.get("odds", {})
 
+    # Проверяем конфликт счёта.
+    live_score = None
+    details_score = None
+    score_conflict = False
+
+    if live_candidate is not None:
+        live_score = (
+            int(live_candidate.get("score_home", 0)),
+            int(live_candidate.get("score_away", 0)),
+        )
+
+    if details:
+        details_score = parse_score(
+            unwrap(details)
+        )
+
+    if (
+        live_score is not None
+        and details_score is not None
+        and live_score != details_score
+    ):
+        score_conflict = True
+
     normalized = normalize_match(
         live_candidate,
         details,
@@ -1611,6 +1648,27 @@ async def analyze_match_internal(
         build_signals(normalized),
     )
 
+    # Если endpoints расходятся по счёту,
+    # никаких ENTER не разрешаем.
+    if score_conflict:
+        guarded_signals = []
+
+        for signal in signals:
+            signal = dict(signal)
+
+            if signal.get("decision") == "ENTER":
+                signal["decision"] = "WAIT"
+                signal["signal"] = "🟡"
+                signal["risk"] = "high"
+                signal["reasons"] = (
+                    signal.get("reasons", [])
+                    + ["score conflict between live list and match details"]
+                )[:5]
+
+            guarded_signals.append(signal)
+
+        signals = guarded_signals
+
     strong = [
         item
         for item in signals
@@ -1620,14 +1678,38 @@ async def analyze_match_internal(
 
     return {
         "match_id": match_id,
+
         "match": {
             "home": normalized["home"],
             "away": normalized["away"],
             "minute": normalized["minute"],
             "score": normalized["score"],
         },
+
+        "score_sync": {
+            "ok": not score_conflict,
+            "live_score": (
+                {
+                    "home": live_score[0],
+                    "away": live_score[1],
+                }
+                if live_score is not None
+                else None
+            ),
+            "details_score": (
+                {
+                    "home": details_score[0],
+                    "away": details_score[1],
+                }
+                if details_score is not None
+                else None
+            ),
+            "conflict": score_conflict,
+        },
+
         "parser_ok": normalized["parser_ok"],
         "parser_warning": normalized["parser_warning"],
+
         "metrics": {
             "xg": normalized["xg"],
             "shots": normalized["shots"],
@@ -1638,21 +1720,42 @@ async def analyze_match_internal(
             "possession": normalized["possession"],
             "red_cards": normalized["red_cards"],
         },
+
         "pressure": pressure,
-        "odds_snapshot": parse_odds_snapshot(odds),
-        "top_candidate": signals[0] if signals else None,
+
+        "odds_snapshot": parse_odds_snapshot(
+            odds
+        ),
+
+        "top_candidate": (
+            signals[0]
+            if signals
+            else None
+        ),
+
         "strong_signals": strong,
         "all_signals": signals,
+
         "diagnostic": {
+            "live_http": http_status(fresh_live),
             "stats_http": http_status(stats),
-            "details_http": http_status(details) if details else None,
-            "summary_http": http_status(summary) if summary else None,
-            "odds_http": http_status(odds) if odds else None,
+            "details_http": (
+                http_status(details)
+                if details
+                else None
+            ),
+            "summary_http": (
+                http_status(summary)
+                if summary
+                else None
+            ),
+            "odds_http": (
+                http_status(odds)
+                if odds
+                else None
+            ),
         },
     }
-
-
-@mcp.tool()
 async def analyze_zyla_match(match_id: str):
     """
     Analyze one Zyla live match with normalized stats, events, odds and signals.
