@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.4a-FINAL-MATCH-VERIFY-FIX"
-MODEL_TYPE = "heuristic-v5.7.4a-final-match-verify-fix-not-calibrated"
+VERSION = "V5.7.4b-FINAL-SNAPSHOT-RECOVERY"
+MODEL_TYPE = "heuristic-v5.7.4b-final-snapshot-recovery-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -6358,10 +6358,19 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     try:
         final_r = await final_client.live()
         final_matches = flatten_live(final_r.get("data"))
-        targeted_final_verify = await _v574_targeted_freshness_recovery(deep_reports, final_matches)
-
     finally:
         await final_client.close()
+
+    # V5.7.4b:
+    # A zero-sized second snapshot after a healthy first snapshot is treated as
+    # FINAL_SNAPSHOT_DEGRADED, not as proof that all matches disappeared.
+    final_snapshot_status = (
+        "FINAL_SNAPSHOT_DEGRADED"
+        if len(matches) > 0 and len(final_matches) == 0
+        else "FINAL_SNAPSHOT_OK"
+    )
+    targeted_final_verify = {"recovered": {}, "checked": []}
+    targeted_checked_count = 0
 
     # ---------- Build results ----------
     candidates = []
@@ -6389,34 +6398,6 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             continue
 
         resolved = _v53_find_final_match(match, mid, final_matches)
-
-        # V5.7.4: if the whole-live final snapshot missed this strong match,
-        # use the targeted details/summary verification as a synthetic final match.
-        targeted_recovery = (targeted_final_verify.get("recovered") or {}).get(mid)
-        if resolved.get("match") is None and targeted_recovery:
-            verified_minute = targeted_recovery.get("verified_minute")
-            if verified_minute is None:
-                verified_minute = int(match.get("minute") or 0)
-
-            verified_score = targeted_recovery.get("verified_score") or [None, None]
-            synthetic_final = {
-                "match_id": mid,
-                "home": match.get("home"),
-                "away": match.get("away"),
-                "score": {
-                    "home": verified_score[0],
-                    "away": verified_score[1],
-                },
-                "minute": int(verified_minute or 0),
-                "minute_valid": True,
-                "is_in_progress": True,
-            }
-            resolved = {
-                "match": synthetic_final,
-                "method": "TARGETED_MATCH_VERIFY",
-                "confidence": 0.96,
-            }
-
         freshness = _v53_freshness_check(
             match,
             resolved.get("match"),
@@ -6424,9 +6405,103 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             float(resolved.get("confidence") or 0),
         )
 
-        if resolved.get("method") == "TARGETED_MATCH_VERIFY" and freshness.get("status") == "CONFIRMED":
-            freshness["reason"] = "TARGETED_MATCH_VERIFY"
-            freshness["targeted_verify"] = targeted_recovery
+        # V5.7.4b TARGETED RECOVERY:
+        # First determine whether this unresolved report actually contains a
+        # visible 65%+ goal candidate. Only then spend one targeted API check.
+        if (
+            resolved.get("match") is None
+            and freshness.get("status") == "UNCONFIRMED"
+            and targeted_checked_count < FINAL_VERIFY_MAX_MATCHES
+        ):
+            provisional_view = _v53_human_view(rep, momentum, freshness)
+            provisional_visible = provisional_view.get("goal_board_65_99") or []
+            provisional_best = 0.0
+            for _sig in provisional_visible:
+                try:
+                    provisional_best = max(
+                        provisional_best,
+                        float(_sig.get("probability") or 0),
+                    )
+                except Exception:
+                    pass
+
+            if provisional_best >= FINAL_VERIFY_MIN_PROB:
+                targeted_checked_count += 1
+                verification = await _v574_verify_match_id(mid)
+                check_item = {
+                    "match_id": mid,
+                    "match": f"{match.get('home')} — {match.get('away')}",
+                    "provisional_probability": round(provisional_best, 1),
+                    "verification": verification,
+                    "result": "NOT_RECOVERED",
+                }
+                targeted_final_verify["checked"].append(check_item)
+
+                if verification.get("verified"):
+                    verified_h = verification.get("score_home")
+                    verified_a = verification.get("score_away")
+                    old_score = match.get("score") if isinstance(match.get("score"), dict) else {}
+                    old_h = old_score.get("home")
+                    old_a = old_score.get("away")
+
+                    try:
+                        score_ok = (
+                            old_h is None or old_a is None
+                            or (
+                                int(old_h) == int(verified_h)
+                                and int(old_a) == int(verified_a)
+                            )
+                        )
+                    except Exception:
+                        score_ok = False
+
+                    still_live = verification.get("in_progress") is not False
+
+                    if score_ok and still_live:
+                        verified_minute = verification.get("minute")
+                        if verified_minute is None:
+                            verified_minute = int(match.get("minute") or 0)
+
+                        synthetic_final = {
+                            "match_id": mid,
+                            "home": match.get("home"),
+                            "away": match.get("away"),
+                            "score": {
+                                "home": verified_h,
+                                "away": verified_a,
+                            },
+                            "minute": int(verified_minute or 0),
+                            "minute_valid": True,
+                            "is_in_progress": True,
+                        }
+                        resolved = {
+                            "match": synthetic_final,
+                            "method": "TARGETED_MATCH_VERIFY",
+                            "confidence": 0.96,
+                        }
+                        freshness = _v53_freshness_check(
+                            match,
+                            resolved.get("match"),
+                            resolved.get("method"),
+                            float(resolved.get("confidence") or 0),
+                        )
+                        if freshness.get("status") == "CONFIRMED":
+                            recovery = {
+                                "status": "CONFIRMED",
+                                "reason": "TARGETED_MATCH_VERIFY",
+                                "verified_endpoint": verification.get("endpoint"),
+                                "verified_http_status": verification.get("http_status"),
+                                "verified_score": [verified_h, verified_a],
+                                "verified_minute": verified_minute,
+                            }
+                            targeted_final_verify["recovered"][mid] = recovery
+                            freshness["reason"] = "TARGETED_MATCH_VERIFY"
+                            freshness["targeted_verify"] = recovery
+                            check_item["result"] = "RECOVERED_CONFIRMED"
+                    elif not score_ok:
+                        check_item["result"] = "BLOCKED_SCORE_CONFLICT"
+                    elif not still_live:
+                        check_item["result"] = "BLOCKED_NOT_IN_PROGRESS"
 
         if freshness.get("status") == "BLOCKED":
             hard_blocked.append({
@@ -6707,6 +6782,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "parser_failures": parser_failures,
         "scan_memory_matches": len(new_state),
         "final_live_matches_found": len(final_matches),
+        "FINAL_SNAPSHOT_STATUS": final_snapshot_status,
+        "FINAL_MATCH_VERIFY": targeted_final_verify,
+        "TARGETED_MATCH_VERIFY": targeted_final_verify.get("checked") or [],
 
         "stage1_top": [
             {
@@ -6734,7 +6812,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "message": (
             f"V5.6: ENTER {len(enter_now)}, 65–99% {len(candidates)}, "
             f"rising {len(rising_now)}, radar 55–64 {len(radar_rising)}, "
-            f"memory {len(new_state)}."
+            f"memory {len(new_state)}, final_snapshot {final_snapshot_status}, "
+            f"targeted_recovered {len(targeted_final_verify.get('recovered') or {})}."
         ),
 
         "mode": "BOUNDED_SELF_LEARNING_FLOW",
