@@ -553,7 +553,7 @@ def extract_live_candidates(payload: Any) -> list[dict]:
 
 
 # ============================================================
-# ROBUST ZYLA STAT PARSER
+# ROBUST ZYLA STAT PARSER V2.1
 # ============================================================
 
 LABEL_KEYS = (
@@ -572,6 +572,8 @@ LABEL_KEYS = (
 
 HOME_VALUE_KEYS = (
     "home",
+    "home_team",
+    "homeTeam",
     "home_value",
     "homeValue",
     "value_home",
@@ -585,6 +587,8 @@ HOME_VALUE_KEYS = (
 
 AWAY_VALUE_KEYS = (
     "away",
+    "away_team",
+    "awayTeam",
     "away_value",
     "awayValue",
     "value_away",
@@ -597,77 +601,203 @@ AWAY_VALUE_KEYS = (
 )
 
 
+def clean_stat_value(value: Any) -> float:
+    """
+    Convert Zyla values like:
+    0.32
+    "0.32"
+    "72%"
+    "14"
+    into floats.
+    """
+
+    if value is None:
+        return 0.0
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    if isinstance(value, str):
+        text = value.strip()
+
+        if not text or text in ("-", "—", "N/A", "null"):
+            return 0.0
+
+        text = text.replace("%", "")
+        text = text.replace(",", ".")
+
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+
+        if match:
+            try:
+                return float(match.group(0))
+            except Exception:
+                return 0.0
+
+    return 0.0
+
+
 def label_matches(label: str, aliases: list[str]) -> bool:
     label = normalize_key(label)
 
     if not label:
         return False
 
-    wanted = [normalize_key(a) for a in aliases]
+    aliases_normalized = [
+        normalize_key(alias)
+        for alias in aliases
+    ]
 
-    return any(
-        label == alias
-        or alias in label
-        or label in alias
-        for alias in wanted
-    )
+    for alias in aliases_normalized:
+        if label == alias:
+            return True
+
+        if alias in label:
+            return True
+
+        if label in alias:
+            return True
+
+    return False
 
 
-def direct_pair_from_dict(node: dict) -> tuple[float, float] | None:
-    home = None
-    away = None
+def direct_pair_from_dict(
+    node: dict,
+) -> tuple[float, float] | None:
+    """
+    Main Zyla V2.1 format:
+
+    {
+        "name": "Expected goals (xG)",
+        "home_team": "0.32",
+        "away_team": "0.40"
+    }
+    """
+
+    home_value = None
+    away_value = None
 
     for key in HOME_VALUE_KEYS:
-        if key in node and not isinstance(node[key], (dict, list)):
-            home = node[key]
-            break
+        if key in node:
+            value = node.get(key)
+
+            if not isinstance(value, (dict, list)):
+                home_value = value
+                break
 
     for key in AWAY_VALUE_KEYS:
-        if key in node and not isinstance(node[key], (dict, list)):
-            away = node[key]
-            break
+        if key in node:
+            value = node.get(key)
 
-    if home is not None and away is not None:
-        return safe_float(home), safe_float(away)
+            if not isinstance(value, (dict, list)):
+                away_value = value
+                break
 
-    # Common two-value arrays.
-    for key in ("values", "value", "data", "stats"):
-        value = node.get(key)
+    if home_value is not None and away_value is not None:
+        return (
+            clean_stat_value(home_value),
+            clean_stat_value(away_value),
+        )
 
-        if (
-            isinstance(value, list)
-            and len(value) >= 2
-            and not isinstance(value[0], (dict, list))
-            and not isinstance(value[1], (dict, list))
-        ):
-            return safe_float(value[0]), safe_float(value[1])
+    # Some APIs wrap values inside another object.
+    for container_key in (
+        "value",
+        "values",
+        "data",
+        "stats",
+    ):
+        value = node.get(container_key)
+
+        if isinstance(value, dict):
+            nested_home = None
+            nested_away = None
+
+            for key in HOME_VALUE_KEYS:
+                if key in value:
+                    nested_home = value.get(key)
+                    break
+
+            for key in AWAY_VALUE_KEYS:
+                if key in value:
+                    nested_away = value.get(key)
+                    break
+
+            if (
+                nested_home is not None
+                and nested_away is not None
+            ):
+                return (
+                    clean_stat_value(nested_home),
+                    clean_stat_value(nested_away),
+                )
+
+        if isinstance(value, list) and len(value) >= 2:
+            if (
+                not isinstance(value[0], (dict, list))
+                and not isinstance(value[1], (dict, list))
+            ):
+                return (
+                    clean_stat_value(value[0]),
+                    clean_stat_value(value[1]),
+                )
 
         if isinstance(value, str):
             pair = parse_pair_string(value)
+
             if pair:
                 return pair
 
     return None
 
 
-def find_metric_pair(payload: Any, aliases: list[str]) -> tuple[float, float] | None:
-    # Strategy A: labelled statistic objects.
+def find_metric_pair(
+    payload: Any,
+    aliases: list[str],
+) -> tuple[float, float] | None:
+    """
+    Parse Zyla stats using several possible response layouts.
+    """
+
+    # ========================================================
+    # FORMAT 1
+    # {
+    #   "name": "Total shots",
+    #   "home_team": "6",
+    #   "away_team": "9"
+    # }
+    # ========================================================
+
     for node in walk(payload):
-        label = ""
+        if not isinstance(node, dict):
+            continue
+
+        label = None
 
         for key in LABEL_KEYS:
-            if key in node and isinstance(node[key], str):
-                label = node[key]
+            if key in node and isinstance(node.get(key), str):
+                label = node.get(key)
                 break
 
         if label and label_matches(label, aliases):
             pair = direct_pair_from_dict(node)
 
-            if pair:
+            if pair is not None:
                 return pair
 
-    # Strategy B: metric name is itself a dictionary key.
+    # ========================================================
+    # FORMAT 2
+    # {
+    #   "Total shots": {
+    #       "home_team": 6,
+    #       "away_team": 9
+    #   }
+    # }
+    # ========================================================
+
     for node in walk(payload):
+        if not isinstance(node, dict):
+            continue
+
         for key, value in node.items():
             if not label_matches(str(key), aliases):
                 continue
@@ -675,26 +805,41 @@ def find_metric_pair(payload: Any, aliases: list[str]) -> tuple[float, float] | 
             if isinstance(value, dict):
                 pair = direct_pair_from_dict(value)
 
-                if pair:
+                if pair is not None:
                     return pair
 
             if isinstance(value, list) and len(value) >= 2:
-                if not isinstance(value[0], (dict, list)):
-                    return safe_float(value[0]), safe_float(value[1])
+                if (
+                    not isinstance(value[0], (dict, list))
+                    and not isinstance(value[1], (dict, list))
+                ):
+                    return (
+                        clean_stat_value(value[0]),
+                        clean_stat_value(value[1]),
+                    )
 
-            pair = parse_pair_string(value)
+            if isinstance(value, str):
+                pair = parse_pair_string(value)
 
-            if pair:
-                return pair
+                if pair:
+                    return pair
 
     return None
 
 
-def metric(payload: Any, aliases: list[str]) -> tuple[float, float]:
-    pair = find_metric_pair(payload, aliases)
-    return pair if pair is not None else (0.0, 0.0)
+def metric(
+    payload: Any,
+    aliases: list[str],
+) -> tuple[float, float]:
+    pair = find_metric_pair(
+        payload,
+        aliases,
+    )
 
+    if pair is None:
+        return (0.0, 0.0)
 
+    return pair
 def parse_red_cards(stats_raw: Any, summary_raw: Any) -> tuple[int, int]:
     pair = find_metric_pair(
         stats_raw,
