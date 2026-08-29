@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5c-ADAPTIVE-BRIDGE"
-MODEL_TYPE = "heuristic-v5.7.5c-adaptive-bridge-not-calibrated"
+VERSION = "V5.7.5c1-ADAPTIVE-BRIDGE-HOTFIX"
+MODEL_TYPE = "heuristic-v5.7.5c1-adaptive-bridge-hotfix-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -6110,6 +6110,37 @@ def _v57_adaptive_control(
     view["WHEN_TO_ENTER_ADAPTIVE"] = action
     return view
 
+
+def _v57_learning_report(state: Dict[str, Any]) -> Dict[str, Any]:
+    markets = {}
+    for market in sorted(state.get("markets") or {}):
+        cfg = _v57_market_cfg(state, market)
+        markets[market] = {
+            "summary": _v57_learning_summary(cfg),
+            "config": {
+                "probability_bias": cfg.get("probability_bias"),
+                "enter_offset": cfg.get("enter_offset"),
+                "soon_offset": cfg.get("soon_offset"),
+                "trend_min": cfg.get("trend_min"),
+                "config_version": cfg.get("config_version"),
+            },
+            "last_change": cfg.get("last_change"),
+            "ready_to_tune": len(cfg.get("records") or []) >= V57_MIN_RESOLVED,
+        }
+    return {
+        "learning_mode": state.get("learning_mode"),
+        "resolved_total": state.get("resolved_total"),
+        "pending_unresolved": sum(1 for x in state.get("pending") or [] if not x.get("resolved")),
+        "minimum_samples_before_tuning": V57_MIN_RESOLVED,
+        "markets": markets,
+        "safety": {
+            "rewrites_source_code": False,
+            "bounded_probability_bias": "[-3,+3]",
+            "bounded_enter_offset": "[-2,+5]",
+            "rollback_enabled": True,
+            "ambiguous_outcomes_tune_model": False,
+        },
+    }
 
 # ===== V5.7.2 RATE LIMIT + LIVE FEED GUARD =====
 # 429 is not retried aggressively. A shared cooldown prevents a single scan
