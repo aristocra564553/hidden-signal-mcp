@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5-FINAL-SNAPSHOT-GUARD"
-MODEL_TYPE = "heuristic-v5.7.5-final-snapshot-guard-not-calibrated"
+VERSION = "V5.7.5a-PERSISTENCE-EMPTY-FEED-GUARD"
+MODEL_TYPE = "heuristic-v5.7.5a-persistence-empty-feed-guard-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -121,6 +121,11 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 # -------------------------
 
 SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_7_signals.jsonl")
+SCAN_STATE_PATH = os.getenv("SCAN_STATE_PATH", "/tmp/hidden_signal_v5_7_scan_state.json")
+SCAN_HISTORY_PATH = os.getenv("SCAN_HISTORY_PATH", "/tmp/hidden_signal_v5_7_scan_history.json")
+DECISION_JOURNAL_PATH = os.getenv("DECISION_JOURNAL_PATH", "/tmp/hidden_signal_v5_7_decision_journal.json")
+LEARNING_STATE_PATH = os.getenv("LEARNING_STATE_PATH", "/tmp/hidden_signal_v5_7_learning_state.json")
+FEED_GUARD_STATE_PATH = os.getenv("FEED_GUARD_STATE_PATH", "/tmp/hidden_signal_v5_7_5a_feed_guard_state.json")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -5864,6 +5869,7 @@ RATE_LIMIT_STATE_PATH = os.environ.get(
     "RATE_LIMIT_STATE_PATH", "/tmp/hidden_signal_v5_7_2_rate_limit.json"
 )
 FEED_GUARD_RETRIES = 3
+FEED_EMPTY_200_MAX_ATTEMPTS = int(os.environ.get("FEED_EMPTY_200_MAX_ATTEMPTS", "2"))
 FEED_GUARD_NORMAL_DELAYS = (1.0, 2.0)
 RATE_LIMIT_BACKOFF = (15, 30, 60)
 RATE_LIMIT_MAX_WAIT_INSIDE_SCAN = 18.0
@@ -5941,20 +5947,41 @@ def _v572_clear_rate_limit() -> None:
     _v572_save_rate_state(st)
 
 
+def _v575a_load_feed_guard_state() -> Dict[str, Any]:
+    try:
+        with open(FEED_GUARD_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v575a_save_feed_guard_state(state: Dict[str, Any]) -> None:
+    try:
+        tmp = FEED_GUARD_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, FEED_GUARD_STATE_PATH)
+    except Exception:
+        pass
+
+
 def _v571_previous_live_count() -> int:
     try:
-        st = _load_scan_state()
-        return int(st.get("last_live_matches_found") or 0)
+        st = _v575a_load_feed_guard_state()
+        return int(st.get("last_good_live_matches_found") or 0)
     except Exception:
         return 0
 
 
 def _v571_store_live_count(n: int) -> None:
+    # Store only a successful non-negative snapshot. Suspicious empty/collapse
+    # responses never call this function, so they cannot erase the baseline.
     try:
-        st = _load_scan_state()
-        st["last_live_matches_found"] = int(max(0, n))
-        st["last_live_feed_seen_at"] = now_iso()
-        _save_scan_state(st)
+        st = _v575a_load_feed_guard_state()
+        st["last_good_live_matches_found"] = int(max(0, n))
+        st["last_good_live_feed_seen_at"] = now_iso()
+        _v575a_save_feed_guard_state(st)
     except Exception:
         pass
 
@@ -6037,9 +6064,15 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
         finally:
             await client.close()
 
+        empty_200 = (
+            int(http_status or 0) == 200
+            and structurally_valid
+            and n == 0
+        )
         suspicious = (
             n < 0
             or (http_status is not None and int(http_status) >= 400)
+            or empty_200
             or (prev >= 20 and n < max(5, int(prev * 0.20)))
         )
         attempts.append({
@@ -6047,6 +6080,7 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
             "http_status": http_status,
             "live_matches_found": n,
             "error": err,
+            "empty_200": bool(locals().get("empty_200", False)),
             "suspicious": suspicious,
         })
 
@@ -6070,11 +6104,25 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
                 "rate_limit": _v572_rate_status(),
             }
 
+        if empty_200 and (i + 1) >= max(1, FEED_EMPTY_200_MAX_ATTEMPTS):
+            break
+
         if i < FEED_GUARD_RETRIES - 1:
             await asyncio.sleep(FEED_GUARD_NORMAL_DELAYS[min(i, len(FEED_GUARD_NORMAL_DELAYS)-1)])
 
+    all_empty_200 = bool(attempts) and all(
+        int(a.get("http_status") or 0) == 200
+        and int(a.get("live_matches_found") or 0) == 0
+        and a.get("empty_200")
+        for a in attempts
+    )
+
     return {
-        "status": "LIVE_FEED_OUTAGE" if best_count <= 0 else "LIVE_FEED_DEGRADED",
+        "status": (
+            "LIVE_FEED_EMPTY_200"
+            if all_empty_200
+            else ("LIVE_FEED_OUTAGE" if best_count <= 0 else "LIVE_FEED_DEGRADED")
+        ),
         "matches": best_matches,
         "live_matches_found": max(0, best_count),
         "previous_live_matches_found": prev,
@@ -6437,8 +6485,12 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
 
     if final_r.get("ok") and len(final_matches) > 0:
         final_snapshot_status = "FINAL_SNAPSHOT_OK"
-    elif final_r.get("ok") and final_payload_is_list and len(matches) > 0 and len(final_matches) == 0:
-        final_snapshot_status = "FINAL_SNAPSHOT_DEGRADED_EMPTY_200"
+    elif final_r.get("ok") and final_payload_is_list and len(final_matches) == 0:
+        final_snapshot_status = (
+            "FINAL_SNAPSHOT_DEGRADED_EMPTY_200"
+            if len(matches) > 0
+            else "FINAL_SNAPSHOT_EMPTY_200"
+        )
     elif final_error in {
         "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
         "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
@@ -6942,6 +6994,14 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "cache_entries": len(_PROVIDER_CACHE),
+        "persistence_paths": {
+            "scan_state": SCAN_STATE_PATH,
+            "scan_history": SCAN_HISTORY_PATH,
+            "decision_journal": DECISION_JOURNAL_PATH,
+            "learning_state": LEARNING_STATE_PATH,
+            "feed_guard_state": FEED_GUARD_STATE_PATH,
+        },
+        "feed_guard_state": _v575a_load_feed_guard_state(),
         "scan_budget": _v573_scan_budget_status(),
         "note": "Provider-side exhausted account quota cannot be bypassed; this layer removes duplicate/burst traffic.",
     }
@@ -6990,6 +7050,8 @@ async def reset_scan_memory() -> Dict[str, Any]:
             os.remove(DECISION_JOURNAL_PATH)
         if os.path.exists(LEARNING_STATE_PATH):
             os.remove(LEARNING_STATE_PATH)
+        if os.path.exists(FEED_GUARD_STATE_PATH):
+            os.remove(FEED_GUARD_STATE_PATH)
         return {"ok": True, "message": "Память предыдущего лайв-скана очищена."}
     except Exception as e:
         return {"ok": False, "error": repr(e)}
