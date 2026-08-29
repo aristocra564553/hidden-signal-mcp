@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -34,7 +35,15 @@ EARLY_MINUTE_HARD = 8
 EARLY_MINUTE_SOFT = 15
 STALE_SECONDS = 90
 
-mcp = FastMCP("Hidden Signal Live")
+mcp = FastMCP(
+    "Hidden Signal Live",
+    transport_security=TransportSecuritySettings(
+        allowed_hosts=[
+            "hidden-signal-mcp.onrender.com",
+            "hidden-signal-mcp.onrender.com:*",
+        ],
+    ),
+)
 
 
 # -------------------------
