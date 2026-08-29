@@ -2,6 +2,7 @@
 import os
 import json
 import math
+import re
 import time
 import asyncio
 from datetime import datetime, timezone
@@ -13,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V4.0-FOOTBALL-REACTOR"
-MODEL_TYPE = "heuristic-v4.0-not-calibrated"
+VERSION = "V4.1-DUAL-REACTOR"
+MODEL_TYPE = "heuristic-v4.1-dual-safe-live-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -41,6 +42,10 @@ mcp = FastMCP(
         allowed_hosts=[
             "hidden-signal-mcp.onrender.com",
             "hidden-signal-mcp.onrender.com:*",
+            "localhost",
+            "localhost:*",
+            "127.0.0.1",
+            "127.0.0.1:*",
         ],
     ),
 )
@@ -193,6 +198,42 @@ class ZylaClient:
 # Live parsing
 # -------------------------
 
+def parse_live_minute(live_time: Any, stage: str) -> Tuple[int, bool, str]:
+    """
+    Parse FlashScore-style live minute safely.
+    Handles values like 67, "67'", "90+9'", "Half Time".
+    Returns: minute, valid, diagnostic.
+    """
+    stage_l = str(stage or "").lower().strip()
+
+    if isinstance(live_time, (int, float)):
+        minute = int(live_time)
+    elif isinstance(live_time, str):
+        text = live_time.strip()
+        # Prefer explicit added-time form: 45+2 / 90+9.
+        m = re.search(r"(?<!\d)(\d{1,3})\s*\+\s*(\d{1,2})(?!\d)", text)
+        if m:
+            minute = int(m.group(1)) + int(m.group(2))
+        else:
+            m = re.search(r"(?<!\d)(\d{1,3})(?!\d)", text)
+            minute = int(m.group(1)) if m else None
+    else:
+        minute = None
+
+    if minute is None:
+        if "half time" in stage_l:
+            return 45, True, "stage_half_time"
+        if "finished" in stage_l:
+            return 90, True, "stage_finished"
+        return 0, False, "minute_missing"
+
+    # Football can legitimately go beyond 90 in added time / extra time,
+    # but values such as 909 are parser corruption and must fail closed.
+    if minute < 0 or minute > 130:
+        return 0, False, f"minute_out_of_range:{minute}"
+
+    return minute, True, "ok"
+
 def flatten_live(data: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if not isinstance(data, list):
@@ -211,21 +252,8 @@ def flatten_live(data: Any) -> List[Dict[str, Any]]:
             at = m.get("away_team") or {}
 
             live_time = st.get("live_time")
-            minute = None
-            if isinstance(live_time, (int, float)):
-                minute = int(live_time)
-            elif isinstance(live_time, str):
-                digits = "".join(ch for ch in live_time if ch.isdigit())
-                if digits:
-                    minute = int(digits[:3])
             stage = str(st.get("stage") or "")
-            if minute is None:
-                if "Half Time" in stage:
-                    minute = 45
-                elif "Finished" in stage:
-                    minute = 90
-                else:
-                    minute = 0
+            minute, minute_valid, minute_diag = parse_live_minute(live_time, stage)
 
             out.append({
                 "match_id": m.get("match_id"),
@@ -236,6 +264,9 @@ def flatten_live(data: Any) -> List[Dict[str, Any]]:
                 "home_team_id": ht.get("team_id"),
                 "away_team_id": at.get("team_id"),
                 "minute": minute,
+                "minute_valid": minute_valid,
+                "minute_diagnostic": minute_diag,
+                "raw_live_time": live_time,
                 "stage": stage,
                 "is_in_progress": bool(st.get("is_in_progress")),
                 "score": score_obj(scores.get("home"), scores.get("away")),
@@ -348,13 +379,22 @@ def quality_guard(metrics: Dict[str, Any]) -> Dict[str, Any]:
     basic_ok = bool(metrics["shots"]["present"] and metrics["shots_on_target"]["present"])
     advanced_keys = ["xg", "touches_in_box", "shots_in_box", "big_chances"]
     advanced_count = sum(1 for k in advanced_keys if metrics.get(k, {}).get("present"))
-    strong_eligible = basic_ok and advanced_count >= 1 and score >= 55
+    shots_total = total_val(metrics, "shots")
+    sot_total = total_val(metrics, "shots_on_target")
+    robust_basic_sample = basic_ok and shots_total >= 10 and sot_total >= 3
+
+    # Two ways to become strong-eligible:
+    # 1) advanced attacking metric is present, or
+    # 2) basic shot sample is already large enough to be informative.
+    strong_eligible = basic_ok and score >= 45 and (advanced_count >= 1 or robust_basic_sample)
     level = "HIGH" if strong_eligible and score >= 75 else ("MEDIUM" if basic_ok and score >= 45 else "LOW")
     return {
         "score": score,
         "level": level,
         "basic_ok": basic_ok,
         "advanced_count": advanced_count,
+        "robust_basic_sample": robust_basic_sample,
+        "eligibility_path": "advanced" if (basic_ok and advanced_count >= 1 and score >= 45) else ("robust_basic" if robust_basic_sample and score >= 45 else "blocked"),
         "strong_eligible": strong_eligible,
         "missing": missing,
     }
@@ -553,6 +593,44 @@ def team_goal_probability(goal_p: float, share: float) -> float:
     p = p_any * (0.60 + 0.82 * s)
     return clamp(p * 100, 2, 95)
 
+def live_impulse_probability(
+    base_goal_p: float,
+    live: Dict[str, Any],
+    metrics: Dict[str, Any],
+    pressure: Dict[str, float],
+) -> float:
+    """
+    Aggressive live-reading layer. It does NOT bypass early/small-sample/red-card guards.
+    It intentionally ignores missing-field penalties, so incomplete feeds can still
+    surface as WATCH candidates without becoming SAFE ENTER automatically.
+    """
+    p = float(base_goal_p)
+    minute = max(1, int(live.get("minute") or 1))
+
+    # High pressure should matter in live play, but avoid runaway inflation.
+    p += max(0.0, pressure["total"] - 62.0) * 0.34
+
+    if metrics["xg"]["present"]:
+        xg_total = total_val(metrics, "xg")
+        xg_pace = xg_total * 90.0 / max(20, minute)
+        p += max(0.0, xg_pace - 2.0) * 2.2
+
+    if metrics["shots_on_target"]["present"]:
+        sot = total_val(metrics, "shots_on_target")
+        sot_pace = sot * 90.0 / max(20, minute)
+        p += max(0.0, sot_pace - 6.0) * 0.8
+
+    if metrics["shots_in_box"]["present"]:
+        sib = total_val(metrics, "shots_in_box")
+        p += min(5.0, sib * 0.30)
+
+    if metrics["touches_in_box"]["present"]:
+        tib = total_val(metrics, "touches_in_box")
+        p += min(5.0, tib * 0.10)
+
+    return clamp(p, 2, 94)
+
+
 def next_window_probability(goal_ft: float, minute: int, window: int) -> float:
     remain = max(1, 96 - minute)
     hazard = -math.log(max(0.001, 1 - goal_ft / 100.0)) / remain
@@ -610,10 +688,10 @@ def quality_probability_guard(
     reasons: List[str] = []
     blocked = False
     if q["level"] == "MEDIUM":
-        p -= 5
+        p -= 3
         reasons.append("medium data quality penalty")
     elif q["level"] == "LOW":
-        p -= 12
+        p -= 9
         reasons.append("low data quality penalty")
 
     if market == "UNDER" and not metrics["xg"]["present"]:
@@ -720,6 +798,32 @@ def apply_guards(
     reasons += r
     return round1(clamp(p)), reasons, blocked
 
+def apply_live_guards(
+    raw_p: float,
+    minute: int,
+    market_class: str,
+    metrics: Dict[str, Any],
+    live: Dict[str, Any],
+) -> Tuple[float, List[str]]:
+    p = float(raw_p)
+    reasons: List[str] = []
+    p, r = early_match_guard(p, minute, market_class, metrics)
+    reasons += r
+    p, r = small_sample_guard(p, minute, metrics)
+    reasons += r
+    p, r = red_card_guard(p, live, market_class)
+    reasons += r
+    return round1(clamp(p)), reasons
+
+
+def live_decision_for(p: float, q: Dict[str, Any]) -> str:
+    if p >= 80 and q.get("basic_ok"):
+        return "LIVE_ENTER"
+    if p >= 72:
+        return "WATCH"
+    return "PASS"
+
+
 def signal_obj(
     market: str,
     selection: str,
@@ -730,18 +834,28 @@ def signal_obj(
     guard_reasons: List[str],
     risk: str = "medium",
     blocked: bool = False,
+    live_p: Optional[float] = None,
+    live_guard_reasons: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     decision = decision_for(guarded_p, q)
+    if live_p is None:
+        live_p = raw_p
+    live_decision = live_decision_for(float(live_p), q)
     return {
         "market": market,
         "selection": selection,
         "raw_probability": round1(raw_p),
         "probability": round1(guarded_p),
+        "safe_probability": round1(guarded_p),
+        "safe_decision": decision,
+        "live_probability": round1(live_p),
+        "live_decision": live_decision,
         "signal": "🟢" if decision == "ENTER" else ("🟡" if decision == "WAIT" else "🔴"),
         "decision": decision,
         "risk": risk,
         "reasons": reasons,
         "guard_reasons": guard_reasons,
+        "live_guard_reasons": live_guard_reasons or [],
         "data_quality_blocked": blocked,
         "data_quality_score": q["score"],
         "data_quality_level": q["level"],
@@ -781,32 +895,46 @@ def build_signals(
 
     signals: List[Dict[str, Any]] = []
 
+    def dual_values(raw: float, market_class: str) -> Tuple[float, List[str], bool, float, List[str]]:
+        safe_p, safe_reasons, blocked = apply_guards(raw, minute, market_class, q, metrics, live)
+        live_base = raw
+        if market_class in {"GOAL_BEFORE_FULLTIME", "OVER_UNDER", "TEAM_GOAL"}:
+            # Live impulse is strongest for broad goal/team-goal markets.
+            if market_class == "GOAL_BEFORE_FULLTIME" or market_class == "OVER_UNDER":
+                live_base = live_impulse_probability(raw, live, metrics, pressure)
+            else:
+                # Team-goal markets inherit only part of the global live impulse.
+                global_live = live_impulse_probability(goal_raw, live, metrics, pressure)
+                live_base = clamp(raw + max(0.0, global_live - goal_raw) * 0.65)
+        live_p, live_reasons = apply_live_guards(live_base, minute, market_class, metrics, live)
+        return safe_p, safe_reasons, blocked, live_p, live_reasons
+
     # Goal before FT
-    gp, gr, blocked = apply_guards(goal_raw, minute, "GOAL_BEFORE_FULLTIME", q, metrics, live)
+    gp, gr, blocked, glive, glr = dual_values(goal_raw, "GOAL_BEFORE_FULLTIME")
     signals.append(signal_obj(
         "GOAL_BEFORE_FULLTIME", "At least one more goal", goal_raw, gp, q,
-        reasons_goal, gr, blocked=blocked
+        reasons_goal, gr, blocked=blocked, live_p=glive, live_guard_reasons=glr
     ))
 
     # O/U current + 0.5
     over_line = score["total"] + 0.5
-    op, ogr, blocked = apply_guards(goal_raw, minute, "OVER_UNDER", q, metrics, live)
+    op, ogr, blocked, olive, olr = dual_values(goal_raw, "OVER_UNDER")
     signals.append(signal_obj(
         "OVER_UNDER", f"Over {over_line:.1f}", goal_raw, op, q,
-        reasons_goal, ogr, blocked=blocked
+        reasons_goal, ogr, blocked=blocked, live_p=olive, live_guard_reasons=olr
     ))
     under_raw = 100 - goal_raw
-    up, ugr, blocked = apply_guards(under_raw, minute, "UNDER", q, metrics, live)
+    up, ugr, blocked, ulive, ulr = dual_values(under_raw, "UNDER")
     signals.append(signal_obj(
         "OVER_UNDER", f"Under {over_line:.1f}", under_raw, up, q,
         [f"current total {score['total']}", f"minute {minute}", f"another-goal raw {goal_raw:.1f}%"],
-        ugr, blocked=blocked
+        ugr, blocked=blocked, live_p=ulive, live_guard_reasons=ulr
     ))
 
     # team goals
     for side, share, raw in [("home", hshare, home_raw), ("away", ashare, away_raw)]:
         team_name = live["home"] if side == "home" else live["away"]
-        p, guards, blocked = apply_guards(raw, minute, "TEAM_GOAL", q, metrics, live)
+        p, guards, blocked, tlive, tlr = dual_values(raw, "TEAM_GOAL")
         signals.append(signal_obj(
             "TEAM_GOAL", f"{team_name} to score", raw, p, q,
             [
@@ -816,27 +944,27 @@ def build_signals(
                 f"{side} SOT {side_val(metrics,'shots_on_target',side):.0f}" if metrics["shots_on_target"]["present"] else f"{side} SOT missing",
             ],
             guards,
-            blocked=blocked
+            blocked=blocked, live_p=tlive, live_guard_reasons=tlr
         ))
 
     # next windows
     for window in (5, 10):
         raw = next_window_probability(goal_raw, minute, window)
-        p, guards, blocked = apply_guards(raw, minute, f"GOAL_NEXT_{window}", q, metrics, live)
+        p, guards, blocked, wlive, wlr = dual_values(raw, f"GOAL_NEXT_{window}")
         signals.append(signal_obj(
             f"GOAL_NEXT_{window}", f"Goal in next {window} minutes", raw, p, q,
-            reasons_goal, guards, risk="high", blocked=blocked
+            reasons_goal, guards, risk="high", blocked=blocked, live_p=wlive, live_guard_reasons=wlr
         ))
 
     # first half goal only if applicable
     if minute < 45:
         remain_to_ht = max(1, 47 - minute)
         raw = next_window_probability(goal_raw, minute, remain_to_ht)
-        p, guards, blocked = apply_guards(raw, minute, "GOAL_BEFORE_HALFTIME", q, metrics, live)
+        p, guards, blocked, hlive, hlr = dual_values(raw, "GOAL_BEFORE_HALFTIME")
         signals.append(signal_obj(
             "GOAL_BEFORE_HALFTIME", "At least one goal before half-time", raw, p, q,
             reasons_goal + [f"{remain_to_ht} min model window to HT"],
-            guards, blocked=blocked
+            guards, blocked=blocked, live_p=hlive, live_guard_reasons=hlr
         ))
 
     # BTTS YES only meaningful if neither/both state considered
@@ -850,11 +978,11 @@ def build_signals(
         # both still need to score: strong dependence penalty
         btts_raw = (home_raw / 100.0) * (away_raw / 100.0) * 100.0 * 0.82
 
-    p, guards, blocked = apply_guards(btts_raw, minute, "BTTS", q, metrics, live)
+    p, guards, blocked, blive, blr = dual_values(btts_raw, "BTTS")
     signals.append(signal_obj(
         "BTTS", "Both teams to score - YES", btts_raw, p, q,
         [f"score {score['home']}-{score['away']}", f"team goal raw {home_raw:.1f}%/{away_raw:.1f}%"],
-        guards, blocked=blocked
+        guards, blocked=blocked, live_p=blive, live_guard_reasons=blr
     ))
 
     # Sort strongest first
@@ -982,11 +1110,29 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live:
             return {
-                "source": "football-reactor-v4",
+                "source": "football-reactor-v4.1",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "NOT_LIVE_OR_NOT_FOUND",
                 "api_calls": api_calls,
+            }
+
+        if not live.get("minute_valid", True):
+            return {
+                "source": "football-reactor-v4.1",
+                "version": VERSION,
+                "match_id": match_id,
+                "status": "INVALID_LIVE_MINUTE",
+                "match": {
+                    "home": live.get("home"),
+                    "away": live.get("away"),
+                    "minute": live.get("minute"),
+                    "raw_live_time": live.get("raw_live_time"),
+                    "minute_diagnostic": live.get("minute_diagnostic"),
+                    "score": live.get("score"),
+                },
+                "api_calls": api_calls,
+                "reason": "Live minute failed sanity validation; analysis blocked fail-closed.",
             }
 
         # Parallel deep fetch
@@ -1015,6 +1161,8 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             s["new_or_changed"] = is_new_or_changed(match_id, s)
 
         strong = [s for s in signals if s["decision"] == "ENTER"]
+        live_watch = [s for s in signals if s.get("live_decision") in {"LIVE_ENTER", "WATCH"}]
+        live_watch.sort(key=lambda x: float(x.get("live_probability") or 0), reverse=True)
         top3 = signals[:3]
         corr = correlation_groups(signals)
         consensus = consensus_report(live, metrics, q, pressure, lineups, odds, h2h, top3[0] if top3 else None)
@@ -1051,7 +1199,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         ]
 
         report = {
-            "source": "football-reactor-v4",
+            "source": "football-reactor-v4.1",
             "version": VERSION,
             "model_type": MODEL_TYPE,
             "match_id": match_id,
@@ -1061,6 +1209,9 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                 "away": live["away"],
                 "tournament": live.get("tournament"),
                 "minute": live["minute"],
+                "minute_valid": live.get("minute_valid", True),
+                "minute_diagnostic": live.get("minute_diagnostic"),
+                "raw_live_time": live.get("raw_live_time"),
                 "stage": live.get("stage"),
                 "score": live["score"],
                 "red_cards": live.get("red_cards"),
@@ -1085,6 +1236,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             "top_candidate": top3[0] if top3 else None,
             "top_3_signals": top3,
             "strong_signals": strong,
+            "live_watchlist": live_watch[:5],
             "quality_blocked_signals": quality_blocked_signals,
             "all_signals": signals,
             "diagnostic": {
@@ -1167,6 +1319,7 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "h2h_context",
             "pressure_engine",
             "market_engine",
+            "dual_safe_live_engine",
             "consensus_engine",
             "signal_journal",
         ],
@@ -1185,7 +1338,7 @@ async def get_zyla_live_matches() -> Dict[str, Any]:
         r = await client.live()
         matches = flatten_live(r.get("data"))
         return {
-            "source": "football-reactor-v4",
+            "source": "football-reactor-v4.1",
             "version": VERSION,
             "http_status": r["status"],
             "live_matches_found": len(matches),
@@ -1196,6 +1349,9 @@ async def get_zyla_live_matches() -> Dict[str, Any]:
                     "home": m["home"],
                     "away": m["away"],
                     "minute": m["minute"],
+                    "minute_valid": m.get("minute_valid", True),
+                    "minute_diagnostic": m.get("minute_diagnostic"),
+                    "raw_live_time": m.get("raw_live_time"),
                     "stage": m["stage"],
                     "score": m["score"],
                     "red_cards": m["red_cards"],
@@ -1225,7 +1381,13 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
     finally:
         await client.close()
 
-    ranked = sorted(matches, key=cheap_rank, reverse=True)
+    invalid_minute_matches = [
+        m for m in matches if not m.get("minute_valid", True)
+    ]
+    valid_matches = [
+        m for m in matches if m.get("minute_valid", True)
+    ]
+    ranked = sorted(valid_matches, key=cheap_rank, reverse=True)
     pre = ranked[:max(1, int(prefilter_limit))]
     deep = pre[:max(1, int(deep_limit))]
 
@@ -1249,6 +1411,7 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
     quality_blocked = []
     analysis_errors = []
     strong_signals = []
+    live_watchlist = []
     top_candidates = []
 
     for rep in reports:
@@ -1290,6 +1453,17 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
                     "consensus": rep.get("consensus"),
                     **s,
                 })
+        for s in rep.get("live_watchlist", []):
+            live_watchlist.append({
+                "match_id": rep.get("match_id"),
+                "home": rep.get("match", {}).get("home"),
+                "away": rep.get("match", {}).get("away"),
+                "minute": rep.get("match", {}).get("minute"),
+                "score": rep.get("match", {}).get("score"),
+                "data_quality": rep.get("data_quality"),
+                "pressure": rep.get("pressure"),
+                **s,
+            })
         if rep.get("top_candidate"):
             top_candidates.append({
                 "match_id": rep.get("match_id"),
@@ -1304,13 +1478,26 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
 
     top_candidates.sort(key=lambda x: float(x.get("probability") or 0), reverse=True)
     strong_signals.sort(key=lambda x: float(x.get("probability") or 0), reverse=True)
+    live_watchlist.sort(key=lambda x: float(x.get("live_probability") or 0), reverse=True)
 
     return {
-        "source": "football-reactor-v4",
+        "source": "football-reactor-v4.1",
         "version": VERSION,
         "status": "OK" if live_r.get("ok") else "LIVE_FETCH_ERROR",
         "live_http_status": live_r.get("status"),
         "live_matches_found": len(matches),
+        "valid_live_matches": len(valid_matches),
+        "invalid_minute_matches": [
+            {
+                "match_id": m.get("match_id"),
+                "home": m.get("home"),
+                "away": m.get("away"),
+                "raw_live_time": m.get("raw_live_time"),
+                "minute_diagnostic": m.get("minute_diagnostic"),
+                "score": m.get("score"),
+            }
+            for m in invalid_minute_matches
+        ],
         "prefiltered_matches": len(pre),
         "cheap_analyzed": len(pre),
         "fully_analyzed": len([r for r in reports if r.get("status") == "OK"]),
@@ -1322,12 +1509,15 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
         "quality_blocked_signals": quality_blocked,
         "strong_signal_threshold": STRONG_THRESHOLD,
         "strong_signals": strong_signals,
+        "live_watchlist": live_watchlist[:10],
         "top_candidates": top_candidates[:8],
         "estimated_api_calls_this_scan": 1 + len(deep) * 7,
         "reactor_notes": [
             "Fresh live list is authoritative for score/minute.",
             "Lineups and match player stats are fetched for deep-analyzed matches.",
             "Early-match and small-sample guards prevent 90%+ inflation in the opening minutes.",
+            "SAFE probability applies data-quality gating; LIVE probability surfaces pressure-driven WATCH candidates without bypassing sample guards.",
+            "Invalid live minutes are rejected before deep analysis.",
             "Correlated markets are grouped inside each match report.",
             "Probabilities are not calibrated until enough logged outcomes are collected.",
         ],
