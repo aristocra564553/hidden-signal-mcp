@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.4-FINAL-MATCH-VERIFY"
-MODEL_TYPE = "heuristic-v5.7.4-final-match-verify-not-calibrated"
+VERSION = "V5.7.4a-FINAL-MATCH-VERIFY-FIX"
+MODEL_TYPE = "heuristic-v5.7.4a-final-match-verify-fix-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -6181,8 +6181,8 @@ def _v574_candidate_probability(view: Dict[str, Any]) -> float:
 
 
 async def _v574_targeted_freshness_recovery(
-    analyzed_views: List[Dict[str, Any]],
-    final_live_matches: List[Dict[str, Any]],
+    analyzed_views: Optional[List[Dict[str, Any]]],
+    final_live_matches: Optional[List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
     """
     Recover only strong candidates that were otherwise marked
@@ -6190,6 +6190,8 @@ async def _v574_targeted_freshness_recovery(
     """
     recovered = {}
     checked = []
+    analyzed_views = analyzed_views if isinstance(analyzed_views, list) else []
+    final_live_matches = final_live_matches if isinstance(final_live_matches, list) else []
     final_ids = {str(m.get("match_id")) for m in final_live_matches if isinstance(m, dict) and m.get("match_id")}
 
     candidates = []
@@ -6356,7 +6358,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     try:
         final_r = await final_client.live()
         final_matches = flatten_live(final_r.get("data"))
-        targeted_final_verify = await _v574_targeted_freshness_recovery(analyzed_views if "analyzed_views" in locals() else analyzed, final_matches)
+        targeted_final_verify = await _v574_targeted_freshness_recovery(deep_reports, final_matches)
 
     finally:
         await final_client.close()
