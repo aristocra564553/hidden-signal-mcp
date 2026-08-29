@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5b-ATOMIC-BUDGET-GUARD"
-MODEL_TYPE = "heuristic-v5.7.5b-atomic-budget-priority-analysis-not-calibrated"
+VERSION = "V5.7.5c-ADAPTIVE-BRIDGE"
+MODEL_TYPE = "heuristic-v5.7.5c-adaptive-bridge-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -5125,6 +5125,18 @@ def _v55_enrich_view(
 
 V56_JOURNAL_KEEP = 8
 
+# V5.7.5c Adaptive Bridge.
+# Strong confirmed base ENTER signals must not disappear from the adaptive
+# ladder only because trend history is still young.
+ADAPTIVE_BRIDGE_SOON_PROB = float(os.environ.get("ADAPTIVE_BRIDGE_SOON_PROB", "90"))
+ADAPTIVE_BRIDGE_SOON_TREND = float(os.environ.get("ADAPTIVE_BRIDGE_SOON_TREND", "15"))
+ADAPTIVE_BRIDGE_NOW_PROB = float(os.environ.get("ADAPTIVE_BRIDGE_NOW_PROB", "96"))
+ADAPTIVE_BRIDGE_NOW_TREND = float(os.environ.get("ADAPTIVE_BRIDGE_NOW_TREND", "24"))
+ADAPTIVE_BRIDGE_MAX_FALSE_PRESSURE_FOR_SOON = float(
+    os.environ.get("ADAPTIVE_BRIDGE_MAX_FALSE_PRESSURE_FOR_SOON", "4")
+)
+
+
 
 def _v56_load_journal() -> Dict[str, Any]:
     try:
@@ -5880,12 +5892,51 @@ def _v57_adaptive_control(
 ) -> Dict[str, Any]:
     """
     Final bounded adaptive layer after V5.6.
-    It can move at most one ladder step relative to the controlled state.
+
+    V5.7.5c adds ADAPTIVE BRIDGE:
+    a very strong, fresh, base ENTER signal with a real trend is guaranteed
+    at least TAKE_SOON instead of disappearing from the adaptive ladder.
+
+    TAKE_NOW remains strict:
+    - stronger trend,
+    - two-scan stability,
+    - no severe false-pressure,
+    - no market-conflict,
+    - low context risk.
     """
     trend = view.get("PRESSURE_TREND") or {}
     trend_score = float(trend.get("score") or 0)
-    freshness = str((view.get("freshness") or view.get("FRESHNESS") or ""))
+
+    freshness_obj = view.get("freshness") or view.get("FRESHNESS") or {}
+    if not isinstance(freshness_obj, dict):
+        freshness_obj = {}
+    freshness_status = str(freshness_obj.get("status") or "")
+    freshness_reason = str(freshness_obj.get("reason") or "")
+
+    false_pressure = view.get("FALSE_PRESSURE") or {}
+    false_penalty = float(false_pressure.get("penalty") or 0)
+
+    context_risk = view.get("CONTEXT_RISK") or {}
+    context_risk_score = float(context_risk.get("score") or 0)
+    context_risk_band = str(context_risk.get("band") or "LOW")
+
+    conflicts = view.get("MARKET_CONFLICTS") or {}
+    conflict_detected = bool(conflicts.get("detected"))
+
+    hard_bridge_block = (
+        freshness_status != "CONFIRMED"
+        or freshness_reason in {
+            "POST_GOAL_COOLDOWN",
+            "SCORE_CONFLICT",
+            "MATCH_FINISHED",
+            "STALE_MINUTE",
+            "FINAL_SCORE_CHANGED",
+        }
+        or context_risk_score >= 24
+    )
+
     items = []
+    bridge_items = []
 
     # V5.6 already produced controlled decision items.
     for x in list(view.get("DECISION_CONTROL_ITEMS") or []):
@@ -5904,12 +5955,15 @@ def _v57_adaptive_control(
         adaptive = cur
         reason = "адаптивный слой не менял решение"
 
-        # One-step bounded upgrade/downgrade only.
+        decision_control = y.get("DECISION_CONTROL") or {}
+        stable = int(decision_control.get("stable_count") or 1)
+        base_decision = str(y.get("decision") or "")
+
+        # Existing bounded self-learning behavior.
         if cur == "TAKE_NOW" and p_learned < enter_threshold:
             adaptive = "TAKE_SOON"
             reason = "самообучение сделало порог TAKE NOW строже"
         elif cur == "TAKE_SOON":
-            stable = int((y.get("DECISION_CONTROL") or {}).get("stable_count") or 1)
             if p_learned >= enter_threshold and trend_score >= trend_min and stable >= 2:
                 adaptive = "TAKE_NOW"
                 reason = "история рынка + два сильных скана разрешили TAKE NOW"
@@ -5925,8 +5979,89 @@ def _v57_adaptive_control(
                 adaptive = "TAKE_LATER"
                 reason = "ранний сигнал усилился, но самообучение не позволяет перепрыгнуть сразу в вход"
 
+        # ----------------------------------------------------
+        # V5.7.5c ADAPTIVE BRIDGE
+        # ----------------------------------------------------
+        bridge_applied = False
+        bridge_target = None
+        bridge_reason = None
+
+        bridge_soon_ok = (
+            not hard_bridge_block
+            and base_decision == "ENTER"
+            and p_learned >= ADAPTIVE_BRIDGE_SOON_PROB
+            and trend_score >= ADAPTIVE_BRIDGE_SOON_TREND
+            and false_penalty <= ADAPTIVE_BRIDGE_MAX_FALSE_PRESSURE_FOR_SOON
+        )
+
+        # Guarantee at least TAKE_SOON for a genuinely strong confirmed signal.
+        if bridge_soon_ok and adaptive not in {"TAKE_NOW", "TAKE_SOON"}:
+            adaptive = "TAKE_SOON"
+            bridge_applied = True
+            bridge_target = "TAKE_SOON"
+            bridge_reason = (
+                "сильный CONFIRMED ENTER + реальный тренд: "
+                "adaptive bridge не позволяет сигналу исчезнуть из входной лестницы"
+            )
+            reason = bridge_reason
+
+        # TAKE_NOW bridge is intentionally stricter.
+        # Moderate false pressure (penalty 4) can still be TAKE_SOON,
+        # but cannot be promoted to TAKE_NOW by the bridge.
+        bridge_now_ok = (
+            bridge_soon_ok
+            and p_learned >= ADAPTIVE_BRIDGE_NOW_PROB
+            and trend_score >= ADAPTIVE_BRIDGE_NOW_TREND
+            and stable >= 2
+            and false_penalty <= 0
+            and not conflict_detected
+            and context_risk_band == "LOW"
+            and cur in {"TAKE_SOON", "TAKE_NOW"}
+        )
+
+        if bridge_now_ok and adaptive == "TAKE_SOON":
+            adaptive = "TAKE_NOW"
+            bridge_applied = True
+            bridge_target = "TAKE_NOW"
+            bridge_reason = (
+                "очень сильный CONFIRMED ENTER + устойчивый тренд + второй сильный скан "
+                "+ нет false pressure/market conflict"
+            )
+            reason = bridge_reason
+
         y["FLOW"]["state_before_learning"] = cur
         y["FLOW"]["state"] = adaptive
+        y["ADAPTIVE_BRIDGE"] = {
+            "applied": bridge_applied,
+            "target": bridge_target,
+            "reason": bridge_reason,
+            "base_enter_required": True,
+            "base_decision": base_decision,
+            "freshness_status": freshness_status,
+            "freshness_reason": freshness_reason,
+            "trend_score": round1(trend_score),
+            "false_pressure_penalty": round1(false_penalty),
+            "context_risk": context_risk_band,
+            "market_conflict": conflict_detected,
+            "stable_count": stable,
+            "soon_probability_threshold": ADAPTIVE_BRIDGE_SOON_PROB,
+            "soon_trend_threshold": ADAPTIVE_BRIDGE_SOON_TREND,
+            "now_probability_threshold": ADAPTIVE_BRIDGE_NOW_PROB,
+            "now_trend_threshold": ADAPTIVE_BRIDGE_NOW_TREND,
+            "hard_block": hard_bridge_block,
+        }
+        if bridge_applied:
+            bridge_items.append({
+                "title": y.get("title"),
+                "market": y.get("market"),
+                "probability": p_learned,
+                "from_state": cur,
+                "to_state": adaptive,
+                "trend_score": round1(trend_score),
+                "false_pressure_penalty": round1(false_penalty),
+                "reason": bridge_reason,
+            })
+
         y["SELF_LEARNING"] = {
             "market_config_version": cfg.get("config_version"),
             "raw_probability": round1(p_raw),
@@ -5969,41 +6104,11 @@ def _v57_adaptive_control(
         action = "🔴 ПРОПУСКАЕМ"
 
     view["ADAPTIVE_ITEMS"] = items
+    view["ADAPTIVE_BRIDGE_ITEMS"] = bridge_items
+    view["ADAPTIVE_BRIDGE_APPLIED"] = bool(bridge_items)
     view["BEST_ADAPTIVE_SIGNAL"] = best
     view["WHEN_TO_ENTER_ADAPTIVE"] = action
     return view
-
-
-def _v57_learning_report(state: Dict[str, Any]) -> Dict[str, Any]:
-    markets = {}
-    for market in sorted(state.get("markets") or {}):
-        cfg = _v57_market_cfg(state, market)
-        markets[market] = {
-            "summary": _v57_learning_summary(cfg),
-            "config": {
-                "probability_bias": cfg.get("probability_bias"),
-                "enter_offset": cfg.get("enter_offset"),
-                "soon_offset": cfg.get("soon_offset"),
-                "trend_min": cfg.get("trend_min"),
-                "config_version": cfg.get("config_version"),
-            },
-            "last_change": cfg.get("last_change"),
-            "ready_to_tune": len(cfg.get("records") or []) >= V57_MIN_RESOLVED,
-        }
-    return {
-        "learning_mode": state.get("learning_mode"),
-        "resolved_total": state.get("resolved_total"),
-        "pending_unresolved": sum(1 for x in state.get("pending") or [] if not x.get("resolved")),
-        "minimum_samples_before_tuning": V57_MIN_RESOLVED,
-        "markets": markets,
-        "safety": {
-            "rewrites_source_code": False,
-            "bounded_probability_bias": "[-3,+3]",
-            "bounded_enter_offset": "[-2,+5]",
-            "rollback_enabled": True,
-            "ambiguous_outcomes_tune_model": False,
-        },
-    }
 
 
 # ===== V5.7.2 RATE LIMIT + LIVE FEED GUARD =====
@@ -6921,6 +7026,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     adaptive_take_soon = []
     adaptive_take_later = []
     adaptive_emerging = []
+    adaptive_bridge_applied = []
 
     controlled_take_now = []
     controlled_take_soon = []
@@ -6945,6 +7051,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             adaptive_take_later.append(c)
         elif adaptive_state in {"EMERGING", "RADAR"}:
             adaptive_emerging.append(c)
+
+        if c.get("ADAPTIVE_BRIDGE_APPLIED"):
+            adaptive_bridge_applied.append(c)
 
         controlled_best = c.get("BEST_CONTROLLED_SIGNAL") or {}
         controlled_state = (controlled_best.get("FLOW") or {}).get("state")
@@ -7037,6 +7146,14 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "ADAPTIVE_TAKE_SOON": adaptive_take_soon,
         "ADAPTIVE_TAKE_LATER": adaptive_take_later,
         "ADAPTIVE_EMERGING": adaptive_emerging,
+        "ADAPTIVE_BRIDGE_APPLIED": adaptive_bridge_applied,
+        "ADAPTIVE_BRIDGE_CONFIG": {
+            "soon_probability": ADAPTIVE_BRIDGE_SOON_PROB,
+            "soon_trend": ADAPTIVE_BRIDGE_SOON_TREND,
+            "now_probability": ADAPTIVE_BRIDGE_NOW_PROB,
+            "now_trend": ADAPTIVE_BRIDGE_NOW_TREND,
+            "max_false_pressure_for_soon": ADAPTIVE_BRIDGE_MAX_FALSE_PRESSURE_FOR_SOON,
+        },
         "SELF_LEARNING_REPORT": _v57_learning_report(learning_state),
         "SELF_LEARNING_CHANGES_THIS_SCAN": learning_changes,
         "SELF_LEARNING_ROLLBACKS_THIS_SCAN": learning_rollbacks,
@@ -7140,6 +7257,13 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "atomic_budget_guard": True,
+        "adaptive_bridge": {
+            "enabled": True,
+            "soon_probability": ADAPTIVE_BRIDGE_SOON_PROB,
+            "soon_trend": ADAPTIVE_BRIDGE_SOON_TREND,
+            "now_probability": ADAPTIVE_BRIDGE_NOW_PROB,
+            "now_trend": ADAPTIVE_BRIDGE_NOW_TREND,
+        },
         "priority_analysis": {
             "tier_1": "stats_only",
             "tier_2_threshold": VISIBLE_SIGNAL_MIN,
