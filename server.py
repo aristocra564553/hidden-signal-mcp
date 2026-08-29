@@ -7,13 +7,15 @@ from typing import Any
 
 import httpx
 from mcp.server import MCPServer
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 
 # ============================================================
 # HIDDEN SIGNAL LIVE V3.0 — ZYLA ONLY
 # ============================================================
 
-VERSION = "V3.0-ZYLA"
+VERSION = "V3.1-ZYLA-DQ"
 
 ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
 ZYLA_BASE_URL = (
@@ -22,13 +24,17 @@ ZYLA_BASE_URL = (
 )
 
 mcp = MCPServer("Hidden Signal Live")
+
+
 @mcp.custom_route("/", methods=["GET", "HEAD"])
 async def health_root(request: Request) -> Response:
+    """Render health-check endpoint."""
     return JSONResponse({
         "status": "ok",
         "service": "Hidden Signal Live",
         "version": VERSION,
     })
+
 
 # ============================================================
 # SETTINGS
@@ -553,10 +559,14 @@ def parse_stats_rows(payload: Any) -> list[dict]:
     ]
 
 
-def get_stat_pair(
+def get_stat_entry(
     rows: list[dict],
     aliases: tuple[str, ...],
-) -> tuple[float, float]:
+) -> dict:
+    """
+    Distinguish a real 0:0 statistic from a missing statistic.
+    "present=True" means Zyla actually supplied the row.
+    """
     for row in rows:
         name = row.get("name")
 
@@ -566,41 +576,113 @@ def get_stat_pair(
         if not stat_name_matches(name, aliases):
             continue
 
-        return (
-            safe_float(row.get("home_team")),
-            safe_float(row.get("away_team")),
-        )
+        return {
+            "present": True,
+            "home": safe_float(row.get("home_team")),
+            "away": safe_float(row.get("away_team")),
+            "raw_name": name,
+        }
 
-    return 0.0, 0.0
+    return {
+        "present": False,
+        "home": 0.0,
+        "away": 0.0,
+        "raw_name": None,
+    }
+
+
+def build_data_quality(availability: dict[str, bool]) -> dict:
+    """Rate completeness without treating missing advanced stats as zero."""
+    weights = {
+        "shots": 20,
+        "shots_on_target": 20,
+        "xg": 20,
+        "touches_in_box": 15,
+        "shots_in_box": 10,
+        "corners": 8,
+        "possession": 4,
+        "xa": 3,
+    }
+
+    score = sum(
+        weight
+        for name, weight in weights.items()
+        if availability.get(name, False)
+    )
+
+    basic_ok = (
+        availability.get("shots", False)
+        and availability.get("shots_on_target", False)
+    )
+
+    advanced_count = sum(
+        1
+        for name in ("xg", "touches_in_box", "shots_in_box")
+        if availability.get(name, False)
+    )
+
+    # Strong signals require basic attacking data plus at least
+    # one advanced chance-quality metric.
+    strong_eligible = basic_ok and advanced_count >= 1 and score >= 55
+
+    if strong_eligible and score >= 75:
+        level = "HIGH"
+    elif basic_ok and score >= 45:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    missing = [
+        name
+        for name in weights
+        if not availability.get(name, False)
+    ]
+
+    return {
+        "score": int(score),
+        "level": level,
+        "basic_ok": basic_ok,
+        "advanced_count": advanced_count,
+        "strong_eligible": strong_eligible,
+        "missing": missing,
+    }
 
 
 def parse_stats(payload: Any) -> dict:
     rows = parse_stats_rows(payload)
 
     output = {}
+    availability = {}
 
     for metric_name, aliases in STAT_ALIASES.items():
-        home, away = get_stat_pair(rows, aliases)
+        entry = get_stat_entry(rows, aliases)
+        home = entry["home"]
+        away = entry["away"]
+
+        availability[metric_name] = entry["present"]
 
         output[metric_name] = {
             "home": home,
             "away": away,
             "total": home + away,
+            "present": entry["present"],
         }
 
-    core_total = (
-        output["xg"]["total"]
-        + output["shots"]["total"]
-        + output["shots_on_target"]["total"]
-        + output["touches_in_box"]["total"]
-        + output["corners"]["total"]
+    # Parser health is about whether the response can be interpreted,
+    # not whether xG happens to equal zero.
+    parser_ok = bool(rows) and (
+        availability.get("shots", False)
+        or availability.get("shots_on_target", False)
+        or availability.get("xg", False)
     )
 
-    parser_ok = bool(rows) and core_total > 0
+    data_quality = build_data_quality(availability)
 
     return {
         "rows_count": len(rows),
         "parser_ok": parser_ok,
+        "availability": availability,
+        "data_quality": data_quality,
         **output,
     }
 
@@ -642,7 +724,6 @@ def normalize_match(
         red_home = safe_int(stats["red_cards"]["home"])
         red_away = safe_int(stats["red_cards"]["away"])
 
-    # Only compare score if details actually provided a score object.
     details_can_verify_score = bool(details["score_present"])
 
     score_conflict = (
@@ -694,8 +775,10 @@ def normalize_match(
         "parser_warning": (
             None
             if parser_ok
-            else "Stats rows missing or core normalized metrics are all zero"
+            else "Zyla stats response cannot be safely normalized"
         ),
+        "data_quality": stats["data_quality"],
+        "availability": stats["availability"],
         "xg": stats["xg"],
         "shots": stats["shots"],
         "shots_on_target": stats["shots_on_target"],
@@ -916,6 +999,75 @@ def make_signal(
     }
 
 
+def format_metric_reason(metrics: dict, key: str, label: str) -> str:
+    metric = metrics[key]
+
+    if not metric.get("present", False):
+        return f"{label} missing"
+
+    return f"{label} {metric['home']:.2f}-{metric['away']:.2f}"
+
+
+def apply_data_quality_guard(
+    signal: dict,
+    metrics: dict,
+) -> dict:
+    """
+    Missing advanced data must reduce confidence, never behave like 0.00.
+    Strong ENTER is blocked when the data package is incomplete.
+    """
+    item = dict(signal)
+    dq = metrics["data_quality"]
+    market = item.get("market")
+
+    probability = float(item.get("probability", 0))
+    reasons = list(item.get("reasons", []))
+
+    # General completeness penalty.
+    if dq["level"] == "MEDIUM":
+        probability -= 5.0
+        reasons.append(f"data quality {dq['score']}/100")
+    elif dq["level"] == "LOW":
+        probability -= 12.0
+        reasons.append(f"low data quality {dq['score']}/100")
+
+    # Conservative unders are especially dangerous if chance-quality
+    # metrics are missing: absence of xG is NOT xG=0.
+    if market == "OVER_UNDER" and str(item.get("selection", "")).startswith("Under"):
+        if not metrics["availability"].get("xg", False):
+            probability = min(probability, 69.0)
+            reasons.append("xG unavailable: under cannot be strong")
+
+        if not metrics["availability"].get("touches_in_box", False):
+            probability = min(probability, 72.0)
+            reasons.append("box touches unavailable")
+
+    # Team goal / BTTS needs at least one advanced attacking metric.
+    if market in {"TEAM_GOAL", "BTTS"}:
+        if metrics["data_quality"]["advanced_count"] == 0:
+            probability = min(probability, 69.0)
+            reasons.append("no advanced attack metric available")
+
+    probability = clamp(probability, 1, 94)
+    color, decision = classify(probability)
+
+    # Hard fail-closed rule for ENTER.
+    if decision == "ENTER" and not dq["strong_eligible"]:
+        decision = "WAIT"
+        color = "🟡"
+        probability = min(probability, 74.0)
+        reasons.append("strong signal blocked by data-quality guard")
+
+    item["probability"] = round(probability, 1)
+    item["signal"] = color
+    item["decision"] = decision
+    item["data_quality_score"] = dq["score"]
+    item["data_quality_level"] = dq["level"]
+    item["reasons"] = reasons[:6]
+
+    return item
+
+
 def build_signals(metrics: dict) -> list[dict]:
     if not metrics["parser_ok"]:
         return []
@@ -932,10 +1084,10 @@ def build_signals(metrics: dict) -> list[dict]:
 
     common = [
         f"pressure {pressure}/100",
-        f"xG {metrics['xg']['home']:.2f}-{metrics['xg']['away']:.2f}",
+        format_metric_reason(metrics, "xg", "xG"),
         f"shots {metrics['shots']['home']:.0f}-{metrics['shots']['away']:.0f}",
         f"SOT {metrics['shots_on_target']['home']:.0f}-{metrics['shots_on_target']['away']:.0f}",
-        f"box touches {metrics['touches_in_box']['home']:.0f}-{metrics['touches_in_box']['away']:.0f}",
+        format_metric_reason(metrics, "touches_in_box", "box touches"),
     ]
 
     signals = []
@@ -1097,6 +1249,11 @@ def build_signals(metrics: dict) -> list[dict]:
             )
         )
 
+    signals = [
+        apply_data_quality_guard(signal, metrics)
+        for signal in signals
+    ]
+
     signals.sort(
         key=lambda item: item["probability"],
         reverse=True,
@@ -1252,6 +1409,8 @@ async def analyze_match_internal(
         },
         "parser_ok": normalized["parser_ok"],
         "parser_warning": normalized["parser_warning"],
+        "data_quality": normalized["data_quality"],
+        "availability": normalized["availability"],
         "score_sync": normalized["score_sync"],
         "metrics": {
             "xg": normalized["xg"],
@@ -1365,6 +1524,7 @@ async def scan_zyla_live(
             "fully_analyzed": 0,
             "parser_failures": 0,
             "score_conflicts": 0,
+            "quality_blocked": 0,
             "strong_signals": [],
             "top_candidates": [],
             "estimated_api_calls_this_scan": 1,
@@ -1409,6 +1569,15 @@ async def scan_zyla_live(
         if isinstance(item, dict)
         and not item.get("error")
         and item.get("parser_ok") is False
+    )
+
+    quality_blocked = sum(
+        1
+        for item in cheap_results
+        if isinstance(item, dict)
+        and not item.get("error")
+        and item.get("parser_ok") is True
+        and not item.get("data_quality", {}).get("strong_eligible", False)
     )
 
     valid = [
@@ -1488,6 +1657,7 @@ async def scan_zyla_live(
                 "minute": match["minute"],
                 "score": match["score"],
                 "score_sync_ok": analysis["score_sync"]["ok"],
+                "data_quality": analysis.get("data_quality"),
                 "market": top["market"],
                 "selection": top["selection"],
                 "probability": top["probability"],
@@ -1506,6 +1676,7 @@ async def scan_zyla_live(
                 "minute": match["minute"],
                 "score": match["score"],
                 "score_sync_ok": analysis["score_sync"]["ok"],
+                "data_quality": analysis.get("data_quality"),
                 "market": signal["market"],
                 "selection": signal["selection"],
                 "probability": signal["probability"],
@@ -1581,6 +1752,7 @@ async def scan_zyla_live(
         "fully_analyzed": fully_analyzed,
         "parser_failures": parser_failures,
         "score_conflicts": score_conflicts,
+        "quality_blocked": quality_blocked,
         "strong_signal_threshold": STRONG_THRESHOLD,
         "strong_signals": strong_signals,
         "top_candidates": top_candidates[:5],
@@ -1623,6 +1795,8 @@ async def debug_zyla_match(match_id: str):
         "live_candidate": candidate,
         "details": parse_details(details),
         "parser_ok": normalized["parser_ok"],
+        "data_quality": normalized["data_quality"],
+        "availability": normalized["availability"],
         "score_sync": normalized["score_sync"],
         "normalized": {
             "minute": normalized["minute"],
@@ -1665,8 +1839,11 @@ async def hidden_signal_status():
             "score_conflict_downgrades_enter": True,
             "parser_fail_closed": True,
             "repeat_guard_after_scan_only": True,
+            "missing_stats_are_not_zero": True,
+            "data_quality_guard": True,
+            "strong_enter_requires_advanced_metric": True,
         },
-        "model_type": "heuristic-v3-not-calibrated",
+        "model_type": "heuristic-v3.1-not-calibrated",
         "important_note": (
             "Signal percentages are heuristic ranking estimates, not "
             "calibrated statistical probabilities."
