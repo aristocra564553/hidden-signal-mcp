@@ -1,20 +1,20 @@
 import os
+import re
 import math
 import time
+import json
 import asyncio
-import httpx
 from typing import Any
+
+import httpx
 from mcp.server import MCPServer
 
 
 # ============================================================
-# HIDDEN SIGNAL LIVE — ZYLA + API-FOOTBALL
+# HIDDEN SIGNAL V2 — ZYLA ONLY
 # ============================================================
 
-API_KEY = (os.environ.get("API_FOOTBALL_KEY") or "").strip()
 ZYLA_API_KEY = (os.environ.get("ZYLA_API_KEY") or "").strip()
-
-API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
 
 ZYLA_BASE_URL = (
     "https://zylalabs.com/api/12518/"
@@ -28,9 +28,23 @@ mcp = MCPServer("Hidden Signal Live")
 # SETTINGS
 # ============================================================
 
+VERSION = "V2.0-ZYLA"
+
 STRONG_SIGNAL_THRESHOLD = 75.0
 MEDIUM_SIGNAL_THRESHOLD = 62.0
-MAX_SCAN_MATCHES = 8
+
+DEFAULT_PREFILTER_LIMIT = 8
+DEFAULT_DEEP_LIMIT = 4
+MAX_PREFILTER_LIMIT = 14
+MAX_DEEP_LIMIT = 6
+
+LIVE_CACHE_TTL = 15
+STATS_CACHE_TTL = 25
+DETAILS_CACHE_TTL = 30
+SUMMARY_CACHE_TTL = 35
+ODDS_CACHE_TTL = 25
+
+REPEAT_SIGNAL_DELTA = 4.0
 
 SIGNALS = {
     "goal_next_5": True,
@@ -43,15 +57,7 @@ SIGNALS = {
     "match_result": True,
 }
 
-# Повторный сигнал не считается новым, пока его вероятность
-# не изменилась хотя бы на это количество процентных пунктов.
-REPEAT_SIGNAL_DELTA = 4.0
-
-# Scanner cache (seconds)
-ZYLA_CACHE_TTL = 30
-_ZYLA_CACHE: dict[str, dict[str, Any]] = {}
-
-# Простая память процесса Render. После перезапуска сервера очищается.
+_CACHE: dict[str, dict[str, Any]] = {}
 _LAST_SIGNAL_STATE: dict[str, dict[str, float]] = {}
 
 
@@ -74,514 +80,763 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
 
     if isinstance(value, str):
-        text = value.strip().replace("%", "").replace(",", ".")
-        if not text:
-            return default
-
-        # Берём первое число из строки вроде "45+2", "0.64 xG", "9 shots".
-        match = re_search_number(text)
-        if match is None:
+        m = re.search(r"-?\d+(?:[.,]\d+)?", value)
+        if not m:
             return default
 
         try:
-            return float(match)
+            return float(m.group(0).replace(",", "."))
         except Exception:
             return default
 
     return default
 
 
-def re_search_number(text: str):
-    import re
-    m = re.search(r"-?\d+(?:\.\d+)?", text)
-    return m.group(0) if m else None
-
-
-def norm_key(value: Any) -> str:
-    return (
-        str(value or "")
-        .strip()
-        .lower()
-        .replace("_", " ")
-        .replace("-", " ")
-        .replace("  ", " ")
-    )
-
-
-def normalize_name(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _dedupe(value: Any):
-    """Убирает точные дубли из списков рекурсивно."""
-    if isinstance(value, dict):
-        return {k: _dedupe(v) for k, v in value.items()}
-
-    if isinstance(value, list):
-        result = []
-        seen = set()
-
-        for item in value:
-            item = _dedupe(item)
-
-            try:
-                marker = json.dumps(item, ensure_ascii=False, sort_keys=True)
-            except Exception:
-                marker = repr(item)
-
-            if marker not in seen:
-                seen.add(marker)
-                result.append(item)
-
-        return result
-
-    return value
+def normalize_key(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 def walk(value: Any):
-    """Рекурсивно проходит по dict/list."""
     if isinstance(value, dict):
         yield value
-        for item in value.values():
-            yield from walk(item)
+
+        for child in value.values():
+            yield from walk(child)
 
     elif isinstance(value, list):
-        for item in value:
-            yield from walk(item)
+        for child in value:
+            yield from walk(child)
 
 
-def unwrap_api_response(payload: Any):
-    if not isinstance(payload, dict):
-        return payload
-
-    if "api_response" in payload:
+def unwrap(payload: Any):
+    if isinstance(payload, dict) and "api_response" in payload:
         return payload.get("api_response")
-
-    if "data" in payload:
-        return payload.get("data")
 
     return payload
 
 
 def first_value_by_keys(payload: Any, keys: list[str], default=None):
-    wanted = {norm_key(k) for k in keys}
+    wanted = {normalize_key(k) for k in keys}
 
     for node in walk(payload):
         for key, value in node.items():
-            if norm_key(key) in wanted and value not in (None, "", [], {}):
+            if normalize_key(key) in wanted and value not in (None, "", [], {}):
                 return value
 
     return default
 
 
-def collect_values_by_keys(payload: Any, keys: list[str]) -> list[Any]:
-    wanted = {norm_key(k) for k in keys}
-    out = []
+def parse_pair_string(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, str):
+        return None
 
-    for node in walk(payload):
-        for key, value in node.items():
-            if norm_key(key) in wanted:
-                out.append(value)
-
-    return out
-
-
-def find_stat_pair(payload: Any, aliases: list[str]) -> tuple[float, float] | None:
-    """
-    Ищет статистику в наиболее распространённых форматах:
-    1) {"type": "Expected Goals (xG)", "home": 0.45, "away": 0.10}
-    2) {"name": "Shots", "home": "9", "away": "5"}
-    3) {"stat": "Corners", "home": 4, "away": 1}
-    4) {"key": "xG", "value": {"home": 0.45, "away": 0.10}}
-    """
-    wanted = {norm_key(a) for a in aliases}
-    label_keys = ("type", "name", "stat", "title", "label", "key")
-
-    for node in walk(payload):
-        label = None
-
-        for lk in label_keys:
-            if lk in node:
-                label = norm_key(node.get(lk))
-                break
-
-        if label and (
-            label in wanted
-            or any(alias in label for alias in wanted)
-            or any(label in alias for alias in wanted)
-        ):
-            home = None
-            away = None
-
-            for hk in ("home", "home_value", "value_home", "homeValue"):
-                if hk in node:
-                    home = node.get(hk)
-                    break
-
-            for ak in ("away", "away_value", "value_away", "awayValue"):
-                if ak in node:
-                    away = node.get(ak)
-                    break
-
-            if home is not None and away is not None:
-                return safe_float(home), safe_float(away)
-
-            value = node.get("value")
-            if isinstance(value, dict):
-                h = first_value_by_keys(value, ["home", "home_value", "homeValue"])
-                a = first_value_by_keys(value, ["away", "away_value", "awayValue"])
-                if h is not None and a is not None:
-                    return safe_float(h), safe_float(a)
-
-    return None
-
-
-def find_team_names(payload: Any) -> tuple[str, str]:
-    home = ""
-    away = ""
-
-    home_keys = [
-        "home_name", "home team", "home_team_name", "homeTeamName",
-        "home", "team_home"
-    ]
-    away_keys = [
-        "away_name", "away team", "away_team_name", "awayTeamName",
-        "away", "team_away"
-    ]
-
-    # Сначала ищем очевидные строковые поля.
-    for node in walk(payload):
-        for key, value in node.items():
-            nk = norm_key(key)
-
-            if not home and nk in {norm_key(k) for k in home_keys}:
-                if isinstance(value, str):
-                    home = normalize_name(value)
-                elif isinstance(value, dict):
-                    name = first_value_by_keys(value, ["name", "team_name", "team"])
-                    if isinstance(name, str):
-                        home = normalize_name(name)
-
-            if not away and nk in {norm_key(k) for k in away_keys}:
-                if isinstance(value, str):
-                    away = normalize_name(value)
-                elif isinstance(value, dict):
-                    name = first_value_by_keys(value, ["name", "team_name", "team"])
-                    if isinstance(name, str):
-                        away = normalize_name(name)
-
-    return home, away
-
-
-def parse_score(payload: Any) -> tuple[int, int]:
-    pair = find_stat_pair(payload, ["score", "current score"])
-    if pair:
-        return int(pair[0]), int(pair[1])
-
-    # Распространённые поля.
-    home = first_value_by_keys(
-        payload,
-        ["home_score", "score_home", "home goals", "homeGoals"],
-    )
-    away = first_value_by_keys(
-        payload,
-        ["away_score", "score_away", "away goals", "awayGoals"],
+    m = re.search(
+        r"(-?\d+(?:[.,]\d+)?)\s*[:\-–—]\s*(-?\d+(?:[.,]\d+)?)",
+        value,
     )
 
-    if home is not None and away is not None:
-        return int(safe_float(home)), int(safe_float(away))
+    if not m:
+        return None
 
-    # Строка "1:0" / "1-0"
-    score_text = first_value_by_keys(
-        payload,
-        ["score", "current_score", "current score"],
+    return (
+        float(m.group(1).replace(",", ".")),
+        float(m.group(2).replace(",", ".")),
     )
 
-    if isinstance(score_text, str):
-        import re
-        m = re.search(r"(\d+)\s*[:\-]\s*(\d+)", score_text)
-        if m:
-            return int(m.group(1)), int(m.group(2))
 
-    return 0, 0
+def cache_get(key: str):
+    item = _CACHE.get(key)
 
+    if not item:
+        return None
 
-def parse_minute(payload: Any) -> int:
-    minute = first_value_by_keys(
-        payload,
-        [
-            "minute", "live_time", "live time", "time",
-            "match_minute", "match minute", "elapsed"
-        ],
-    )
+    if time.time() >= item["expires_at"]:
+        _CACHE.pop(key, None)
+        return None
 
-    if minute is None:
-        return 0
-
-    text = str(minute)
-    num = safe_float(text, 0.0)
-    return int(clamp(num, 0, 130))
+    return item["value"]
 
 
-def parse_red_cards(payload: Any) -> tuple[int, int]:
-    pair = find_stat_pair(payload, ["red cards", "red card", "reds"])
-    if pair:
-        return int(pair[0]), int(pair[1])
+def cache_set(key: str, value: Any, ttl: int):
+    _CACHE[key] = {
+        "value": value,
+        "expires_at": time.time() + ttl,
+    }
 
-    home = first_value_by_keys(payload, ["home_red_cards", "home reds"])
-    away = first_value_by_keys(payload, ["away_red_cards", "away reds"])
 
-    return int(safe_float(home)), int(safe_float(away))
+def http_status(payload: Any):
+    if not isinstance(payload, dict):
+        return None
+
+    return payload.get("diagnostic", {}).get("http_status")
+
+
+def response_nonempty(payload: Any) -> bool:
+    value = unwrap(payload)
+    return value not in (None, "", [], {})
 
 
 # ============================================================
-# HTTP REQUESTS
+# ZYLA REQUESTS
 # ============================================================
-
-async def api_get(endpoint: str, params: dict | None = None):
-    if not API_KEY:
-        return {
-            "source": "api-football",
-            "error": "API_FOOTBALL_KEY is not configured",
-            "diagnostic": {"key_loaded": False},
-        }
-
-    headers = {"x-apisports-key": API_KEY}
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"{API_FOOTBALL_BASE_URL}{endpoint}",
-                headers=headers,
-                params=params or {},
-            )
-
-        try:
-            data = response.json()
-        except Exception:
-            data = {"raw_response": response.text}
-
-        return {
-            "source": "api-football",
-            "diagnostic": {
-                "key_loaded": True,
-                "http_status": response.status_code,
-            },
-            "api_response": data,
-        }
-
-    except Exception as exc:
-        return {
-            "source": "api-football",
-            "error": str(exc),
-        }
-
 
 async def zyla_get(
     endpoint_id: int,
     endpoint_slug: str,
     params: dict | None = None,
+    cache_key: str | None = None,
+    cache_ttl: int = 0,
 ):
     if not ZYLA_API_KEY:
         return {
-            "source": "zyla-flashscore",
+            "source": "zyla",
             "error": "ZYLA_API_KEY is not configured",
-            "diagnostic": {"key_loaded": False},
+            "diagnostic": {
+                "key_loaded": False,
+                "http_status": None,
+            },
         }
 
-    url = f"{ZYLA_BASE_URL}/{endpoint_id}/{endpoint_slug}"
+    if cache_key and cache_ttl > 0:
+        cached = cache_get(cache_key)
 
-    headers = {
-        "Authorization": f"Bearer {ZYLA_API_KEY}",
-    }
+        if cached is not None:
+            result = dict(cached) if isinstance(cached, dict) else cached
+
+            if isinstance(result, dict):
+                result["cache_hit"] = True
+
+            return result
+
+    url = f"{ZYLA_BASE_URL}/{endpoint_id}/{endpoint_slug}"
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 url,
-                headers=headers,
+                headers={
+                    "Authorization": f"Bearer {ZYLA_API_KEY}",
+                },
                 params=params or {},
             )
 
         try:
             data = response.json()
         except Exception:
-            data = {"raw_response": response.text}
+            data = {
+                "raw_response": response.text,
+            }
 
-        return {
-            "source": "zyla-flashscore",
+        result = {
+            "source": "zyla",
             "diagnostic": {
                 "key_loaded": True,
                 "http_status": response.status_code,
                 "endpoint_id": endpoint_id,
             },
             "api_response": data,
+            "cache_hit": False,
         }
+
+        if (
+            cache_key
+            and cache_ttl > 0
+            and response.status_code == 200
+        ):
+            cache_set(cache_key, result, cache_ttl)
+
+        return result
 
     except Exception as exc:
         return {
-            "source": "zyla-flashscore",
+            "source": "zyla",
             "error": str(exc),
+            "diagnostic": {
+                "key_loaded": bool(ZYLA_API_KEY),
+                "http_status": None,
+                "endpoint_id": endpoint_id,
+            },
         }
 
 
-
-async def zyla_get_cached(
-    endpoint_id: int,
-    endpoint_slug: str,
-    params: dict | None = None,
-    cache_ttl: int = ZYLA_CACHE_TTL,
-):
-    """
-    Small in-memory cache for scanner calls.
-    Render restart clears it automatically.
-    """
-    params = params or {}
-    cache_key = f"{endpoint_id}:{endpoint_slug}:{json.dumps(params, sort_keys=True, ensure_ascii=False)}"
-    now = time.time()
-
-    cached = _ZYLA_CACHE.get(cache_key)
-    if cached and now < cached["expires_at"]:
-        value = cached["value"]
-        if isinstance(value, dict):
-            value = dict(value)
-            value["cache_hit"] = True
-        return value
-
-    value = await zyla_get(endpoint_id, endpoint_slug, params)
-
-    if (
-        isinstance(value, dict)
-        and value.get("diagnostic", {}).get("http_status") == 200
-    ):
-        _ZYLA_CACHE[cache_key] = {
-            "expires_at": now + max(1, int(cache_ttl)),
-            "value": value,
-        }
-
-    return value
-
-
-# ============================================================
-# ZYLA RAW TOOLS
-# ============================================================
-
-@mcp.tool()
-async def get_zyla_live_matches():
-    """Get all live football matches from Zyla FlashScore."""
+async def zyla_live():
     return await zyla_get(
         23856,
         "get+live+matches",
         {"sport_id": 1},
+        cache_key="live",
+        cache_ttl=LIVE_CACHE_TTL,
     )
 
 
-@mcp.tool()
-async def get_zyla_match_details(match_id: str):
-    """Get Zyla match details."""
+async def zyla_details(match_id: str):
     return await zyla_get(
         23859,
         "get+match+details",
         {"match_id": match_id},
+        cache_key=f"details:{match_id}",
+        cache_ttl=DETAILS_CACHE_TTL,
     )
 
 
-@mcp.tool()
-async def get_zyla_match_summary(match_id: str):
-    """Get Zyla goals, cards, substitutions and events."""
+async def zyla_summary(match_id: str):
     return await zyla_get(
         23860,
         "get+match+summary",
         {"match_id": match_id},
+        cache_key=f"summary:{match_id}",
+        cache_ttl=SUMMARY_CACHE_TTL,
     )
 
 
-@mcp.tool()
-async def get_zyla_match_stats(match_id: str):
-    """Get Zyla live match statistics including xG when available."""
+async def zyla_stats(match_id: str):
     return await zyla_get(
         23861,
         "get+match+stats",
         {"match_id": match_id},
+        cache_key=f"stats:{match_id}",
+        cache_ttl=STATS_CACHE_TTL,
     )
 
 
-@mcp.tool()
-async def get_zyla_match_odds(match_id: str):
-    """Get available Zyla odds for a match."""
+async def zyla_odds(match_id: str):
     return await zyla_get(
         23865,
         "get+match+odds",
         {"match_id": match_id},
+        cache_key=f"odds:{match_id}",
+        cache_ttl=ODDS_CACHE_TTL,
     )
 
 
 # ============================================================
-# HIDDEN SIGNAL DATA PARSER
+# RAW ZYLA TOOLS
 # ============================================================
 
-def parse_match_metrics(details: Any, stats: Any, events: Any, odds: Any) -> dict:
-    d = unwrap_api_response(details)
-    s = unwrap_api_response(stats)
-    e = unwrap_api_response(events)
-    o = unwrap_api_response(odds)
+@mcp.tool()
+async def get_zyla_live_matches():
+    """Get all live football matches from Zyla."""
+    return await zyla_live()
+
+
+@mcp.tool()
+async def get_zyla_match_details(match_id: str):
+    """Get Zyla details for one match."""
+    return await zyla_details(match_id)
+
+
+@mcp.tool()
+async def get_zyla_match_stats(match_id: str):
+    """Get Zyla live statistics for one match."""
+    return await zyla_stats(match_id)
+
+
+@mcp.tool()
+async def get_zyla_match_summary(match_id: str):
+    """Get Zyla goals, cards, substitutions and match events."""
+    return await zyla_summary(match_id)
+
+
+@mcp.tool()
+async def get_zyla_match_odds(match_id: str):
+    """Get Zyla bookmaker odds for one match."""
+    return await zyla_odds(match_id)
+
+
+# ============================================================
+# LIVE LIST PARSER
+# ============================================================
+
+def extract_team_name(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, dict):
+        for key in (
+            "name",
+            "team_name",
+            "teamName",
+            "participant_name",
+            "participantName",
+        ):
+            if key in value and isinstance(value[key], str):
+                return value[key].strip()
+
+    return ""
+
+
+def parse_team_names(payload: Any) -> tuple[str, str]:
+    home = ""
+    away = ""
+
+    for node in walk(payload):
+        for key, value in node.items():
+            nk = normalize_key(key)
+
+            if not home and nk in {
+                "home",
+                "home team",
+                "home team name",
+                "home name",
+                "team home",
+                "participant home",
+            }:
+                home = extract_team_name(value)
+
+            if not away and nk in {
+                "away",
+                "away team",
+                "away team name",
+                "away name",
+                "team away",
+                "participant away",
+            }:
+                away = extract_team_name(value)
+
+    return home, away
+
+
+def parse_score(payload: Any) -> tuple[int, int]:
+    # Explicit home/away score keys.
+    home = first_value_by_keys(
+        payload,
+        [
+            "home_score",
+            "score_home",
+            "home goals",
+            "homeGoals",
+            "homeScore",
+            "home score",
+        ],
+    )
+
+    away = first_value_by_keys(
+        payload,
+        [
+            "away_score",
+            "score_away",
+            "away goals",
+            "awayGoals",
+            "awayScore",
+            "away score",
+        ],
+    )
+
+    if home is not None and away is not None:
+        return int(safe_float(home)), int(safe_float(away))
+
+    # Score-like pair strings.
+    for node in walk(payload):
+        for key, value in node.items():
+            if normalize_key(key) in {
+                "score",
+                "current score",
+                "result",
+                "current result",
+                "live score",
+            }:
+                pair = parse_pair_string(value)
+
+                if pair:
+                    return int(pair[0]), int(pair[1])
+
+                if isinstance(value, dict):
+                    h = first_value_by_keys(
+                        value,
+                        ["home", "home_score", "homeScore"],
+                    )
+                    a = first_value_by_keys(
+                        value,
+                        ["away", "away_score", "awayScore"],
+                    )
+
+                    if h is not None and a is not None:
+                        return int(safe_float(h)), int(safe_float(a))
+
+    return 0, 0
+
+
+def parse_minute(payload: Any) -> int:
+    value = first_value_by_keys(
+        payload,
+        [
+            "minute",
+            "live_time",
+            "live time",
+            "time",
+            "elapsed",
+            "match minute",
+            "match_minute",
+            "stage_time",
+        ],
+    )
+
+    return int(clamp(safe_float(value), 0, 130))
+
+
+def parse_live_red_cards(payload: Any) -> tuple[int, int]:
+    home = first_value_by_keys(
+        payload,
+        [
+            "home_red_cards",
+            "home red cards",
+            "homeRedCards",
+            "home reds",
+        ],
+    )
+
+    away = first_value_by_keys(
+        payload,
+        [
+            "away_red_cards",
+            "away red cards",
+            "awayRedCards",
+            "away reds",
+        ],
+    )
+
+    if home is not None or away is not None:
+        return int(safe_float(home)), int(safe_float(away))
+
+    return 0, 0
+
+
+def extract_live_candidates(payload: Any) -> list[dict]:
+    raw = unwrap(payload)
+    results = []
+    seen = set()
+
+    for node in walk(raw):
+        match_id = None
+
+        for key in ("match_id", "matchId", "event_id", "eventId"):
+            if key in node and node.get(key) not in (None, ""):
+                match_id = str(node.get(key))
+                break
+
+        if not match_id or match_id in seen:
+            continue
+
+        home, away = parse_team_names(node)
+        minute = parse_minute(node)
+        score_home, score_away = parse_score(node)
+        red_home, red_away = parse_live_red_cards(node)
+
+        # A real live match object should have at least teams or live state.
+        if not (
+            (home and away)
+            or minute > 0
+            or first_value_by_keys(
+                node,
+                ["status", "stage", "live_time", "score"],
+            ) is not None
+        ):
+            continue
+
+        seen.add(match_id)
+
+        results.append({
+            "match_id": match_id,
+            "home": home,
+            "away": away,
+            "minute": minute,
+            "score_home": score_home,
+            "score_away": score_away,
+            "red_home": red_home,
+            "red_away": red_away,
+        })
+
+    return results
+
+
+# ============================================================
+# ROBUST ZYLA STAT PARSER
+# ============================================================
+
+LABEL_KEYS = (
+    "name",
+    "type",
+    "title",
+    "label",
+    "stat",
+    "stat_name",
+    "statName",
+    "statistic",
+    "statistic_name",
+    "statisticName",
+    "key",
+)
+
+HOME_VALUE_KEYS = (
+    "home",
+    "home_value",
+    "homeValue",
+    "value_home",
+    "valueHome",
+    "home_stat",
+    "homeStat",
+    "participant_1",
+    "participant1",
+    "team1",
+)
+
+AWAY_VALUE_KEYS = (
+    "away",
+    "away_value",
+    "awayValue",
+    "value_away",
+    "valueAway",
+    "away_stat",
+    "awayStat",
+    "participant_2",
+    "participant2",
+    "team2",
+)
+
+
+def label_matches(label: str, aliases: list[str]) -> bool:
+    label = normalize_key(label)
+
+    if not label:
+        return False
+
+    wanted = [normalize_key(a) for a in aliases]
+
+    return any(
+        label == alias
+        or alias in label
+        or label in alias
+        for alias in wanted
+    )
+
+
+def direct_pair_from_dict(node: dict) -> tuple[float, float] | None:
+    home = None
+    away = None
+
+    for key in HOME_VALUE_KEYS:
+        if key in node and not isinstance(node[key], (dict, list)):
+            home = node[key]
+            break
+
+    for key in AWAY_VALUE_KEYS:
+        if key in node and not isinstance(node[key], (dict, list)):
+            away = node[key]
+            break
+
+    if home is not None and away is not None:
+        return safe_float(home), safe_float(away)
+
+    # Common two-value arrays.
+    for key in ("values", "value", "data", "stats"):
+        value = node.get(key)
+
+        if (
+            isinstance(value, list)
+            and len(value) >= 2
+            and not isinstance(value[0], (dict, list))
+            and not isinstance(value[1], (dict, list))
+        ):
+            return safe_float(value[0]), safe_float(value[1])
+
+        if isinstance(value, str):
+            pair = parse_pair_string(value)
+            if pair:
+                return pair
+
+    return None
+
+
+def find_metric_pair(payload: Any, aliases: list[str]) -> tuple[float, float] | None:
+    # Strategy A: labelled statistic objects.
+    for node in walk(payload):
+        label = ""
+
+        for key in LABEL_KEYS:
+            if key in node and isinstance(node[key], str):
+                label = node[key]
+                break
+
+        if label and label_matches(label, aliases):
+            pair = direct_pair_from_dict(node)
+
+            if pair:
+                return pair
+
+    # Strategy B: metric name is itself a dictionary key.
+    for node in walk(payload):
+        for key, value in node.items():
+            if not label_matches(str(key), aliases):
+                continue
+
+            if isinstance(value, dict):
+                pair = direct_pair_from_dict(value)
+
+                if pair:
+                    return pair
+
+            if isinstance(value, list) and len(value) >= 2:
+                if not isinstance(value[0], (dict, list)):
+                    return safe_float(value[0]), safe_float(value[1])
+
+            pair = parse_pair_string(value)
+
+            if pair:
+                return pair
+
+    return None
+
+
+def metric(payload: Any, aliases: list[str]) -> tuple[float, float]:
+    pair = find_metric_pair(payload, aliases)
+    return pair if pair is not None else (0.0, 0.0)
+
+
+def parse_red_cards(stats_raw: Any, summary_raw: Any) -> tuple[int, int]:
+    pair = find_metric_pair(
+        stats_raw,
+        ["red cards", "red card", "reds"],
+    )
+
+    if pair:
+        return int(pair[0]), int(pair[1])
+
+    pair = find_metric_pair(
+        summary_raw,
+        ["red cards", "red card", "reds"],
+    )
+
+    if pair:
+        return int(pair[0]), int(pair[1])
+
+    return 0, 0
+
+
+def normalize_match(
+    live_candidate: dict | None,
+    details_payload: Any,
+    stats_payload: Any,
+    summary_payload: Any,
+    odds_payload: Any,
+) -> dict:
+    live_candidate = live_candidate or {}
+
+    details_raw = unwrap(details_payload)
+    stats_raw = unwrap(stats_payload)
+    summary_raw = unwrap(summary_payload)
+    odds_raw = unwrap(odds_payload)
 
     combined = {
-        "details": d,
-        "stats": s,
-        "events": e,
-        "odds": o,
+        "details": details_raw,
+        "stats": stats_raw,
+        "summary": summary_raw,
     }
 
-    home_name, away_name = find_team_names(d)
-    if not home_name or not away_name:
-        h2, a2 = find_team_names(combined)
-        home_name = home_name or h2
-        away_name = away_name or a2
+    # Live list is authoritative fallback for identity, minute and score.
+    detail_home, detail_away = parse_team_names(combined)
 
-    score_home, score_away = parse_score(d)
-    minute = parse_minute(d)
+    home = live_candidate.get("home") or detail_home
+    away = live_candidate.get("away") or detail_away
 
-    xg = find_stat_pair(s, ["expected goals", "expected goals xg", "xg"])
-    shots = find_stat_pair(s, ["shots", "total shots", "shots total"])
-    sot = find_stat_pair(s, ["shots on target", "shots on goal", "on target"])
-    box_shots = find_stat_pair(
-        s,
-        ["shots inside box", "shots insidebox", "inside box", "shots in box"]
+    score_home = int(live_candidate.get("score_home", 0))
+    score_away = int(live_candidate.get("score_away", 0))
+
+    detail_score = parse_score(combined)
+
+    if score_home == 0 and score_away == 0 and detail_score != (0, 0):
+        score_home, score_away = detail_score
+
+    minute = int(live_candidate.get("minute", 0)) or parse_minute(combined)
+
+    xg = metric(
+        stats_raw,
+        ["xg", "expected goals", "expected goals xg"],
     )
-    touches_box = find_stat_pair(
-        s,
-        ["touches in opposition box", "touches in box", "box touches"]
+
+    shots = metric(
+        stats_raw,
+        ["shots", "total shots", "shots total", "total attempts"],
     )
-    corners = find_stat_pair(s, ["corners", "corner kicks"])
-    possession = find_stat_pair(s, ["possession", "ball possession"])
-    xa = find_stat_pair(s, ["expected assists", "xa"])
-    fouls = find_stat_pair(s, ["fouls", "fouls committed"])
-    red_cards = parse_red_cards(combined)
 
-    def pair_or_zero(value):
-        return value if value is not None else (0.0, 0.0)
+    sot = metric(
+        stats_raw,
+        ["shots on target", "shots on goal", "on target"],
+    )
 
-    xg = pair_or_zero(xg)
-    shots = pair_or_zero(shots)
-    sot = pair_or_zero(sot)
-    box_shots = pair_or_zero(box_shots)
-    touches_box = pair_or_zero(touches_box)
-    corners = pair_or_zero(corners)
-    possession = pair_or_zero(possession)
-    xa = pair_or_zero(xa)
-    fouls = pair_or_zero(fouls)
+    box_shots = metric(
+        stats_raw,
+        [
+            "shots inside box",
+            "shots inside the box",
+            "shots in box",
+            "inside box",
+        ],
+    )
+
+    touches_box = metric(
+        stats_raw,
+        [
+            "touches in opposition box",
+            "touches in opponent box",
+            "touches in box",
+            "box touches",
+        ],
+    )
+
+    corners = metric(
+        stats_raw,
+        ["corners", "corner kicks"],
+    )
+
+    possession = metric(
+        stats_raw,
+        ["possession", "ball possession"],
+    )
+
+    xa = metric(
+        stats_raw,
+        ["xa", "expected assists"],
+    )
+
+    fouls = metric(
+        stats_raw,
+        ["fouls", "fouls committed"],
+    )
+
+    red_home, red_away = parse_red_cards(stats_raw, summary_raw)
+
+    if red_home == 0 and red_away == 0:
+        red_home = int(live_candidate.get("red_home", 0))
+        red_away = int(live_candidate.get("red_away", 0))
+
+    core_total = (
+        xg[0] + xg[1]
+        + shots[0] + shots[1]
+        + sot[0] + sot[1]
+        + touches_box[0] + touches_box[1]
+        + corners[0] + corners[1]
+    )
+
+    stats_have_data = response_nonempty(stats_payload)
+    parser_ok = not (stats_have_data and core_total == 0)
 
     return {
-        "home": home_name,
-        "away": away_name,
+        "home": home,
+        "away": away,
         "minute": minute,
         "score": {
             "home": score_home,
             "away": score_away,
             "total": score_home + score_away,
         },
-        "xg": {"home": xg[0], "away": xg[1], "total": xg[0] + xg[1]},
+        "xg": {
+            "home": xg[0],
+            "away": xg[1],
+            "total": xg[0] + xg[1],
+        },
         "shots": {
             "home": shots[0],
             "away": shots[1],
@@ -622,64 +877,102 @@ def parse_match_metrics(details: Any, stats: Any, events: Any, odds: Any) -> dic
             "total": fouls[0] + fouls[1],
         },
         "red_cards": {
-            "home": red_cards[0],
-            "away": red_cards[1],
+            "home": red_home,
+            "away": red_away,
         },
-        "events_available": bool(e),
-        "odds_available": bool(o),
+        "events_available": response_nonempty(summary_payload),
+        "odds_available": response_nonempty(odds_payload),
+        "parser_ok": parser_ok,
+        "parser_warning": (
+            None
+            if parser_ok
+            else "Zyla stats are non-empty but normalized core metrics are all zero"
+        ),
     }
 
 
 # ============================================================
-# HIDDEN SIGNAL V1 HEURISTIC ENGINE
+# ODDS SNAPSHOT
 # ============================================================
 
-def logistic(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-clamp(x, -20, 20)))
+def parse_odds_snapshot(payload: Any) -> dict:
+    raw = unwrap(payload)
 
+    bookmakers = set()
+    markets = []
+
+    for node in walk(raw):
+        name = first_value_by_keys(
+            node,
+            ["bookmaker", "bookmaker_name", "name"],
+        )
+
+        if isinstance(name, str) and len(name) <= 80:
+            if any(
+                token in name.lower()
+                for token in (
+                    "bet",
+                    "1xbet",
+                    "unibet",
+                    "betfair",
+                    "365",
+                    "pinnacle",
+                )
+            ):
+                bookmakers.add(name.strip())
+
+        market = first_value_by_keys(
+            node,
+            [
+                "betting_type",
+                "betting type",
+                "market",
+                "market_name",
+                "market name",
+            ],
+        )
+
+        if isinstance(market, str):
+            markets.append(market.strip())
+
+    return {
+        "bookmakers_count": len(bookmakers),
+        "bookmakers": sorted(bookmakers)[:8],
+        "markets_sample": list(dict.fromkeys(markets))[:8],
+    }
+
+
+# ============================================================
+# MODEL
+# ============================================================
 
 def build_pressure(metrics: dict) -> dict:
     minute = max(metrics["minute"], 1)
 
-    xg_total = metrics["xg"]["total"]
-    shots_total = metrics["shots"]["total"]
-    sot_total = metrics["shots_on_target"]["total"]
-    box_total = metrics["shots_in_box"]["total"]
-    touches_total = metrics["touches_in_box"]["total"]
-    corners_total = metrics["corners"]["total"]
+    xg_rate = metrics["xg"]["total"] * 90 / minute
+    shots_rate = metrics["shots"]["total"] * 90 / minute
+    sot_rate = metrics["shots_on_target"]["total"] * 90 / minute
+    box_rate = metrics["shots_in_box"]["total"] * 90 / minute
+    touches_rate = metrics["touches_in_box"]["total"] * 90 / minute
+    corner_rate = metrics["corners"]["total"] * 90 / minute
 
-    xg_rate = xg_total * 90 / minute
-    shots_rate = shots_total * 90 / minute
-    sot_rate = sot_total * 90 / minute
-    box_rate = box_total * 90 / minute
-    touches_rate = touches_total * 90 / minute
-    corners_rate = corners_total * 90 / minute
-
-    # Нормализованные компоненты 0..1.
-    c_xg = clamp(xg_rate / 3.0, 0, 1)
-    c_shots = clamp(shots_rate / 24.0, 0, 1)
-    c_sot = clamp(sot_rate / 9.0, 0, 1)
-    c_box = clamp(box_rate / 15.0, 0, 1)
-    c_touch = clamp(touches_rate / 45.0, 0, 1)
-    c_corner = clamp(corners_rate / 11.0, 0, 1)
-
-    pressure = (
-        c_xg * 0.30
-        + c_shots * 0.13
-        + c_sot * 0.20
-        + c_box * 0.13
-        + c_touch * 0.14
-        + c_corner * 0.10
+    score = (
+        clamp(xg_rate / 3.0, 0, 1) * 0.30
+        + clamp(shots_rate / 24.0, 0, 1) * 0.13
+        + clamp(sot_rate / 9.0, 0, 1) * 0.20
+        + clamp(box_rate / 15.0, 0, 1) * 0.13
+        + clamp(touches_rate / 45.0, 0, 1) * 0.14
+        + clamp(corner_rate / 11.0, 0, 1) * 0.10
     )
 
     return {
-        "score_0_100": round(pressure * 100, 1),
+        "score_0_100": round(score * 100, 1),
         "xg_rate_90": round(xg_rate, 2),
         "shots_rate_90": round(shots_rate, 2),
         "sot_rate_90": round(sot_rate, 2),
         "box_shots_rate_90": round(box_rate, 2),
         "touches_box_rate_90": round(touches_rate, 2),
-        "corners_rate_90": round(corners_rate, 2),
+        "corners_rate_90": round(corner_rate, 2),
     }
 
 
@@ -689,7 +982,7 @@ def team_attack_strength(metrics: dict, side: str) -> float:
     xg = metrics["xg"][side] * 90 / minute
     shots = metrics["shots"][side] * 90 / minute
     sot = metrics["shots_on_target"][side] * 90 / minute
-    box_shots = metrics["shots_in_box"][side] * 90 / minute
+    box = metrics["shots_in_box"][side] * 90 / minute
     touches = metrics["touches_in_box"][side] * 90 / minute
     corners = metrics["corners"][side] * 90 / minute
 
@@ -697,99 +990,62 @@ def team_attack_strength(metrics: dict, side: str) -> float:
         clamp(xg / 1.8, 0, 1) * 0.34
         + clamp(shots / 14.0, 0, 1) * 0.12
         + clamp(sot / 5.0, 0, 1) * 0.22
-        + clamp(box_shots / 9.0, 0, 1) * 0.12
+        + clamp(box / 9.0, 0, 1) * 0.12
         + clamp(touches / 28.0, 0, 1) * 0.12
         + clamp(corners / 6.0, 0, 1) * 0.08
     )
 
-    red_home = metrics["red_cards"]["home"]
-    red_away = metrics["red_cards"]["away"]
+    reds = metrics["red_cards"]
 
     if side == "home":
-        score += 0.08 * max(0, red_away - red_home)
-        score -= 0.10 * max(0, red_home - red_away)
+        score += 0.08 * max(0, reds["away"] - reds["home"])
+        score -= 0.10 * max(0, reds["home"] - reds["away"])
     else:
-        score += 0.08 * max(0, red_home - red_away)
-        score -= 0.10 * max(0, red_away - red_home)
+        score += 0.08 * max(0, reds["home"] - reds["away"])
+        score -= 0.10 * max(0, reds["away"] - reds["home"])
 
     return clamp(score, 0, 1)
 
 
-def probability_goal_next_5(metrics: dict, pressure: dict) -> float:
-    p = pressure["score_0_100"] / 100.0
-    minute = metrics["minute"]
-    total_goals = metrics["score"]["total"]
+def logistic(value: float) -> float:
+    return 1 / (1 + math.exp(-clamp(value, -20, 20)))
 
-    # Базовый live hazard + интенсивность.
+
+def probability_goal_next_5(metrics: dict, pressure: dict) -> float:
+    p = pressure["score_0_100"] / 100
+
     logit = -2.05 + 2.35 * p
 
-    # Последняя треть матча чаще открывается.
+    minute = metrics["minute"]
+
     if 65 <= minute <= 88:
         logit += 0.18
 
-    # Нулевой счёт в начале немного снижает немедленный hazard.
-    if total_goals == 0 and minute < 25:
+    if metrics["score"]["total"] == 0 and minute < 25:
         logit -= 0.10
 
-    # Красная карточка создаёт дополнительную дисперсию.
     red_diff = abs(
-        metrics["red_cards"]["home"] - metrics["red_cards"]["away"]
+        metrics["red_cards"]["home"]
+        - metrics["red_cards"]["away"]
     )
+
     logit += 0.20 * min(red_diff, 1)
 
     return clamp(logistic(logit) * 100, 5, 92)
 
 
 def probability_from_interval(p5: float, minutes: float) -> float:
-    p5 = clamp(p5 / 100.0, 0.001, 0.95)
-    intervals = max(minutes / 5.0, 0.0)
-    probability = 1 - ((1 - p5) ** intervals)
-    return clamp(probability * 100, 1, 98)
+    p5 = clamp(p5 / 100, 0.001, 0.95)
+    intervals = max(minutes / 5, 0)
 
-
-def result_probabilities(metrics: dict) -> dict:
-    home_strength = team_attack_strength(metrics, "home")
-    away_strength = team_attack_strength(metrics, "away")
-
-    score_home = metrics["score"]["home"]
-    score_away = metrics["score"]["away"]
-    minute = metrics["minute"]
-
-    score_diff = score_home - score_away
-    time_factor = clamp(minute / 90.0, 0, 1)
-
-    home_logit = (
-        0.20
-        + 1.7 * (home_strength - away_strength)
-        + 1.25 * score_diff * time_factor
-    )
-    away_logit = (
-        0.00
-        + 1.7 * (away_strength - home_strength)
-        - 1.25 * score_diff * time_factor
+    return clamp(
+        (1 - ((1 - p5) ** intervals)) * 100,
+        1,
+        98,
     )
 
-    home_raw = math.exp(clamp(home_logit, -6, 6))
-    away_raw = math.exp(clamp(away_logit, -6, 6))
 
-    draw_base = 1.15
-    if score_diff == 0:
-        draw_base += 0.75 * time_factor
-    else:
-        draw_base -= 0.35 * time_factor
-
-    draw_raw = max(0.15, draw_base)
-
-    total = home_raw + draw_raw + away_raw
-
-    return {
-        "home": round(home_raw / total * 100, 1),
-        "draw": round(draw_raw / total * 100, 1),
-        "away": round(away_raw / total * 100, 1),
-    }
-
-
-def classify_probability(probability: float) -> tuple[str, str]:
+def classify(probability: float) -> tuple[str, str]:
     if probability >= STRONG_SIGNAL_THRESHOLD:
         return "🟢", "ENTER"
 
@@ -799,14 +1055,14 @@ def classify_probability(probability: float) -> tuple[str, str]:
     return "🔴", "SKIP"
 
 
-def signal_item(
+def make_signal(
     market: str,
     selection: str,
     probability: float,
     reasons: list[str],
     risk: str = "medium",
-) -> dict:
-    color, decision = classify_probability(probability)
+):
+    color, decision = classify(probability)
 
     return {
         "market": market,
@@ -819,13 +1075,63 @@ def signal_item(
     }
 
 
+def result_probabilities(metrics: dict) -> dict:
+    home_attack = team_attack_strength(metrics, "home")
+    away_attack = team_attack_strength(metrics, "away")
+
+    score_diff = (
+        metrics["score"]["home"]
+        - metrics["score"]["away"]
+    )
+
+    time_factor = clamp(metrics["minute"] / 90, 0, 1)
+
+    home_raw = math.exp(
+        clamp(
+            0.20
+            + 1.7 * (home_attack - away_attack)
+            + 1.25 * score_diff * time_factor,
+            -6,
+            6,
+        )
+    )
+
+    away_raw = math.exp(
+        clamp(
+            1.7 * (away_attack - home_attack)
+            - 1.25 * score_diff * time_factor,
+            -6,
+            6,
+        )
+    )
+
+    draw_raw = 1.15
+
+    if score_diff == 0:
+        draw_raw += 0.75 * time_factor
+    else:
+        draw_raw -= 0.35 * time_factor
+
+    draw_raw = max(0.15, draw_raw)
+
+    total = home_raw + draw_raw + away_raw
+
+    return {
+        "home": home_raw / total * 100,
+        "draw": draw_raw / total * 100,
+        "away": away_raw / total * 100,
+    }
+
+
 def build_signals(metrics: dict) -> list[dict]:
-    pressure = build_pressure(metrics)
+    # Safety rule: never score broken normalized data.
+    if not metrics["parser_ok"]:
+        return []
 
     minute = metrics["minute"]
-    score_home = metrics["score"]["home"]
-    score_away = metrics["score"]["away"]
     total_goals = metrics["score"]["total"]
+
+    pressure = build_pressure(metrics)
 
     home_attack = team_attack_strength(metrics, "home")
     away_attack = team_attack_strength(metrics, "away")
@@ -833,7 +1139,7 @@ def build_signals(metrics: dict) -> list[dict]:
     p5 = probability_goal_next_5(metrics, pressure)
     p10 = probability_from_interval(p5, 10)
 
-    reasons_common = [
+    common = [
         f"pressure {pressure['score_0_100']}/100",
         f"xG {metrics['xg']['home']:.2f}-{metrics['xg']['away']:.2f}",
         f"shots {metrics['shots']['home']:.0f}-{metrics['shots']['away']:.0f}",
@@ -841,163 +1147,170 @@ def build_signals(metrics: dict) -> list[dict]:
         f"box touches {metrics['touches_in_box']['home']:.0f}-{metrics['touches_in_box']['away']:.0f}",
     ]
 
-    signals: list[dict] = []
+    signals = []
 
     if SIGNALS["goal_next_5"]:
         signals.append(
-            signal_item(
+            make_signal(
                 "GOAL_NEXT_5",
                 "Goal in next 5 minutes",
                 p5,
-                reasons_common,
+                common,
                 "high" if p5 < STRONG_SIGNAL_THRESHOLD else "medium",
             )
         )
 
     if SIGNALS["goal_next_10"]:
         signals.append(
-            signal_item(
+            make_signal(
                 "GOAL_NEXT_10",
                 "Goal in next 10 minutes",
                 p10,
-                reasons_common,
+                common,
             )
         )
 
     if SIGNALS["goal_before_halftime"] and 1 <= minute < 45:
         remaining = max(1, 45 - minute)
-        p_ht = probability_from_interval(p5, remaining)
 
         signals.append(
-            signal_item(
+            make_signal(
                 "GOAL_BEFORE_HALFTIME",
                 "Goal before halftime",
-                p_ht,
-                reasons_common + [f"{remaining} min to HT"],
+                probability_from_interval(p5, remaining),
+                common + [f"{remaining} min to HT"],
             )
         )
 
     if SIGNALS["goal_before_fulltime"] and 1 <= minute < 90:
         remaining = max(1, 90 - minute)
-        p_ft = probability_from_interval(p5, remaining)
 
         signals.append(
-            signal_item(
+            make_signal(
                 "GOAL_BEFORE_FULLTIME",
                 "At least one more goal",
-                p_ft,
-                reasons_common + [f"{remaining} min to FT"],
+                probability_from_interval(p5, remaining),
+                common + [f"{remaining} min to FT"],
             )
         )
 
-    if SIGNALS["over_under"]:
-        # Динамические линии относительно текущего счёта.
+    if SIGNALS["over_under"] and minute < 90:
         over_line = total_goals + 0.5
-        p_over = probability_from_interval(p5, max(1, 90 - minute))
+        p_over = probability_from_interval(
+            p5,
+            max(1, 90 - minute),
+        )
         p_under = 100 - p_over
 
         signals.append(
-            signal_item(
+            make_signal(
                 "OVER_UNDER",
                 f"Over {over_line:.1f}",
                 p_over,
-                reasons_common,
+                common,
             )
         )
 
         signals.append(
-            signal_item(
+            make_signal(
                 "OVER_UNDER",
                 f"Under {over_line:.1f}",
                 p_under,
                 [
-                    f"goal probability to FT {p_over:.1f}%",
-                    f"current total {total_goals}",
+                    f"current score total {total_goals}",
                     f"minute {minute}",
+                    f"another-goal estimate {p_over:.1f}%",
                 ],
             )
         )
 
-    if SIGNALS["team_goal"]:
-        if minute < 90:
-            remaining = max(1, 90 - minute)
+    if SIGNALS["team_goal"] and minute < 90:
+        remaining = max(1, 90 - minute)
+        p_any = probability_from_interval(p5, remaining)
 
-            # Распределяем общий hazard по силе атак.
-            total_attack = max(home_attack + away_attack, 0.05)
+        total_attack = max(home_attack + away_attack, 0.05)
 
-            home_share = home_attack / total_attack
-            away_share = away_attack / total_attack
+        home_share = home_attack / total_attack
+        away_share = away_attack / total_attack
 
-            p_any = probability_from_interval(p5, remaining)
-            p_home_goal = clamp(
-                p_any * (0.35 + 0.85 * home_share),
-                1,
-                96,
+        home_p = clamp(
+            p_any * (0.35 + 0.85 * home_share),
+            1,
+            96,
+        )
+
+        away_p = clamp(
+            p_any * (0.35 + 0.85 * away_share),
+            1,
+            96,
+        )
+
+        signals.append(
+            make_signal(
+                "TEAM_GOAL",
+                f"{metrics['home'] or 'Home'} to score",
+                home_p,
+                [
+                    f"home attack {home_attack * 100:.0f}/100",
+                    f"home xG {metrics['xg']['home']:.2f}",
+                    f"home shots {metrics['shots']['home']:.0f}",
+                    f"home box touches {metrics['touches_in_box']['home']:.0f}",
+                ],
             )
-            p_away_goal = clamp(
-                p_any * (0.35 + 0.85 * away_share),
-                1,
-                96,
-            )
+        )
 
-            signals.append(
-                signal_item(
-                    "TEAM_GOAL",
-                    f"{metrics['home'] or 'Home'} to score",
-                    p_home_goal,
-                    [
-                        f"home attack {home_attack * 100:.0f}/100",
-                        f"home xG {metrics['xg']['home']:.2f}",
-                        f"home shots {metrics['shots']['home']:.0f}",
-                        f"home box touches {metrics['touches_in_box']['home']:.0f}",
-                    ],
-                )
+        signals.append(
+            make_signal(
+                "TEAM_GOAL",
+                f"{metrics['away'] or 'Away'} to score",
+                away_p,
+                [
+                    f"away attack {away_attack * 100:.0f}/100",
+                    f"away xG {metrics['xg']['away']:.2f}",
+                    f"away shots {metrics['shots']['away']:.0f}",
+                    f"away box touches {metrics['touches_in_box']['away']:.0f}",
+                ],
             )
-
-            signals.append(
-                signal_item(
-                    "TEAM_GOAL",
-                    f"{metrics['away'] or 'Away'} to score",
-                    p_away_goal,
-                    [
-                        f"away attack {away_attack * 100:.0f}/100",
-                        f"away xG {metrics['xg']['away']:.2f}",
-                        f"away shots {metrics['shots']['away']:.0f}",
-                        f"away box touches {metrics['touches_in_box']['away']:.0f}",
-                    ],
-                )
-            )
+        )
 
     if SIGNALS["btts"]:
-        home_scored = score_home > 0
-        away_scored = score_away > 0
+        home_scored = metrics["score"]["home"] > 0
+        away_scored = metrics["score"]["away"] > 0
 
         if home_scored and away_scored:
             p_btts = 100.0
-        elif home_scored and not away_scored:
-            remaining = max(1, 90 - minute)
-            p_any = probability_from_interval(p5, remaining)
-            p_btts = clamp(p_any * (0.50 + away_attack), 1, 95)
-        elif away_scored and not home_scored:
-            remaining = max(1, 90 - minute)
-            p_any = probability_from_interval(p5, remaining)
-            p_btts = clamp(p_any * (0.50 + home_attack), 1, 95)
         else:
             remaining = max(1, 90 - minute)
             p_any = probability_from_interval(p5, remaining)
-            p_btts = clamp(
-                p_any * min(home_attack, away_attack) * 1.15,
-                1,
-                88,
-            )
+
+            if home_scored:
+                p_btts = clamp(
+                    p_any * (0.50 + away_attack),
+                    1,
+                    95,
+                )
+            elif away_scored:
+                p_btts = clamp(
+                    p_any * (0.50 + home_attack),
+                    1,
+                    95,
+                )
+            else:
+                p_btts = clamp(
+                    p_any
+                    * min(home_attack, away_attack)
+                    * 1.15,
+                    1,
+                    88,
+                )
 
         signals.append(
-            signal_item(
+            make_signal(
                 "BTTS",
                 "Both teams to score - YES",
                 p_btts,
                 [
-                    f"score {score_home}-{score_away}",
+                    f"score {metrics['score']['home']}-{metrics['score']['away']}",
                     f"home attack {home_attack * 100:.0f}/100",
                     f"away attack {away_attack * 100:.0f}/100",
                     f"xG {metrics['xg']['home']:.2f}-{metrics['xg']['away']:.2f}",
@@ -1006,18 +1319,15 @@ def build_signals(metrics: dict) -> list[dict]:
         )
 
     if SIGNALS["match_result"]:
-        probs = result_probabilities(metrics)
-
-        home_name = metrics["home"] or "Home"
-        away_name = metrics["away"] or "Away"
+        rp = result_probabilities(metrics)
 
         signals.append(
-            signal_item(
+            make_signal(
                 "MATCH_RESULT",
-                f"{home_name} win",
-                probs["home"],
+                f"{metrics['home'] or 'Home'} win",
+                rp["home"],
                 [
-                    f"score {score_home}-{score_away}",
+                    f"score {metrics['score']['home']}-{metrics['score']['away']}",
                     f"home attack {home_attack * 100:.0f}/100",
                     f"away attack {away_attack * 100:.0f}/100",
                 ],
@@ -1025,421 +1335,421 @@ def build_signals(metrics: dict) -> list[dict]:
         )
 
         signals.append(
-            signal_item(
+            make_signal(
                 "MATCH_RESULT",
                 "Draw",
-                probs["draw"],
+                rp["draw"],
                 [
-                    f"score {score_home}-{score_away}",
+                    f"score {metrics['score']['home']}-{metrics['score']['away']}",
                     f"minute {minute}",
                 ],
             )
         )
 
         signals.append(
-            signal_item(
+            make_signal(
                 "MATCH_RESULT",
-                f"{away_name} win",
-                probs["away"],
+                f"{metrics['away'] or 'Away'} win",
+                rp["away"],
                 [
-                    f"score {score_home}-{score_away}",
+                    f"score {metrics['score']['home']}-{metrics['score']['away']}",
                     f"home attack {home_attack * 100:.0f}/100",
                     f"away attack {away_attack * 100:.0f}/100",
                 ],
             )
         )
 
-    # Самые сильные наверх.
-    signals.sort(key=lambda x: x["probability"], reverse=True)
+    signals.sort(
+        key=lambda item: item["probability"],
+        reverse=True,
+    )
 
     return signals
 
 
-def apply_repeat_guard(match_id: str, signals: list[dict]) -> list[dict]:
-    previous = _LAST_SIGNAL_STATE.setdefault(match_id, {})
+def apply_repeat_guard(match_id: str, signals: list[dict]):
+    state = _LAST_SIGNAL_STATE.setdefault(match_id, {})
     output = []
 
     for item in signals:
         key = f"{item['market']}::{item['selection']}"
-        p = float(item["probability"])
-        last = previous.get(key)
+        probability = float(item["probability"])
+        old = state.get(key)
 
-        is_new = (
-            last is None
-            or abs(p - last) >= REPEAT_SIGNAL_DELTA
+        changed = (
+            old is None
+            or abs(probability - old) >= REPEAT_SIGNAL_DELTA
         )
 
         item = dict(item)
-        item["new_or_changed"] = is_new
+        item["new_or_changed"] = changed
 
         if item["decision"] == "ENTER":
-            previous[key] = p
+            state[key] = probability
 
         output.append(item)
 
     return output
 
 
-def compact_recommendation(signals: list[dict]) -> dict:
-    strong = [
-        s for s in signals
-        if s["decision"] == "ENTER"
-        and s.get("new_or_changed", True)
+# ============================================================
+# MATCH LOOKUP
+# ============================================================
+
+def find_live_candidate(
+    live_candidates: list[dict],
+    match_id: str,
+):
+    for candidate in live_candidates:
+        if str(candidate.get("match_id")) == str(match_id):
+            return candidate
+
+    return None
+
+
+async def analyze_match_internal(
+    match_id: str,
+    live_candidate: dict | None = None,
+    include_details: bool = True,
+    include_summary: bool = True,
+    include_odds: bool = True,
+):
+    # If no live fallback supplied, get it from the cached live list.
+    if live_candidate is None:
+        live = await zyla_live()
+        candidates = extract_live_candidates(live)
+        live_candidate = find_live_candidate(candidates, match_id)
+
+    tasks = [
+        zyla_stats(match_id),
     ]
 
-    if strong:
-        top = strong[0]
-        return {
-            "status": "🟢 STRONG SIGNAL",
-            "market": top["market"],
-            "selection": top["selection"],
-            "probability": top["probability"],
-            "risk": top["risk"],
-            "decision": "ENTER",
-            "reasons": top["reasons"],
-        }
+    task_names = ["stats"]
 
-    waiting = [s for s in signals if s["decision"] == "WAIT"]
+    if include_details:
+        tasks.append(zyla_details(match_id))
+        task_names.append("details")
 
-    if waiting:
-        top = waiting[0]
-        return {
-            "status": "🟡 NO STRONG SIGNAL",
-            "market": top["market"],
-            "selection": top["selection"],
-            "probability": top["probability"],
-            "risk": top["risk"],
-            "decision": "WAIT",
-            "reasons": top["reasons"],
-        }
+    if include_summary:
+        tasks.append(zyla_summary(match_id))
+        task_names.append("summary")
 
-    return {
-        "status": "🔴 SKIP",
-        "decision": "SKIP",
-        "probability": 0,
-        "reasons": ["No enabled market reached the signal threshold"],
-    }
+    if include_odds:
+        tasks.append(zyla_odds(match_id))
+        task_names.append("odds")
 
+    results = await asyncio.gather(*tasks)
 
-# ============================================================
-# MAIN MATCH ANALYZER
-# ============================================================
+    mapped = dict(zip(task_names, results))
 
-async def _collect_zyla_match(match_id: str):
-    details, stats, summary, odds = await asyncio.gather(
-        zyla_get(
-            23859,
-            "get+match+details",
-            {"match_id": match_id},
-        ),
-        zyla_get(
-            23861,
-            "get+match+stats",
-            {"match_id": match_id},
-        ),
-        zyla_get(
-            23860,
-            "get+match+summary",
-            {"match_id": match_id},
-        ),
-        zyla_get(
-            23865,
-            "get+match+odds",
-            {"match_id": match_id},
-        ),
-    )
+    stats = mapped.get("stats", {})
+    details = mapped.get("details", {})
+    summary = mapped.get("summary", {})
+    odds = mapped.get("odds", {})
 
-    return details, stats, summary, odds
-
-
-@mcp.tool()
-async def analyze_zyla_match(match_id: str):
-    """
-    Full Hidden Signal analysis for one Zyla live match.
-
-    Collects details + stats/xG + events + odds,
-    cleans duplicate data, calculates enabled signals,
-    and returns ENTER / WAIT / SKIP.
-    """
-
-    details, stats, summary, odds = await _collect_zyla_match(match_id)
-
-    metrics = parse_match_metrics(
+    normalized = normalize_match(
+        live_candidate,
         details,
         stats,
         summary,
         odds,
     )
 
-    pressure = build_pressure(metrics)
-    signals = build_signals(metrics)
-    signals = apply_repeat_guard(match_id, signals)
-    recommendation = compact_recommendation(signals)
+    pressure = (
+        build_pressure(normalized)
+        if normalized["parser_ok"]
+        else None
+    )
 
-    strong_signals = [
-        s for s in signals
-        if s["decision"] == "ENTER"
-        and s.get("new_or_changed", True)
+    signals = apply_repeat_guard(
+        match_id,
+        build_signals(normalized),
+    )
+
+    strong = [
+        item
+        for item in signals
+        if item["decision"] == "ENTER"
+        and item.get("new_or_changed", True)
     ]
 
-    return _dedupe({
-        "source": "hidden-signal-v1",
-        "model_type": "heuristic-v1-not-calibrated",
-        "match_id": match_id,
-        "match": {
-            "home": metrics["home"],
-            "away": metrics["away"],
-            "minute": metrics["minute"],
-            "score": metrics["score"],
-        },
-        "metrics": metrics,
-        "pressure": pressure,
-        "recommendation": recommendation,
-        "strong_signals": strong_signals,
-        "all_signals": signals,
-        "raw": {
-            "details": details,
-            "statistics": stats,
-            "events": summary,
-            "odds": odds,
-        },
-    })
-
-
-# ============================================================
-# OPTIMIZED LIVE SCANNER
-# ============================================================
-
-def _compact_candidate_from_analysis(analysis: dict) -> dict:
-    match = analysis.get("match", {})
-    signals = analysis.get("all_signals", [])
-    top = signals[0] if signals else None
-
-    return {
-        "match_id": analysis.get("match_id"),
-        "home": match.get("home"),
-        "away": match.get("away"),
-        "minute": match.get("minute"),
-        "score": match.get("score"),
-        "top_signal": top,
-        "pressure": analysis.get("pressure"),
-    }
-
-
-async def _light_analyze_zyla_match(match_id: str) -> dict:
-    """
-    Cheap stage for the scanner:
-    only Details + Stats (2 calls, often less with cache).
-    No giant raw payload is returned.
-    """
-    details, stats = await asyncio.gather(
-        zyla_get_cached(
-            23859,
-            "get+match+details",
-            {"match_id": match_id},
-            cache_ttl=30,
-        ),
-        zyla_get_cached(
-            23861,
-            "get+match+stats",
-            {"match_id": match_id},
-            cache_ttl=30,
-        ),
-    )
-
-    metrics = parse_match_metrics(
-        details,
-        stats,
-        {},
-        {},
-    )
-
-    pressure = build_pressure(metrics)
-    signals = build_signals(metrics)
-
     return {
         "match_id": match_id,
         "match": {
-            "home": metrics["home"],
-            "away": metrics["away"],
-            "minute": metrics["minute"],
-            "score": metrics["score"],
+            "home": normalized["home"],
+            "away": normalized["away"],
+            "minute": normalized["minute"],
+            "score": normalized["score"],
         },
+        "parser_ok": normalized["parser_ok"],
+        "parser_warning": normalized["parser_warning"],
         "metrics": {
-            "xg": metrics["xg"],
-            "shots": metrics["shots"],
-            "shots_on_target": metrics["shots_on_target"],
-            "shots_in_box": metrics["shots_in_box"],
-            "touches_in_box": metrics["touches_in_box"],
-            "corners": metrics["corners"],
-            "possession": metrics["possession"],
-            "red_cards": metrics["red_cards"],
+            "xg": normalized["xg"],
+            "shots": normalized["shots"],
+            "shots_on_target": normalized["shots_on_target"],
+            "shots_in_box": normalized["shots_in_box"],
+            "touches_in_box": normalized["touches_in_box"],
+            "corners": normalized["corners"],
+            "possession": normalized["possession"],
+            "red_cards": normalized["red_cards"],
         },
         "pressure": pressure,
+        "odds_snapshot": parse_odds_snapshot(odds),
+        "top_candidate": signals[0] if signals else None,
+        "strong_signals": strong,
         "all_signals": signals,
         "diagnostic": {
-            "details_http": details.get("diagnostic", {}).get("http_status")
-            if isinstance(details, dict) else None,
-            "stats_http": stats.get("diagnostic", {}).get("http_status")
-            if isinstance(stats, dict) else None,
+            "stats_http": http_status(stats),
+            "details_http": http_status(details) if details else None,
+            "summary_http": http_status(summary) if summary else None,
+            "odds_http": http_status(odds) if odds else None,
         },
-    }
-
-
-async def _deep_confirm_zyla_match(match_id: str) -> dict:
-    """
-    Deep confirmation only for genuinely strong candidates:
-    Events + Odds (2 extra calls, often less with cache).
-    """
-    summary, odds = await asyncio.gather(
-        zyla_get_cached(
-            23860,
-            "get+match+summary",
-            {"match_id": match_id},
-            cache_ttl=45,
-        ),
-        zyla_get_cached(
-            23865,
-            "get+match+odds",
-            {"match_id": match_id},
-            cache_ttl=30,
-        ),
-    )
-
-    return {
-        "events_http": summary.get("diagnostic", {}).get("http_status")
-        if isinstance(summary, dict) else None,
-        "odds_http": odds.get("diagnostic", {}).get("http_status")
-        if isinstance(odds, dict) else None,
-        "events_available": bool(unwrap_api_response(summary)),
-        "odds_available": bool(unwrap_api_response(odds)),
     }
 
 
 @mcp.tool()
-async def scan_zyla_live(max_matches: int = MAX_SCAN_MATCHES):
+async def analyze_zyla_match(match_id: str):
     """
-    Economical Hidden Signal scanner.
-
-    1. One request gets all live football matches.
-    2. At most max_matches candidates get Details + Stats.
-    3. Events + Odds are requested only for matches that already have
-       at least one 75%+ signal.
-    4. Returns compact JSON only: counters, strong signals and top-5.
+    Analyze one Zyla live match with normalized stats, events, odds and signals.
     """
-
-    max_matches = int(clamp(max_matches, 1, 12))
-
-    live = await zyla_get_cached(
-        23856,
-        "get+live+matches",
-        {"sport_id": 1},
-        cache_ttl=20,
+    return await analyze_match_internal(
+        match_id,
+        include_details=True,
+        include_summary=True,
+        include_odds=True,
     )
 
-    live_http = (
-        live.get("diagnostic", {}).get("http_status")
-        if isinstance(live, dict) else None
+
+# ============================================================
+# SCANNER
+# ============================================================
+
+def live_prefilter_score(candidate: dict) -> float:
+    minute = candidate.get("minute", 0)
+    total_goals = (
+        candidate.get("score_home", 0)
+        + candidate.get("score_away", 0)
     )
+
+    score = 0.0
+
+    if 8 <= minute <= 88:
+        score += 40
+
+    if 30 <= minute < 45:
+        score += 18
+    elif 55 <= minute <= 85:
+        score += 22
+
+    if total_goals <= 4:
+        score += 12
+
+    if candidate.get("home") and candidate.get("away"):
+        score += 10
+
+    if (
+        candidate.get("red_home", 0)
+        != candidate.get("red_away", 0)
+    ):
+        score += 8
+
+    return score
+
+
+@mcp.tool()
+async def scan_zyla_live(
+    prefilter_limit: int = DEFAULT_PREFILTER_LIMIT,
+    deep_limit: int = DEFAULT_DEEP_LIMIT,
+):
+    """
+    Efficient Zyla-only Hidden Signal scanner.
+
+    1 live request.
+    Stats only for prefiltered candidates.
+    Details + events + odds only for the strongest deep candidates.
+    Returns compact JSON only.
+    """
+
+    prefilter_limit = int(
+        clamp(
+            prefilter_limit,
+            1,
+            MAX_PREFILTER_LIMIT,
+        )
+    )
+
+    deep_limit = int(
+        clamp(
+            deep_limit,
+            1,
+            MAX_DEEP_LIMIT,
+        )
+    )
+
+    live = await zyla_live()
+    live_http = http_status(live)
 
     if live_http != 200:
         return {
-            "source": "hidden-signal-v1.1",
-            "status": "ZYLA_LIVE_ERROR",
+            "source": "hidden-signal-v2",
+            "version": VERSION,
+            "status": "ZYLA_ERROR",
             "live_http_status": live_http,
             "live_matches_found": 0,
-            "matches_light_analyzed": 0,
+            "prefiltered_matches": 0,
+            "cheap_analyzed": 0,
             "fully_analyzed": 0,
-            "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
+            "parser_failures": 0,
             "strong_signals": [],
             "top_candidates": [],
-            "zyla_error": (
-                live.get("api_response")
-                if isinstance(live, dict)
-                else str(live)
-            ),
+            "api_call_estimate": 1,
+            "error": unwrap(live),
         }
 
-    all_candidates = extract_live_match_candidates(live)
-    total_live_found = len(all_candidates)
+    candidates = extract_live_candidates(live)
 
-    if not all_candidates:
+    total_live = len(candidates)
+
+    if not candidates:
         return {
-            "source": "hidden-signal-v1.1",
+            "source": "hidden-signal-v2",
+            "version": VERSION,
             "status": "NO_LIVE_MATCHES_OR_PARSE_FAILED",
             "live_http_status": 200,
             "live_matches_found": 0,
-            "matches_light_analyzed": 0,
+            "prefiltered_matches": 0,
+            "cheap_analyzed": 0,
             "fully_analyzed": 0,
-            "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
+            "parser_failures": 0,
             "strong_signals": [],
             "top_candidates": [],
+            "api_call_estimate": 1,
         }
 
-    # Prefer useful live windows and matches whose minute parsed correctly.
-    def pre_score(item: dict):
-        minute = int(item.get("minute") or 0)
-        score_home, score_away = item.get("score") or (0, 0)
-        total_goals = int(score_home) + int(score_away)
+    candidates.sort(
+        key=live_prefilter_score,
+        reverse=True,
+    )
 
-        value = 0
-        if 8 <= minute <= 88:
-            value += 50
-        if 30 <= minute < 45:
-            value += 12
-        if 55 <= minute <= 85:
-            value += 18
-        if total_goals <= 3:
-            value += 8
-        if item.get("home") and item.get("away"):
-            value += 10
-        return value
+    selected = candidates[:prefilter_limit]
 
-    all_candidates.sort(key=pre_score, reverse=True)
-    selected = all_candidates[:max_matches]
+    sem = asyncio.Semaphore(3)
 
-    semaphore = asyncio.Semaphore(3)
-
-    async def run_light(item):
-        async with semaphore:
+    async def cheap(candidate):
+        async with sem:
             try:
-                return await _light_analyze_zyla_match(item["match_id"])
+                return await analyze_match_internal(
+                    candidate["match_id"],
+                    live_candidate=candidate,
+                    include_details=False,
+                    include_summary=False,
+                    include_odds=False,
+                )
+            except Exception as exc:
+                return {
+                    "match_id": candidate["match_id"],
+                    "error": str(exc),
+                }
+
+    cheap_results = await asyncio.gather(
+        *(cheap(candidate) for candidate in selected)
+    )
+
+    parser_failures = sum(
+        1
+        for item in cheap_results
+        if isinstance(item, dict)
+        and not item.get("error")
+        and item.get("parser_ok") is False
+    )
+
+    valid = [
+        item
+        for item in cheap_results
+        if isinstance(item, dict)
+        and not item.get("error")
+        and item.get("parser_ok") is True
+        and item.get("top_candidate")
+    ]
+
+    valid.sort(
+        key=lambda item: (
+            item.get("top_candidate", {})
+            .get("probability", 0)
+        ),
+        reverse=True,
+    )
+
+    deep_seed = valid[:deep_limit]
+
+    async def deep(item):
+        async with sem:
+            candidate = find_live_candidate(
+                selected,
+                item["match_id"],
+            )
+
+            try:
+                return await analyze_match_internal(
+                    item["match_id"],
+                    live_candidate=candidate,
+                    include_details=True,
+                    include_summary=True,
+                    include_odds=True,
+                )
             except Exception as exc:
                 return {
                     "match_id": item["match_id"],
                     "error": str(exc),
                 }
 
-    light_results = await asyncio.gather(
-        *(run_light(item) for item in selected)
+    deep_results = (
+        await asyncio.gather(
+            *(deep(item) for item in deep_seed)
+        )
+        if deep_seed
+        else []
     )
 
-    valid = [
-        item for item in light_results
-        if isinstance(item, dict)
-        and "error" not in item
-        and item.get("all_signals")
-    ]
+    final_by_id = {
+        item["match_id"]: item
+        for item in valid
+    }
 
-    # Sort by best signal even if below 75%.
-    valid.sort(
-        key=lambda x: x.get("all_signals", [{}])[0].get("probability", 0),
-        reverse=True,
-    )
+    for item in deep_results:
+        if (
+            isinstance(item, dict)
+            and item.get("match_id")
+            and not item.get("error")
+        ):
+            final_by_id[item["match_id"]] = item
 
-    strong_match_ids = []
+    final_results = list(final_by_id.values())
+
+    top_candidates = []
     strong_signals = []
 
-    for analysis in valid:
+    for analysis in final_results:
         match = analysis.get("match", {})
+        top = analysis.get("top_candidate")
 
-        for signal in analysis.get("all_signals", []):
-            if signal.get("decision") != "ENTER":
-                continue
+        if top:
+            top_candidates.append({
+                "match_id": analysis["match_id"],
+                "home": match.get("home"),
+                "away": match.get("away"),
+                "minute": match.get("minute"),
+                "score": match.get("score"),
+                "market": top.get("market"),
+                "selection": top.get("selection"),
+                "probability": top.get("probability"),
+                "decision": top.get("decision"),
+                "reasons": top.get("reasons"),
+            })
 
-            strong_match_ids.append(analysis["match_id"])
+        for signal in analysis.get("strong_signals", []):
             strong_signals.append({
-                "match_id": analysis.get("match_id"),
+                "match_id": analysis["match_id"],
                 "home": match.get("home"),
                 "away": match.get("away"),
                 "minute": match.get("minute"),
@@ -1452,96 +1762,118 @@ async def scan_zyla_live(max_matches: int = MAX_SCAN_MATCHES):
                 "reasons": signal.get("reasons"),
             })
 
-    # Deep confirmation only for unique matches with a strong signal.
-    unique_strong_ids = list(dict.fromkeys(strong_match_ids))[:4]
-
-    async def run_deep(match_id):
-        async with semaphore:
-            try:
-                confirmation = await _deep_confirm_zyla_match(match_id)
-                return match_id, confirmation
-            except Exception as exc:
-                return match_id, {"error": str(exc)}
-
-    deep_pairs = await asyncio.gather(
-        *(run_deep(match_id) for match_id in unique_strong_ids)
-    ) if unique_strong_ids else []
-
-    confirmations = dict(deep_pairs)
-
-    for signal in strong_signals:
-        signal["deep_confirmation"] = confirmations.get(
-            signal["match_id"],
-            {"not_requested": True},
-        )
-
-    # Repeat guard is applied only to strong signals that are about to surface.
-    final_strong = []
-    for signal in strong_signals:
-        match_id = signal["match_id"]
-        key = f"{signal['market']}::{signal['selection']}"
-        p = float(signal["probability"])
-
-        state = _LAST_SIGNAL_STATE.setdefault(match_id, {})
-        previous = state.get(key)
-
-        is_new = (
-            previous is None
-            or abs(p - previous) >= REPEAT_SIGNAL_DELTA
-        )
-
-        signal["new_or_changed"] = is_new
-
-        if is_new:
-            state[key] = p
-            final_strong.append(signal)
-
-    final_strong.sort(
-        key=lambda x: x.get("probability", 0),
+    top_candidates.sort(
+        key=lambda item: item.get("probability", 0),
         reverse=True,
     )
 
-    top_candidates = []
+    strong_signals.sort(
+        key=lambda item: item.get("probability", 0),
+        reverse=True,
+    )
 
-    for analysis in valid[:5]:
-        match = analysis.get("match", {})
-        top = analysis.get("all_signals", [{}])[0]
+    fully_analyzed = sum(
+        1
+        for item in deep_results
+        if isinstance(item, dict)
+        and not item.get("error")
+    )
 
-        top_candidates.append({
-            "match_id": analysis.get("match_id"),
-            "home": match.get("home"),
-            "away": match.get("away"),
-            "minute": match.get("minute"),
-            "score": match.get("score"),
-            "market": top.get("market"),
-            "selection": top.get("selection"),
-            "probability": top.get("probability"),
-            "decision": top.get("decision"),
-            "reasons": top.get("reasons"),
-        })
+    # 1 live + N stats + deep*(details+summary+odds)
+    api_estimate = (
+        1
+        + len(selected)
+        + fully_analyzed * 3
+    )
 
     return {
-        "source": "hidden-signal-v1.1",
+        "source": "hidden-signal-v2",
+        "version": VERSION,
         "status": "OK",
-        "model_type": "heuristic-v1-not-calibrated",
         "live_http_status": 200,
-        "live_matches_found": total_live_found,
-        "matches_selected_for_stats": len(selected),
-        "matches_light_analyzed": len(valid),
-        "fully_analyzed": len(confirmations),
+        "live_matches_found": total_live,
+        "prefiltered_matches": len(selected),
+        "cheap_analyzed": len(valid),
+        "fully_analyzed": fully_analyzed,
+        "parser_failures": parser_failures,
         "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
-        "strong_signals": final_strong,
-        "top_candidates": top_candidates,
-        "estimated_max_api_calls_without_cache": (
-            1
-            + len(selected) * 2
-            + len(unique_strong_ids) * 2
-        ),
-        "cache_ttl_seconds": ZYLA_CACHE_TTL,
+        "strong_signals": strong_signals,
+        "top_candidates": top_candidates[:5],
+        "api_call_estimate": api_estimate,
         "note": (
-            "Scanner returns compact JSON only. "
-            "Events and odds are fetched only for 75%+ candidates."
+            "Cache hits can make actual API usage lower. "
+            "Matches with parser failure are excluded from signals."
         ),
+    }
+
+
+# ============================================================
+# PARSER DIAGNOSTIC
+# ============================================================
+
+@mcp.tool()
+async def debug_zyla_parser(match_id: str):
+    """
+    Debug one match parser without exposing the API key.
+    Shows normalized values and limited raw structure hints.
+    """
+    live = await zyla_live()
+    candidates = extract_live_candidates(live)
+    candidate = find_live_candidate(candidates, match_id)
+
+    stats = await zyla_stats(match_id)
+    details = await zyla_details(match_id)
+
+    normalized = normalize_match(
+        candidate,
+        details,
+        stats,
+        {},
+        {},
+    )
+
+    raw_stats = unwrap(stats)
+
+    # Limited structure sample: first labelled objects, no giant payload.
+    samples = []
+
+    for node in walk(raw_stats):
+        if len(samples) >= 12:
+            break
+
+        label = None
+
+        for key in LABEL_KEYS:
+            if key in node and isinstance(node[key], str):
+                label = node[key]
+                break
+
+        if label:
+            samples.append({
+                "label": label,
+                "keys": list(node.keys())[:12],
+            })
+
+    return {
+        "match_id": match_id,
+        "live_candidate": candidate,
+        "parser_ok": normalized["parser_ok"],
+        "parser_warning": normalized["parser_warning"],
+        "normalized": {
+            "score": normalized["score"],
+            "minute": normalized["minute"],
+            "xg": normalized["xg"],
+            "shots": normalized["shots"],
+            "shots_on_target": normalized["shots_on_target"],
+            "shots_in_box": normalized["shots_in_box"],
+            "touches_in_box": normalized["touches_in_box"],
+            "corners": normalized["corners"],
+            "possession": normalized["possession"],
+            "red_cards": normalized["red_cards"],
+        },
+        "stats_http": http_status(stats),
+        "details_http": http_status(details),
+        "raw_structure_samples": samples,
     }
 
 
@@ -1551,134 +1883,42 @@ async def scan_zyla_live(max_matches: int = MAX_SCAN_MATCHES):
 
 @mcp.tool()
 async def hidden_signal_status():
-    """Check Hidden Signal configuration and enabled markets."""
+    """Check Hidden Signal V2 configuration."""
 
     return {
         "service": "Hidden Signal Live",
-        "version": "V1.1",
+        "version": VERSION,
+        "provider": "Zyla FlashScore only",
         "zyla_key_loaded": bool(ZYLA_API_KEY),
-        "api_football_key_loaded": bool(API_KEY),
         "strong_signal_threshold": STRONG_SIGNAL_THRESHOLD,
         "medium_signal_threshold": MEDIUM_SIGNAL_THRESHOLD,
-        "max_scan_matches": MAX_SCAN_MATCHES,
-        "signals": SIGNALS,
-        "model_type": "heuristic-v1-not-calibrated",
-        "scanner_mode": "optimized-compact-cache",
+        "signals_enabled": SIGNALS,
+        "scanner": {
+            "default_prefilter_limit": DEFAULT_PREFILTER_LIMIT,
+            "default_deep_limit": DEFAULT_DEEP_LIMIT,
+            "max_prefilter_limit": MAX_PREFILTER_LIMIT,
+            "max_deep_limit": MAX_DEEP_LIMIT,
+        },
+        "cache_ttl_seconds": {
+            "live": LIVE_CACHE_TTL,
+            "stats": STATS_CACHE_TTL,
+            "details": DETAILS_CACHE_TTL,
+            "summary": SUMMARY_CACHE_TTL,
+            "odds": ODDS_CACHE_TTL,
+        },
+        "safety": {
+            "parser_fail_closed": True,
+            "meaning": (
+                "If Zyla returns stats but the parser cannot normalize them, "
+                "the match is excluded instead of producing a false signal."
+            ),
+        },
+        "model_type": "heuristic-v2-not-calibrated",
         "note": (
-            "Percentages are heuristic estimates. "
-            "They must be calibrated against real results before "
-            "being treated as statistical probabilities."
+            "Percentages are heuristic ranking estimates until calibrated "
+            "against a sufficiently large history of real outcomes."
         ),
     }
-
-
-# ============================================================
-# API-FOOTBALL FALLBACK TOOLS
-# ============================================================
-
-@mcp.tool()
-async def get_live_matches():
-    """Get all API-Football matches that are live right now."""
-    return await api_get(
-        "/fixtures",
-        {"live": "all"},
-    )
-
-
-@mcp.tool()
-async def get_fixture_details(fixture_id: int):
-    """Get fixture details from API-Football."""
-    return await api_get(
-        "/fixtures",
-        {"id": fixture_id},
-    )
-
-
-@mcp.tool()
-async def get_fixture_statistics(fixture_id: int):
-    """Get fixture live statistics from API-Football."""
-    return await api_get(
-        "/fixtures/statistics",
-        {"fixture": fixture_id},
-    )
-
-
-@mcp.tool()
-async def get_fixture_events(fixture_id: int):
-    """Get goals, cards, substitutions and VAR events."""
-    return await api_get(
-        "/fixtures/events",
-        {"fixture": fixture_id},
-    )
-
-
-@mcp.tool()
-async def get_fixture_lineups(fixture_id: int):
-    """Get lineups and formations."""
-    return await api_get(
-        "/fixtures/lineups",
-        {"fixture": fixture_id},
-    )
-
-
-@mcp.tool()
-async def get_head_to_head(
-    team1_id: int,
-    team2_id: int,
-    last: int = 10,
-):
-    """Get recent head-to-head matches."""
-    return await api_get(
-        "/fixtures/headtohead",
-        {
-            "h2h": f"{team1_id}-{team2_id}",
-            "last": last,
-        },
-    )
-
-
-@mcp.tool()
-async def get_team_last_matches(
-    team_id: int,
-    season: int,
-    last: int = 10,
-):
-    """Get latest matches for a team."""
-    return await api_get(
-        "/fixtures",
-        {
-            "team": team_id,
-            "season": season,
-            "last": last,
-        },
-    )
-
-
-@mcp.tool()
-async def get_injuries(fixture_id: int):
-    """Get injury information."""
-    return await api_get(
-        "/injuries",
-        {"fixture": fixture_id},
-    )
-
-
-@mcp.tool()
-async def get_prematch_odds(fixture_id: int):
-    """Get pre-match bookmaker odds."""
-    return await api_get(
-        "/odds",
-        {"fixture": fixture_id},
-    )
-
-
-@mcp.tool()
-async def get_live_odds(fixture_id: int):
-    """Get live bookmaker odds."""
-    return await api_get(
-        "/odds/live",
-        {"fixture": fixture_id},
-    )
 
 
 # ============================================================
