@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7-SELF-LEARNING"
-MODEL_TYPE = "heuristic-v5.7-self-learning-bounded-not-calibrated"
+VERSION = "V5.7.1-SELF-LEARNING-FEED-GUARD"
+MODEL_TYPE = "heuristic-v5.7.1-self-learning-feed-guard-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -5659,6 +5659,99 @@ def _v57_learning_report(state: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
 
+
+# ===== V5.7.1 LIVE FEED GUARD =====
+FEED_GUARD_RETRIES = 3
+FEED_GUARD_DELAYS = (0.8, 1.6)
+
+def _v571_previous_live_count() -> int:
+    try:
+        st = _load_scan_state()
+        return int(st.get("last_live_matches_found") or 0)
+    except Exception:
+        return 0
+
+def _v571_store_live_count(n: int) -> None:
+    try:
+        st = _load_scan_state()
+        st["last_live_matches_found"] = int(max(0, n))
+        st["last_live_feed_seen_at"] = now_iso()
+        _save_scan_state(st)
+    except Exception:
+        pass
+
+async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
+    prev = _v571_previous_live_count()
+    attempts = []
+    best_matches = []
+    best_count = -1
+    best_status = None
+
+    for i in range(FEED_GUARD_RETRIES):
+        client = ZylaClient()
+        err = None
+        try:
+            r = await client.live()
+            http_status = r.get("status")
+            raw_data = r.get("data")
+            # Malformed payload must not silently become a trusted zero.
+            structurally_valid = isinstance(raw_data, list)
+            matches = flatten_live(raw_data) if structurally_valid else []
+            n = len(matches) if structurally_valid else -1
+        except Exception as e:
+            matches = []
+            n = -1
+            http_status = None
+            err = f"{type(e).__name__}: {str(e)[:220]}"
+        finally:
+            await client.close()
+
+        suspicious = (
+            n < 0
+            or (http_status is not None and int(http_status) >= 400)
+            or (prev >= 20 and n < max(5, int(prev * 0.20)))
+        )
+        attempts.append({
+            "attempt": i + 1,
+            "http_status": http_status,
+            "live_matches_found": n,
+            "error": err,
+            "suspicious": suspicious,
+        })
+
+        if n > best_count:
+            best_count, best_matches, best_status = n, matches, http_status
+
+        if not suspicious:
+            status = "LIVE_FEED_OK"
+            if prev >= 20 and n < prev * 0.5:
+                status = "LIVE_FEED_DEGRADED"
+            _v571_store_live_count(n)
+            return {
+                "status": status,
+                "matches": matches,
+                "live_matches_found": n,
+                "previous_live_matches_found": prev,
+                "attempts": attempts,
+                "safe_for_signals": True,
+                "safe_for_learning": True,
+            }
+
+        if i < FEED_GUARD_RETRIES - 1:
+            await asyncio.sleep(FEED_GUARD_DELAYS[min(i, len(FEED_GUARD_DELAYS)-1)])
+
+    return {
+        "status": "LIVE_FEED_OUTAGE" if best_count <= 0 else "LIVE_FEED_DEGRADED",
+        "matches": best_matches,
+        "live_matches_found": max(0, best_count),
+        "previous_live_matches_found": prev,
+        "last_http_status": best_status,
+        "attempts": attempts,
+        "safe_for_signals": False,
+        "safe_for_learning": False,
+        "message": "Live feed remained suspicious after retries. Stale signals are not reused and Self Learning is frozen for this scan.",
+    }
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -5681,13 +5774,25 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     decision_journal = _v56_load_journal()
     learning_state = _v57_load_state()
 
-    # ---------- First broad snapshot ----------
-    client = ZylaClient()
-    try:
-        live_r = await client.live()
-        matches = flatten_live(live_r.get("data"))
-    finally:
-        await client.close()
+    # ---------- First broad snapshot, protected by V5.7.1 Feed Guard ----------
+    feed_guard = await _v571_guarded_live_snapshot()
+    matches = feed_guard.get("matches") or []
+    if not feed_guard.get("safe_for_signals"):
+        return {
+            "version": VERSION,
+            "model_type": MODEL_TYPE,
+            "LIVE_FEED_STATUS": feed_guard.get("status"),
+            "LIVE_FEED_GUARD": feed_guard,
+            "ADAPTIVE_TAKE_NOW": [],
+            "ADAPTIVE_TAKE_SOON": [],
+            "ADAPTIVE_TAKE_LATER": [],
+            "ADAPTIVE_EMERGING": [],
+            "FIRST_HALF_EMERGING": [],
+            "PRESSURE_TREND_NOW": [],
+            "SELF_LEARNING_FROZEN_THIS_SCAN": True,
+            "SELF_LEARNING_REPORT": _v57_learning_report(learning_state),
+            "message": "Источник live временно нестабилен. Старые сигналы не выдаются как свежие, а Self Learning на этом скане заморожен.",
+        }
 
     pool = _stage1_live_pool(matches, max_pool=max_pool)
     chosen = _stage2_deep_selection(pool, limit=limit)
@@ -6037,6 +6142,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "CONTROLLED_EMERGING": controlled_emerging,
 
         # V5.7 final adaptive ladder:
+        "LIVE_FEED_STATUS": feed_guard.get("status"),
+        "LIVE_FEED_GUARD": feed_guard,
+        "SELF_LEARNING_FROZEN_THIS_SCAN": False,
         "ADAPTIVE_TAKE_NOW": adaptive_take_now,
         "ADAPTIVE_TAKE_SOON": adaptive_take_soon,
         "ADAPTIVE_TAKE_LATER": adaptive_take_later,
