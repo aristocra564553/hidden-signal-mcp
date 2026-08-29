@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.4-TIMING-SIGNALS"
-MODEL_TYPE = "heuristic-v5.4-timing-signals-not-calibrated"
+VERSION = "V5.6-DECISION-CONTROL"
+MODEL_TYPE = "heuristic-v5.6-decision-control-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -119,7 +119,7 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 # Lightweight journal
 # -------------------------
 
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_4_signals.jsonl")
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_6_signals.jsonl")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -1743,6 +1743,19 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "second_half_goal_section",
             "take_now_soon_later",
             "timed_entry_guidance",
+            "emerging_goal_detector",
+            "dedicated_first_half_engine",
+            "multi_scan_pressure_trend",
+            "false_pressure_detector",
+            "market_comparison_engine",
+            "our_thinking_2",
+            "signal_hysteresis",
+            "two_scan_confirmation",
+            "entry_expiry_window",
+            "market_conflict_detector",
+            "context_risk_layer",
+            "priority_score",
+            "decision_journal",
             "phase_quota_selection",
             "tournament_diversity_prefilter",
             "goal_chain_board",
@@ -2671,7 +2684,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5.4",
+            "source": "hidden-signal-v5.6",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
@@ -2679,7 +2692,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
             "final_freshness": freshness,
         }
     return {
-        "source": "hidden-signal-v5.4",
+        "source": "hidden-signal-v5.6",
         "version": VERSION,
         "report": structured_market_report(rep),
         "technical": {
@@ -2803,7 +2816,7 @@ async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
 
     total = sum(len(v) for v in sections.values())
     return {
-        "source": "hidden-signal-v5.4",
+        "source": "hidden-signal-v5.6",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_matches_found": len(matches),
@@ -2915,7 +2928,7 @@ async def analyze_screenshot_quick(
     )
     report = _quick_screenshot_report(live, metrics, source_note)
     return {
-        "source": "hidden-signal-v5.4.1-screenshot",
+        "source": "hidden-signal-v5.6.1-screenshot",
         "version": VERSION,
         "latency_ms": int((time.time() - started) * 1000),
         "live_match_found": bool(best_match and best_similarity >= 0.58),
@@ -3029,7 +3042,7 @@ async def scan_thinking_live(limit: int = 12, concurrency: int = 2) -> Dict[str,
     )
 
     return {
-        "source": "hidden-signal-v5.4",
+        "source": "hidden-signal-v5.6",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -4257,6 +4270,835 @@ def _v54_attach_timing(view: Dict[str, Any]) -> Dict[str, Any]:
     view["WHEN_TO_ENTER"] = human
     return view
 
+
+# ============================================================
+# V5.5 SIGNAL FLOW
+# Layer above V5.4 core:
+# - emerging-goal detector
+# - NOW / SOON / LATER state machine
+# - dedicated first-half engine
+# - 3-scan pressure trend
+# - false-pressure detector
+# - market comparison
+# - OUR_THINKING 2.0
+# ============================================================
+
+FLOW_EMERGING_MIN = 55.0
+FLOW_VISIBLE_MIN = 65.0
+FLOW_ENTER_MIN = 75.0
+FLOW_HISTORY_KEEP = 4
+
+
+def _v55_load_history() -> Dict[str, Any]:
+    try:
+        with open(SCAN_HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v55_save_history(history: Dict[str, Any]) -> None:
+    try:
+        tmp = SCAN_HISTORY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False)
+        os.replace(tmp, SCAN_HISTORY_PATH)
+    except Exception:
+        pass
+
+
+def _v55_append_history(history: Dict[str, Any], mid: str, snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    seq = list(history.get(mid) or [])
+    seq.append(snapshot)
+    seq = seq[-FLOW_HISTORY_KEEP:]
+    history[mid] = seq
+    return seq
+
+
+def _v55_pair_value(snap: Dict[str, Any], key: str, side: str) -> Optional[float]:
+    obj = snap.get(key)
+    if not isinstance(obj, dict):
+        return None
+    try:
+        return float(obj.get(side))
+    except Exception:
+        return None
+
+
+def _v55_series(history_seq: List[Dict[str, Any]], key: str, side: str) -> List[float]:
+    vals = []
+    for s in history_seq:
+        v = _v55_pair_value(s, key, side)
+        if v is not None:
+            vals.append(round(v, 2))
+    return vals
+
+
+def _v55_trend(history_seq: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    3–4 scan trend. The important question is direction, not only cumulative totals.
+    """
+    if len(history_seq) < 2:
+        return {
+            "available": False,
+            "label": "строим историю",
+            "score": 0.0,
+            "direction": "FLAT",
+            "series": {},
+        }
+
+    metrics = ("xg", "shots_on_target", "touches_in_box", "shots_in_box", "shots", "corners")
+    series = {
+        key: {
+            "home": _v55_series(history_seq, key, "home"),
+            "away": _v55_series(history_seq, key, "away"),
+        }
+        for key in metrics
+    }
+
+    def delta(key, side):
+        vals = series[key][side]
+        return (vals[-1] - vals[0]) if len(vals) >= 2 else 0.0
+
+    # Weighted recent growth across both teams.
+    score_h = (
+        max(0, delta("xg", "home")) * 40
+        + max(0, delta("shots_on_target", "home")) * 11
+        + max(0, delta("touches_in_box", "home")) * 2.2
+        + max(0, delta("shots_in_box", "home")) * 3.2
+        + max(0, delta("shots", "home")) * 1.2
+        + max(0, delta("corners", "home")) * 1.5
+    )
+    score_a = (
+        max(0, delta("xg", "away")) * 40
+        + max(0, delta("shots_on_target", "away")) * 11
+        + max(0, delta("touches_in_box", "away")) * 2.2
+        + max(0, delta("shots_in_box", "away")) * 3.2
+        + max(0, delta("shots", "away")) * 1.2
+        + max(0, delta("corners", "away")) * 1.5
+    )
+    total = min(99.0, score_h + score_a)
+
+    if total >= 60:
+        label = "резко разгоняется"
+        direction = "UP_FAST"
+    elif total >= 32:
+        label = "давление растёт"
+        direction = "UP"
+    elif total >= 14:
+        label = "есть небольшой рост"
+        direction = "UP_SLOW"
+    else:
+        label = "темп не растёт"
+        direction = "FLAT"
+
+    if score_h - score_a >= 12:
+        side = "HOME"
+    elif score_a - score_h >= 12:
+        side = "AWAY"
+    else:
+        side = "BOTH_OR_UNCLEAR"
+
+    return {
+        "available": True,
+        "samples": len(history_seq),
+        "label": label,
+        "direction": direction,
+        "dominant_side": side,
+        "home_score": round1(score_h),
+        "away_score": round1(score_a),
+        "score": round1(total),
+        "series": series,
+    }
+
+
+def _v55_false_pressure(history_seq: List[Dict[str, Any]], rep: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Detect cumulative-stat traps:
+    many historical shots, but little happened in the recent scan window.
+    """
+    if len(history_seq) < 2:
+        return {"detected": False, "penalty": 0.0, "reason": "недостаточно истории"}
+
+    first, last = history_seq[0], history_seq[-1]
+
+    def total_delta(key):
+        a = first.get(key) or {}
+        b = last.get(key) or {}
+        try:
+            return (
+                float(b.get("home") or 0) + float(b.get("away") or 0)
+                - float(a.get("home") or 0) - float(a.get("away") or 0)
+            )
+        except Exception:
+            return 0.0
+
+    dxg = total_delta("xg")
+    dsot = total_delta("shots_on_target")
+    dbox = total_delta("touches_in_box")
+    dshots = total_delta("shots")
+
+    metrics = rep.get("metrics") or {}
+    shots = _metric_pair(metrics, "shots")
+    total_shots = sum(shots) if shots else 0
+
+    # Strong cumulative boxscore, dead recent interval.
+    if total_shots >= 14 and dxg < 0.12 and dsot < 1 and dbox < 3 and dshots < 2:
+        return {
+            "detected": True,
+            "penalty": 8.0,
+            "reason": "много накопленной статистики, но последние минуты матч остыл",
+        }
+
+    # Moderate cooling.
+    if total_shots >= 10 and dxg < 0.20 and dsot < 1 and dbox < 5:
+        return {
+            "detected": True,
+            "penalty": 4.0,
+            "reason": "накопленные цифры хорошие, но свежий импульс слабый",
+        }
+
+    return {"detected": False, "penalty": 0.0, "reason": "свежая активность не противоречит общей статистике"}
+
+
+def _v55_first_half_engine(rep: Dict[str, Any], base_p: float, trend: Dict[str, Any], false_pressure: Dict[str, Any]) -> Dict[str, Any]:
+    match = rep.get("match") or {}
+    minute = int(match.get("minute") or 0)
+    stage = str(match.get("stage") or "").lower()
+
+    if minute <= 0 or minute > 45 or "half time" in stage or "halftime" in stage:
+        return {"active": False}
+
+    p = float(base_p)
+    trend_score = float(trend.get("score") or 0)
+
+    # Minute windows: early formation -> prime -> aggressive late window.
+    if 10 <= minute <= 19:
+        window = "FORMATION"
+        p -= 2
+    elif 20 <= minute <= 34:
+        window = "PRIME"
+        p += 2
+    elif 35 <= minute <= 42:
+        window = "AGGRESSIVE"
+        p += 4
+    else:
+        window = "LAST_CHANCE"
+        p -= 2
+
+    if trend_score >= 60:
+        p += 5
+    elif trend_score >= 32:
+        p += 3
+    elif trend_score < 14 and minute >= 25:
+        p -= 2
+
+    p -= float(false_pressure.get("penalty") or 0)
+    p = round1(clamp(p, 0, 99))
+
+    if p >= 78 and trend_score >= 32:
+        state = "TAKE_NOW"
+    elif p >= 68 and trend_score >= 32:
+        state = "TAKE_SOON"
+    elif p >= 55:
+        state = "EMERGING"
+    else:
+        state = "PASS"
+
+    if minute >= 43 and state in {"EMERGING", "TAKE_SOON"}:
+        # There is no room for vague "later" at 43–45.
+        state = "TAKE_NOW" if p >= 80 and trend_score >= 45 else "PASS"
+
+    return {
+        "active": True,
+        "minute_window": window,
+        "probability": p,
+        "state": state,
+        "trend_score": trend_score,
+        "false_pressure": false_pressure,
+    }
+
+
+def _v55_flow_state(
+    item: Dict[str, Any],
+    minute: int,
+    stage: str,
+    trend: Dict[str, Any],
+    freshness: Dict[str, Any],
+    false_pressure: Dict[str, Any],
+) -> Dict[str, Any]:
+    p = float(item.get("probability") or 0)
+    trend_score = float(trend.get("score") or 0)
+    fresh = freshness.get("status") == "CONFIRMED"
+    halftime = "half time" in str(stage or "").lower() or "halftime" in str(stage or "").lower()
+    penalty = float(false_pressure.get("penalty") or 0)
+
+    adjusted = round1(clamp(p - penalty, 0, 99))
+
+    if halftime:
+        state = "TAKE_LATER"
+        why = "перерыв: ждём начало 2-го тайма и первые 3–5 минут"
+    elif adjusted >= 78 and fresh and trend_score >= 24:
+        state = "TAKE_NOW"
+        why = "высокий сигнал + свежесть + текущая динамика"
+    elif adjusted >= 75 and fresh and trend_score < 24:
+        state = "TAKE_SOON"
+        why = "процент уже высокий, но нужен свежий атакующий толчок"
+    elif adjusted >= 65 and trend_score >= 32:
+        state = "TAKE_SOON"
+        why = "сигнал ещё не максимальный, зато давление ускоряется"
+    elif adjusted >= 65:
+        state = "TAKE_LATER"
+        why = "сигнал есть, но динамика пока недостаточна"
+    elif adjusted >= 55 and trend_score >= 14:
+        state = "EMERGING"
+        why = "ранний сигнал и уже есть рост"
+    elif adjusted >= 55:
+        state = "RADAR"
+        why = "процент формируется, но роста пока нет"
+    else:
+        state = "PASS"
+        why = "ни процент, ни динамика не дают вход"
+
+    if not fresh and state == "TAKE_NOW":
+        state = "TAKE_SOON"
+        why = "сильный сигнал, но финальная свежесть ещё не подтверждена"
+
+    return {
+        "state": state,
+        "base_probability": round1(p),
+        "adjusted_probability": adjusted,
+        "trend_score": trend_score,
+        "freshness": freshness.get("status"),
+        "why": why,
+        "false_pressure_penalty": penalty,
+    }
+
+
+def _v55_compare_markets(items: List[Dict[str, Any]], match: Dict[str, Any]) -> Dict[str, Any]:
+    if not items:
+        return {
+            "best": None,
+            "alternative": None,
+            "why_best": "нет достаточно сильных рынков",
+        }
+
+    market_bonus = {
+        "GOAL_BEFORE_FULLTIME": 3.0,
+        "GOAL_BEFORE_HALFTIME": 2.0,
+        "GOAL_NEXT_10": 1.0,
+        "GOAL_NEXT_5": -1.0,
+        "TEAM_GOAL": 0.0,
+        "BTTS": -1.5,
+    }
+
+    ranked = []
+    for x in items:
+        y = dict(x)
+        flow = y.get("FLOW") or {}
+        score = float(flow.get("adjusted_probability") or y.get("probability") or 0)
+        score += market_bonus.get(str(y.get("market") or ""), 0.0)
+        if flow.get("state") == "TAKE_NOW":
+            score += 5
+        elif flow.get("state") == "TAKE_SOON":
+            score += 3
+        ranked.append((score, y))
+
+    ranked.sort(key=lambda z: z[0], reverse=True)
+    best = ranked[0][1]
+    alt = ranked[1][1] if len(ranked) > 1 else None
+
+    why = f"{best.get('title')} лучше сочетает вероятность, динамику и ширину условия."
+    if best.get("market") == "GOAL_BEFORE_FULLTIME":
+        why += " Общий гол не требует угадывать конкретную команду."
+    elif best.get("market") == "TEAM_GOAL":
+        why += " Направление давления достаточно выражено в сторону одной команды."
+    elif best.get("market") == "BTTS":
+        why += " ОЗ имеет смысл только если именно ещё не забившая команда реально создаёт."
+
+    return {
+        "best": best,
+        "alternative": alt,
+        "why_best": why,
+    }
+
+
+def _v55_thinking_2(
+    rep: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    trend: Dict[str, Any],
+    false_pressure: Dict[str, Any],
+    freshness: Dict[str, Any],
+    first_half: Dict[str, Any],
+) -> Dict[str, Any]:
+    match = rep.get("match") or {}
+    metrics = rep.get("metrics") or {}
+    comparison = _v55_compare_markets(items, match)
+
+    def metric_text(key, label):
+        p = _metric_pair(metrics, key)
+        if not p:
+            return None
+        return f"{label} {round1(p[0])}–{round1(p[1])}"
+
+    facts = [
+        metric_text("xg", "xG"),
+        metric_text("shots", "удары"),
+        metric_text("shots_on_target", "створ"),
+        metric_text("touches_in_box", "штрафная"),
+        metric_text("corners", "угловые"),
+    ]
+    facts = [x for x in facts if x]
+
+    if trend.get("available"):
+        trend_text = f"{trend.get('label')} ({trend.get('score')}%)"
+    else:
+        trend_text = "история ещё строится"
+
+    if false_pressure.get("detected"):
+        tempo_text = f"⚠️ {false_pressure.get('reason')}"
+    else:
+        tempo_text = "свежая динамика не выглядит ложным накопленным давлением"
+
+    best = comparison.get("best")
+    if best:
+        flow = best.get("FLOW") or {}
+        state = flow.get("state")
+        if state == "TAKE_NOW":
+            action = f"🟢 БРАТЬ СЕЙЧАС — {best.get('title')} {flow.get('adjusted_probability')}%"
+        elif state == "TAKE_SOON":
+            action = f"🟡 СКОРО — {best.get('title')} {flow.get('adjusted_probability')}%"
+        elif state == "TAKE_LATER":
+            action = f"🟠 ПОЗЖЕ — {best.get('title')} {flow.get('adjusted_probability')}%"
+        elif state in {"EMERGING", "RADAR"}:
+            action = f"👀 НАЗРЕВАЕТ — {best.get('title')} {flow.get('adjusted_probability')}%"
+        else:
+            action = "🔴 ПРОПУСКАЕМ"
+    else:
+        action = "🔴 ПРОПУСКАЕМ"
+
+    return {
+        "what_i_see": (
+            f"{match.get('home')} — {match.get('away')}, "
+            f"{match.get('minute')}′, счёт {(match.get('score') or {}).get('home')}:"
+            f"{(match.get('score') or {}).get('away')}."
+        ),
+        "facts": facts,
+        "pressure_trend": trend_text,
+        "trend_series": trend.get("series"),
+        "false_pressure_check": tempo_text,
+        "first_half_engine": first_half if first_half.get("active") else None,
+        "market_comparison": comparison,
+        "freshness": freshness.get("status"),
+        "OUR_ACTION": action,
+        "what_confirms": (
+            "рост xG, новый створ, серия касаний/ударов из штрафной или большой момент"
+        ),
+        "what_breaks": (
+            "5–10 минут без роста метрик, изменение счёта до входа, красная/VAR или резкое падение темпа"
+        ),
+    }
+
+
+def _v55_enrich_view(
+    rep: Dict[str, Any],
+    view: Dict[str, Any],
+    history_seq: List[Dict[str, Any]],
+    freshness: Dict[str, Any],
+) -> Dict[str, Any]:
+    trend = _v55_trend(history_seq)
+    false_pressure = _v55_false_pressure(history_seq, rep)
+    match = rep.get("match") or {}
+    minute = int(match.get("minute") or 0)
+    stage = str(match.get("stage") or "")
+
+    all_items = []
+    for x in list(view.get("goal_board_65_99") or []) + list(view.get("RISING_RADAR_55_64") or []):
+        y = dict(x)
+        y["FLOW"] = _v55_flow_state(y, minute, stage, trend, freshness, false_pressure)
+        all_items.append(y)
+
+    # Dedicated first-half score based on the actual HT market when present.
+    ht_item = next((x for x in all_items if x.get("market") == "GOAL_BEFORE_HALFTIME"), None)
+    first_half = _v55_first_half_engine(
+        rep,
+        float((ht_item or {}).get("probability") or 0),
+        trend,
+        false_pressure,
+    ) if ht_item else {"active": False}
+
+    emerging = [
+        x for x in all_items
+        if (x.get("FLOW") or {}).get("state") in {"EMERGING", "RADAR"}
+        and float((x.get("FLOW") or {}).get("adjusted_probability") or 0) >= 55
+    ]
+    later = [x for x in all_items if (x.get("FLOW") or {}).get("state") == "TAKE_LATER"]
+    soon = [x for x in all_items if (x.get("FLOW") or {}).get("state") == "TAKE_SOON"]
+    now = [x for x in all_items if (x.get("FLOW") or {}).get("state") == "TAKE_NOW"]
+
+    # First-half emerging signal is surfaced even before 65%.
+    first_half_emerging = []
+    if first_half.get("active") and first_half.get("state") in {"EMERGING", "TAKE_SOON", "TAKE_NOW"}:
+        first_half_emerging.append({
+            "title": "Гол в 1-м тайме",
+            "probability": first_half.get("probability"),
+            "state": first_half.get("state"),
+            "minute_window": first_half.get("minute_window"),
+            "trend_score": first_half.get("trend_score"),
+        })
+
+    view["PRESSURE_TREND"] = trend
+    view["FALSE_PRESSURE"] = false_pressure
+    view["FIRST_HALF_ENGINE"] = first_half
+    view["EMERGING_GOAL"] = emerging
+    view["FLOW_TAKE_LATER"] = later
+    view["FLOW_TAKE_SOON"] = soon
+    view["FLOW_TAKE_NOW"] = now
+    view["FIRST_HALF_EMERGING"] = first_half_emerging
+    view["OUR_THINKING_2"] = _v55_thinking_2(
+        rep, all_items, trend, false_pressure, freshness, first_half
+    )
+
+    best_action = view["OUR_THINKING_2"].get("OUR_ACTION")
+    view["WHEN_TO_ENTER"] = best_action
+    return view
+
+
+# ============================================================
+# V5.6 DECISION CONTROL
+# Extra safety + timing layer above V5.5 Signal Flow.
+# Keeps the core intact.
+# ============================================================
+
+V56_JOURNAL_KEEP = 8
+
+
+def _v56_load_journal() -> Dict[str, Any]:
+    try:
+        with open(DECISION_JOURNAL_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v56_save_journal(data: Dict[str, Any]) -> None:
+    try:
+        tmp = DECISION_JOURNAL_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, DECISION_JOURNAL_PATH)
+    except Exception:
+        pass
+
+
+def _v56_signal_key(item: Dict[str, Any]) -> str:
+    return f"{item.get('market')}::{item.get('title')}"
+
+
+def _v56_previous_state(journal: Dict[str, Any], match_id: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    key = _v56_signal_key(item)
+    rows = list(journal.get(match_id) or [])
+    for row in reversed(rows):
+        for s in row.get("signals") or []:
+            if s.get("key") == key:
+                return s
+    return None
+
+
+def _v56_transition_control(
+    item: Dict[str, Any],
+    journal: Dict[str, Any],
+    match_id: str,
+    trend: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Anti-whipsaw / hysteresis:
+    a signal should normally walk through the ladder instead of teleporting.
+    Extremely strong fresh acceleration can skip a step.
+    """
+    flow = dict(item.get("FLOW") or {})
+    current = str(flow.get("state") or "PASS")
+    adjusted = float(flow.get("adjusted_probability") or item.get("probability") or 0)
+    trend_score = float(trend.get("score") or 0)
+    prev = _v56_previous_state(journal, match_id, item)
+    prev_state = str((prev or {}).get("state") or "PASS")
+    prev_p = float((prev or {}).get("probability") or 0)
+
+    order = {
+        "PASS": 0,
+        "RADAR": 1,
+        "EMERGING": 2,
+        "TAKE_LATER": 3,
+        "TAKE_SOON": 4,
+        "TAKE_NOW": 5,
+    }
+
+    controlled = current
+    reason = "переход нормальный"
+
+    # Prevent a one-scan jump from weak radar straight to NOW,
+    # except when the move is very strong and fresh.
+    if order.get(current, 0) - order.get(prev_state, 0) >= 3:
+        if not (adjusted >= 85 and trend_score >= 60):
+            controlled = "TAKE_SOON"
+            reason = "слишком резкий скачок статуса; нужен ещё один подтверждающий скан"
+
+    # Falling probability should not retain NOW automatically.
+    if current == "TAKE_NOW" and prev and adjusted <= prev_p - 4:
+        controlled = "TAKE_SOON"
+        reason = "вероятность заметно откатилась относительно прошлого скана"
+
+    # Two consecutive strong observations increase stability.
+    stable_count = 1
+    if prev and prev_state in {"TAKE_SOON", "TAKE_NOW"} and current in {"TAKE_SOON", "TAKE_NOW"}:
+        stable_count = int((prev or {}).get("stable_count") or 1) + 1
+
+    if controlled == "TAKE_NOW" and stable_count < 2 and adjusted < 85:
+        controlled = "TAKE_SOON"
+        reason = "для обычного TAKE NOW нужен второй сильный последовательный скан"
+
+    return {
+        "raw_state": current,
+        "controlled_state": controlled,
+        "previous_state": prev_state,
+        "previous_probability": prev_p if prev else None,
+        "stable_count": stable_count,
+        "reason": reason,
+    }
+
+
+def _v56_entry_expiry(item: Dict[str, Any], minute: int) -> Dict[str, Any]:
+    market = str(item.get("market") or "")
+    flow = item.get("FLOW") or {}
+    state = str(flow.get("state") or "")
+
+    if state not in {"TAKE_NOW", "TAKE_SOON"}:
+        return {
+            "active": False,
+            "expires_after_minute": None,
+            "window_minutes": None,
+        }
+
+    if market == "GOAL_NEXT_5":
+        window = 2
+    elif market == "GOAL_NEXT_10":
+        window = 3
+    elif market == "GOAL_BEFORE_HALFTIME":
+        window = 2 if minute >= 40 else 3
+    else:
+        window = 4
+
+    return {
+        "active": True,
+        "window_minutes": window,
+        "expires_after_minute": minute + window,
+        "note": f"если картина не подтверждается до {minute + window}′ — пересканировать, старый вход не переносить",
+    }
+
+
+def _v56_market_conflicts(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Detect when several attractive markets are actually asking for different game scripts.
+    """
+    active = [
+        x for x in items
+        if (x.get("FLOW") or {}).get("state") in {"TAKE_NOW", "TAKE_SOON", "TAKE_LATER"}
+    ]
+    markets = {str(x.get("market") or "") for x in active}
+    conflicts = []
+
+    if "BTTS" in markets and "TEAM_GOAL" in markets:
+        conflicts.append(
+            "ОЗ и гол конкретной команды могут опираться на разные сценарии — не складываем их как независимые подтверждения."
+        )
+
+    if "GOAL_NEXT_5" in markets and "GOAL_BEFORE_FULLTIME" in markets:
+        conflicts.append(
+            "Ближайшие 5 минут — более узкое условие, чем гол до конца; высокий общий гол не гарантирует короткое окно."
+        )
+
+    team_goal_titles = [str(x.get("title") or "") for x in active if x.get("market") == "TEAM_GOAL"]
+    if len(team_goal_titles) >= 2:
+        conflicts.append(
+            "Есть направления на обе команды — лучше рассматривать общий гол, если он тоже силён."
+        )
+
+    return {
+        "detected": bool(conflicts),
+        "items": conflicts,
+    }
+
+
+def _v56_context_risk(rep: Dict[str, Any], trend: Dict[str, Any]) -> Dict[str, Any]:
+    match = rep.get("match") or {}
+    minute = int(match.get("minute") or 0)
+    score = match.get("score") or {}
+    h = int(score.get("home") or 0)
+    a = int(score.get("away") or 0)
+    red = match.get("red_cards") or {}
+    rh = int(red.get("home") or 0) if isinstance(red, dict) else 0
+    ra = int(red.get("away") or 0) if isinstance(red, dict) else 0
+
+    risk = 0
+    reasons = []
+
+    if abs(h - a) >= 3:
+        risk += 18
+        reasons.append("крупная разница в счёте может убить темп")
+    elif abs(h - a) == 2 and minute >= 70:
+        risk += 10
+        reasons.append("при разнице в 2 мяча в концовке темп может стать рваным")
+
+    if minute >= 86:
+        risk += 10
+        reasons.append("очень поздняя минута — маленькое окно и высокая дисперсия")
+
+    if rh or ra:
+        risk += 8
+        reasons.append("красная карточка меняет обычный рисунок матча")
+
+    if float(trend.get("score") or 0) < 14 and minute >= 25:
+        risk += 6
+        reasons.append("последние сканы не показывают роста давления")
+
+    if risk >= 24:
+        band = "HIGH"
+    elif risk >= 12:
+        band = "MEDIUM"
+    else:
+        band = "LOW"
+
+    return {
+        "score": min(40, risk),
+        "band": band,
+        "reasons": reasons,
+    }
+
+
+def _v56_priority_score(
+    item: Dict[str, Any],
+    trend: Dict[str, Any],
+    context_risk: Dict[str, Any],
+    false_pressure: Dict[str, Any],
+) -> float:
+    flow = item.get("FLOW") or {}
+    p = float(flow.get("adjusted_probability") or item.get("probability") or 0)
+    trend_score = float(trend.get("score") or 0)
+    risk = float(context_risk.get("score") or 0)
+    false_penalty = float(false_pressure.get("penalty") or 0)
+
+    score = p + min(10, trend_score * 0.12) - risk * 0.35 - false_penalty * 0.5
+
+    if flow.get("state") == "TAKE_NOW":
+        score += 5
+    elif flow.get("state") == "TAKE_SOON":
+        score += 2
+
+    return round1(clamp(score, 0, 99))
+
+
+def _v56_apply_decision_control(
+    rep: Dict[str, Any],
+    view: Dict[str, Any],
+    journal: Dict[str, Any],
+    match_id: str,
+) -> Dict[str, Any]:
+    trend = view.get("PRESSURE_TREND") or {}
+    false_pressure = view.get("FALSE_PRESSURE") or {}
+    match = rep.get("match") or {}
+    minute = int(match.get("minute") or 0)
+    context_risk = _v56_context_risk(rep, trend)
+
+    all_items = []
+    for x in list(view.get("goal_board_65_99") or []) + list(view.get("RISING_RADAR_55_64") or []):
+        y = dict(x)
+        y["FLOW"] = dict(y.get("FLOW") or {})
+        transition = _v56_transition_control(y, journal, match_id, trend)
+
+        # Controlled state replaces the raw state for final decision presentation.
+        y["FLOW"]["state_before_control"] = y["FLOW"].get("state")
+        y["FLOW"]["state"] = transition["controlled_state"]
+        y["DECISION_CONTROL"] = transition
+        y["ENTRY_EXPIRY"] = _v56_entry_expiry(y, minute)
+        y["CONTEXT_RISK"] = context_risk
+        y["PRIORITY_SCORE"] = _v56_priority_score(y, trend, context_risk, false_pressure)
+        all_items.append(y)
+
+    conflicts = _v56_market_conflicts(all_items)
+
+    rank = sorted(
+        all_items,
+        key=lambda z: (
+            {"TAKE_NOW": 5, "TAKE_SOON": 4, "TAKE_LATER": 3, "EMERGING": 2, "RADAR": 1, "PASS": 0}.get(
+                (z.get("FLOW") or {}).get("state"), 0
+            ),
+            float(z.get("PRIORITY_SCORE") or 0),
+        ),
+        reverse=True,
+    )
+
+    best = rank[0] if rank else None
+    if best:
+        state = (best.get("FLOW") or {}).get("state")
+        expiry = best.get("ENTRY_EXPIRY") or {}
+        if state == "TAKE_NOW":
+            text = f"🟢 БРАТЬ СЕЙЧАС — {best.get('title')} {best.get('PRIORITY_SCORE')} priority"
+        elif state == "TAKE_SOON":
+            text = f"🟡 СКОРО — {best.get('title')} {best.get('PRIORITY_SCORE')} priority"
+        elif state == "TAKE_LATER":
+            text = f"🟠 ПОЗЖЕ — {best.get('title')}"
+        elif state in {"EMERGING", "RADAR"}:
+            text = f"👀 НАЗРЕВАЕТ — {best.get('title')}"
+        else:
+            text = "🔴 ПРОПУСКАЕМ"
+        if expiry.get("active"):
+            text += f"; окно до ~{expiry.get('expires_after_minute')}′"
+    else:
+        text = "🔴 ПРОПУСКАЕМ"
+
+    # Record one compact journal row per scan.
+    signals_for_journal = []
+    for x in all_items:
+        flow = x.get("FLOW") or {}
+        ctrl = x.get("DECISION_CONTROL") or {}
+        signals_for_journal.append({
+            "key": _v56_signal_key(x),
+            "state": flow.get("state"),
+            "probability": flow.get("adjusted_probability") or x.get("probability"),
+            "stable_count": ctrl.get("stable_count") or 1,
+        })
+
+    rows = list(journal.get(match_id) or [])
+    rows.append({
+        "at": now_iso(),
+        "minute": minute,
+        "score": match.get("score"),
+        "signals": signals_for_journal,
+    })
+    journal[match_id] = rows[-V56_JOURNAL_KEEP:]
+
+    view["DECISION_CONTROL_ITEMS"] = all_items
+    view["MARKET_CONFLICTS"] = conflicts
+    view["CONTEXT_RISK"] = context_risk
+    view["BEST_CONTROLLED_SIGNAL"] = best
+    view["WHEN_TO_ENTER_CONTROLLED"] = text
+    view["WHY_NOW"] = (
+        "процент + свежая динамика + последовательность сканов подтверждают вход"
+        if best and (best.get("FLOW") or {}).get("state") == "TAKE_NOW"
+        else None
+    )
+    view["WHY_NOT_NOW"] = (
+        None
+        if best and (best.get("FLOW") or {}).get("state") == "TAKE_NOW"
+        else (
+            ((best or {}).get("DECISION_CONTROL") or {}).get("reason")
+            if best else "нет подходящего сигнала"
+        )
+    )
+    return view
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -4275,6 +5117,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     """
     started = time.time()
     previous_state = _load_scan_state()
+    scan_history = _v55_load_history()
+    decision_journal = _v56_load_journal()
 
     # ---------- First broad snapshot ----------
     client = ZylaClient()
@@ -4325,6 +5169,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         # Always retain this snapshot, even if final live confirmation later fails.
         snap = momentum.get("current") if momentum else _build_scan_snapshot(rep)
         new_state[mid] = snap
+        _v55_append_history(scan_history, mid, snap)
         ok_reports.append(rep)
 
     # Preserve recent history for matches not selected in this pass.
@@ -4339,6 +5184,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             pass
 
     _save_scan_state(new_state)
+    _v55_save_history(scan_history)
 
     # ---------- Final broad refresh ----------
     final_client = ZylaClient()
@@ -4391,6 +5237,18 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             continue
 
         view = _v54_attach_timing(_v53_human_view(rep, momentum, freshness))
+        view = _v55_enrich_view(
+            rep,
+            view,
+            list(scan_history.get(mid) or []),
+            freshness,
+        )
+        view = _v56_apply_decision_control(
+            rep,
+            view,
+            decision_journal,
+            mid,
+        )
         visible = view.get("goal_board_65_99") or []
         radar = view.get("RISING_RADAR_55_64") or []
 
@@ -4474,6 +5332,45 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     ]
 
 
+    _v56_save_journal(decision_journal)
+
+    controlled_take_now = []
+    controlled_take_soon = []
+    controlled_take_later = []
+    controlled_emerging = []
+
+    emerging_goal_now = []
+    first_half_emerging_now = []
+    flow_take_now = []
+    flow_take_soon = []
+    flow_take_later = []
+    pressure_trend_now = []
+
+    for c in candidates:
+        controlled_best = c.get("BEST_CONTROLLED_SIGNAL") or {}
+        controlled_state = (controlled_best.get("FLOW") or {}).get("state")
+        if controlled_state == "TAKE_NOW":
+            controlled_take_now.append(c)
+        elif controlled_state == "TAKE_SOON":
+            controlled_take_soon.append(c)
+        elif controlled_state == "TAKE_LATER":
+            controlled_take_later.append(c)
+        elif controlled_state in {"EMERGING", "RADAR"}:
+            controlled_emerging.append(c)
+
+        if c.get("EMERGING_GOAL"):
+            emerging_goal_now.append(c)
+        if c.get("FIRST_HALF_EMERGING"):
+            first_half_emerging_now.append(c)
+        if c.get("FLOW_TAKE_NOW"):
+            flow_take_now.append(c)
+        if c.get("FLOW_TAKE_SOON"):
+            flow_take_soon.append(c)
+        if c.get("FLOW_TAKE_LATER"):
+            flow_take_later.append(c)
+        if float((c.get("PRESSURE_TREND") or {}).get("score") or 0) >= 32:
+            pressure_trend_now.append(c)
+
     first_half_now = []
     second_half_now = []
     btts_now = []
@@ -4503,7 +5400,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             take_later.append(c)
 
     return {
-        "source": "hidden-signal-v5.4-complete-live",
+        "source": "hidden-signal-v5.6-complete-live",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_snapshot_at": now_iso(),
@@ -4518,6 +5415,20 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "RISING_PRESSURE_NOW": rising_now,
         "ALL_65_99": candidates,
         "RISING_RADAR_55_64": radar_rising[:10],
+
+        # V5.5 Signal Flow:
+        "EMERGING_GOAL": emerging_goal_now,
+        "FIRST_HALF_EMERGING": first_half_emerging_now,
+        "PRESSURE_TREND_NOW": pressure_trend_now,
+        "FLOW_TAKE_NOW": flow_take_now,
+        "FLOW_TAKE_SOON": flow_take_soon,
+        "FLOW_TAKE_LATER": flow_take_later,
+
+        # V5.6 controlled final ladder:
+        "CONTROLLED_TAKE_NOW": controlled_take_now,
+        "CONTROLLED_TAKE_SOON": controlled_take_soon,
+        "CONTROLLED_TAKE_LATER": controlled_take_later,
+        "CONTROLLED_EMERGING": controlled_emerging,
 
         # V5.4 human timing split:
         "GOAL_FIRST_HALF": first_half_now,
@@ -4563,12 +5474,12 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         ),
 
         "message": (
-            f"V5.3: ENTER {len(enter_now)}, 65–99% {len(candidates)}, "
+            f"V5.6: ENTER {len(enter_now)}, 65–99% {len(candidates)}, "
             f"rising {len(rising_now)}, radar 55–64 {len(radar_rising)}, "
             f"memory {len(new_state)}."
         ),
 
-        "mode": "TIMING_SPLIT_NOW_SOON_LATER",
+        "mode": "DECISION_CONTROL_STABLE_FLOW",
     }
 
 
@@ -4578,6 +5489,10 @@ async def reset_scan_memory() -> Dict[str, Any]:
     try:
         if os.path.exists(SCAN_STATE_PATH):
             os.remove(SCAN_STATE_PATH)
+        if os.path.exists(SCAN_HISTORY_PATH):
+            os.remove(SCAN_HISTORY_PATH)
+        if os.path.exists(DECISION_JOURNAL_PATH):
+            os.remove(DECISION_JOURNAL_PATH)
         return {"ok": True, "message": "Память предыдущего лайв-скана очищена."}
     except Exception as e:
         return {"ok": False, "error": repr(e)}
@@ -4710,7 +5625,7 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
     ]
 
     return {
-        "source": "hidden-signal-v5.4.1-goal-hunter",
+        "source": "hidden-signal-v5.6.1-goal-hunter",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -4755,14 +5670,14 @@ async def analyze_goal_hunter_match(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5.4",
+            "source": "hidden-signal-v5.6",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
             "message": "Сигнал скрыт: live уже изменился.",
         }
     return {
-        "source": "hidden-signal-v5.4",
+        "source": "hidden-signal-v5.6",
         "version": VERSION,
         "report": _goal_hunter_view(rep),
         "technical": {
@@ -4864,7 +5779,7 @@ async def quick_screenshot_goal_hunter(
     }
 
     return {
-        "source": "hidden-signal-v5.4.1-screenshot",
+        "source": "hidden-signal-v5.6.1-screenshot",
         "version": VERSION,
         "live_match_found": bool(best_match and best_similarity >= 0.58),
         "match_similarity": round1(best_similarity * 100),
