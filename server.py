@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V4.1-DUAL-REACTOR"
-MODEL_TYPE = "heuristic-v4.1-dual-safe-live-not-calibrated"
+VERSION = "V4.2-CONTEXT-REACTOR"
+MODEL_TYPE = "heuristic-v4.2-dual-safe-live-context-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -29,6 +29,13 @@ ENDPOINTS = {
     "player_stats": (23863, "get+match+player+stats"),
     "odds": (23865, "get+match+odds"),
     "h2h": (23866, "get+h2h"),
+    "team_details": (23875, "get+team+details"),
+    "team_results": (23876, "get+team+results"),
+    "team_fixtures": (23877, "get+team+fixtures"),
+    "team_squad": (23878, "get+team+squad"),
+    "tournament_details": (23881, "get+tournament+details"),
+    "tournament_form": (23885, "get+tournament+standings+form"),
+    "tournament_over_under": (23887, "get+tournament+standings+over+under"),
 }
 
 STRONG_THRESHOLD = 75.0
@@ -192,6 +199,36 @@ class ZylaClient:
 
     async def h2h(self, match_id: str) -> Dict[str, Any]:
         return await self.get("h2h", {"match_id": match_id})
+
+    async def team_details(self, team_url: str) -> Dict[str, Any]:
+        return await self.get("team_details", {"team_url": team_url})
+
+    async def team_results(self, team_id: str, page: int = 1) -> Dict[str, Any]:
+        return await self.get("team_results", {"team_id": team_id, "page": max(1, int(page))})
+
+    async def team_fixtures(self, team_id: str, page: int = 1) -> Dict[str, Any]:
+        return await self.get("team_fixtures", {"team_id": team_id, "page": max(1, int(page))})
+
+    async def team_squad(self, team_url: str) -> Dict[str, Any]:
+        return await self.get("team_squad", {"team_url": team_url})
+
+    async def tournament_details(self, tournament_stage_id: str) -> Dict[str, Any]:
+        return await self.get("tournament_details", {"tournament_stage_id": tournament_stage_id})
+
+    async def tournament_form(self, tournament_id: str, tournament_stage_id: str, type_: str = "overall") -> Dict[str, Any]:
+        return await self.get("tournament_form", {
+            "tournament_id": tournament_id,
+            "tournament_stage_id": tournament_stage_id,
+            "type": type_,
+        })
+
+    async def tournament_over_under(self, tournament_id: str, tournament_stage_id: str, type_: str = "overall", sub_type: str = "2.5") -> Dict[str, Any]:
+        return await self.get("tournament_over_under", {
+            "tournament_id": tournament_id,
+            "tournament_stage_id": tournament_stage_id,
+            "type": type_,
+            "sub_type": sub_type,
+        })
 
 
 # -------------------------
@@ -1090,6 +1127,68 @@ def correlation_groups(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+
+def parse_team_history(data: Any, team_id: str, limit: int = 10) -> Dict[str, Any]:
+    """Compact recent-results context. Historical data is confirmation only."""
+    matches: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        blocks = data
+    elif isinstance(data, dict):
+        blocks = data.get("data") if isinstance(data.get("data"), list) else [data]
+    else:
+        blocks = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        rows = block.get("matches")
+        if isinstance(rows, list):
+            matches.extend([m for m in rows if isinstance(m, dict)])
+    matches = sorted(matches, key=lambda m: int(safe_float(m.get("timestamp")) or 0), reverse=True)[:max(1, limit)]
+    gf = ga = btts = over25 = wins = draws = losses = 0
+    used = 0
+    for m in matches:
+        ht = m.get("home_team") or {}; at = m.get("away_team") or {}; sc = m.get("scores") or {}
+        h = safe_float(sc.get("home")); a = safe_float(sc.get("away"))
+        if h is None or a is None:
+            continue
+        is_home = str(ht.get("team_id")) == str(team_id)
+        is_away = str(at.get("team_id")) == str(team_id)
+        if not (is_home or is_away):
+            continue
+        team_g = int(h if is_home else a); opp_g = int(a if is_home else h)
+        gf += team_g; ga += opp_g; used += 1
+        btts += int(team_g > 0 and opp_g > 0)
+        over25 += int(team_g + opp_g >= 3)
+        if team_g > opp_g: wins += 1
+        elif team_g == opp_g: draws += 1
+        else: losses += 1
+    if not used:
+        return {"available": False, "matches": 0}
+    return {
+        "available": True, "matches": used,
+        "goals_for_avg": round(gf / used, 2),
+        "goals_against_avg": round(ga / used, 2),
+        "total_goals_avg": round((gf + ga) / used, 2),
+        "btts_rate": round(100 * btts / used, 1),
+        "over_2_5_rate": round(100 * over25 / used, 1),
+        "wins": wins, "draws": draws, "losses": losses,
+    }
+
+def historical_confirmation(home_hist: Dict[str, Any], away_hist: Dict[str, Any]) -> Dict[str, Any]:
+    if not home_hist.get("available") or not away_hist.get("available"):
+        return {"available": False, "weight": "LOW", "note": "History incomplete; no model override."}
+    goal_env = (float(home_hist.get("total_goals_avg", 0)) + float(away_hist.get("total_goals_avg", 0))) / 2
+    btts = (float(home_hist.get("btts_rate", 0)) + float(away_hist.get("btts_rate", 0))) / 2
+    over25 = (float(home_hist.get("over_2_5_rate", 0)) + float(away_hist.get("over_2_5_rate", 0))) / 2
+    return {
+        "available": True, "weight": "LOW",
+        "goal_environment_avg": round(goal_env, 2),
+        "btts_blend_rate": round(btts, 1),
+        "over_2_5_blend_rate": round(over25, 1),
+        "goal_context": "HIGH" if goal_env >= 3.0 else "MEDIUM" if goal_env >= 2.4 else "LOW",
+        "note": "Historical confirmation has low weight and cannot create SAFE ENTER by itself.",
+    }
+
 # -------------------------
 # Match analyzer
 # -------------------------
@@ -1110,7 +1209,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live:
             return {
-                "source": "football-reactor-v4.1",
+                "source": "football-reactor-v4.2",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "NOT_LIVE_OR_NOT_FOUND",
@@ -1119,7 +1218,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live.get("minute_valid", True):
             return {
-                "source": "football-reactor-v4.1",
+                "source": "football-reactor-v4.2",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "INVALID_LIVE_MINUTE",
@@ -1156,6 +1255,28 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         h2h = h2h_context(h2h_r.get("data"))
         pressure = pressure_score(metrics, int(live["minute"]))
         signals = build_signals(live, metrics, q, pressure, lineups)
+
+        # Historical context is fetched only for meaningful candidates, keeping quota under control.
+        top_pre_context = signals[0] if signals else None
+        history_context = {"available": False, "reason": "not_requested_for_weak_candidate"}
+        history_http = {"home": None, "away": None}
+        if top_pre_context and float(top_pre_context.get("probability") or 0) >= 60.0:
+            home_id = live.get("home_team_id")
+            away_id = live.get("away_team_id")
+            if home_id and away_id:
+                home_hist_r, away_hist_r = await asyncio.gather(
+                    client.team_results(str(home_id), 1),
+                    client.team_results(str(away_id), 1),
+                )
+                api_calls += 2
+                history_http = {"home": home_hist_r.get("status"), "away": away_hist_r.get("status")}
+                home_hist = parse_team_history(home_hist_r.get("data"), str(home_id))
+                away_hist = parse_team_history(away_hist_r.get("data"), str(away_id))
+                history_context = {
+                    "home": home_hist,
+                    "away": away_hist,
+                    "confirmation": historical_confirmation(home_hist, away_hist),
+                }
 
         for s in signals:
             s["new_or_changed"] = is_new_or_changed(match_id, s)
@@ -1199,7 +1320,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         ]
 
         report = {
-            "source": "football-reactor-v4.1",
+            "source": "football-reactor-v4.2",
             "version": VERSION,
             "model_type": MODEL_TYPE,
             "match_id": match_id,
@@ -1231,6 +1352,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             "player_stats": players,
             "odds_snapshot": odds,
             "h2h_context": h2h,
+            "historical_context": history_context,
             "consensus": consensus,
             "correlation_groups": corr,
             "top_candidate": top3[0] if top3 else None,
@@ -1249,6 +1371,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                 "player_stats_http": player_r["status"],
                 "odds_http": odds_r["status"],
                 "h2h_http": h2h_r["status"],
+                "team_history_http": history_http,
                 "estimated_api_calls": api_calls,
             },
         }
@@ -1317,6 +1440,12 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "player_stats",
             "odds_snapshot",
             "h2h_context",
+            "team_recent_results_context",
+            "team_fixtures_endpoint",
+            "team_details_endpoint",
+            "team_squad_endpoint",
+            "tournament_form_endpoint",
+            "tournament_over_under_endpoint",
             "pressure_engine",
             "market_engine",
             "dual_safe_live_engine",
@@ -1325,7 +1454,7 @@ async def hidden_signal_status() -> Dict[str, Any]:
         ],
         "notes": [
             "Probabilities are heuristic ranking estimates, not calibrated true probabilities.",
-            "H2H has low weight and cannot create ENTER by itself.",
+            "H2H and historical team context have low weight and cannot create ENTER by themselves.",
             "Correlated signals are grouped and should not be counted as independent.",
             "Signal journal is local unless SIGNAL_LOG_PATH points to persistent storage.",
         ],
@@ -1338,7 +1467,7 @@ async def get_zyla_live_matches() -> Dict[str, Any]:
         r = await client.live()
         matches = flatten_live(r.get("data"))
         return {
-            "source": "football-reactor-v4.1",
+            "source": "football-reactor-v4.2",
             "version": VERSION,
             "http_status": r["status"],
             "live_matches_found": len(matches),
@@ -1481,7 +1610,7 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
     live_watchlist.sort(key=lambda x: float(x.get("live_probability") or 0), reverse=True)
 
     return {
-        "source": "football-reactor-v4.1",
+        "source": "football-reactor-v4.2",
         "version": VERSION,
         "status": "OK" if live_r.get("ok") else "LIVE_FETCH_ERROR",
         "live_http_status": live_r.get("status"),
@@ -1511,7 +1640,7 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
         "strong_signals": strong_signals,
         "live_watchlist": live_watchlist[:10],
         "top_candidates": top_candidates[:8],
-        "estimated_api_calls_this_scan": 1 + len(deep) * 7,
+        "estimated_api_calls_this_scan": 1 + sum(int(r.get("diagnostic", {}).get("estimated_api_calls") or 0) for r in reports if isinstance(r, dict)),
         "reactor_notes": [
             "Fresh live list is authoritative for score/minute.",
             "Lineups and match player stats are fetched for deep-analyzed matches.",
@@ -1522,6 +1651,63 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
             "Probabilities are not calibrated until enough logged outcomes are collected.",
         ],
     }
+
+@mcp.tool()
+async def get_zyla_team_context(team_id: str, page: int = 1) -> Dict[str, Any]:
+    """Recent results and upcoming fixtures for a team. Uses team_id from live/results data."""
+    client = ZylaClient()
+    try:
+        results_r, fixtures_r = await asyncio.gather(
+            client.team_results(team_id, page),
+            client.team_fixtures(team_id, page),
+        )
+        return {
+            "source": "football-reactor-v4.2", "version": VERSION, "team_id": team_id,
+            "recent_results_http": results_r.get("status"),
+            "fixtures_http": fixtures_r.get("status"),
+            "recent_summary": parse_team_history(results_r.get("data"), team_id),
+            "recent_results": results_r.get("data"),
+            "fixtures": fixtures_r.get("data"),
+        }
+    finally:
+        await client.close()
+
+@mcp.tool()
+async def get_zyla_team_profile(team_url: str, include_squad: bool = False) -> Dict[str, Any]:
+    """Team details and optionally squad. team_url must come from Zyla, do not invent it."""
+    client = ZylaClient()
+    try:
+        if include_squad:
+            details_r, squad_r = await asyncio.gather(client.team_details(team_url), client.team_squad(team_url))
+        else:
+            details_r = await client.team_details(team_url); squad_r = {"status": None, "data": None}
+        return {
+            "source": "football-reactor-v4.2", "version": VERSION, "team_url": team_url,
+            "details_http": details_r.get("status"), "details": details_r.get("data"),
+            "squad_http": squad_r.get("status"), "squad": squad_r.get("data"),
+        }
+    finally:
+        await client.close()
+
+@mcp.tool()
+async def get_zyla_tournament_context(tournament_id: str, tournament_stage_id: str, type_: str = "overall", sub_type: str = "2.5") -> Dict[str, Any]:
+    """Tournament details, current form and over/under table. IDs must come from Zyla."""
+    client = ZylaClient()
+    try:
+        details_r, form_r, ou_r = await asyncio.gather(
+            client.tournament_details(tournament_stage_id),
+            client.tournament_form(tournament_id, tournament_stage_id, type_),
+            client.tournament_over_under(tournament_id, tournament_stage_id, type_, sub_type),
+        )
+        return {
+            "source": "football-reactor-v4.2", "version": VERSION,
+            "tournament_id": tournament_id, "tournament_stage_id": tournament_stage_id,
+            "details_http": details_r.get("status"), "details": details_r.get("data"),
+            "form_http": form_r.get("status"), "form": form_r.get("data"),
+            "over_under_http": ou_r.get("status"), "over_under": ou_r.get("data"),
+        }
+    finally:
+        await client.close()
 
 @mcp.tool()
 async def get_signal_log(limit: int = 50) -> Dict[str, Any]:
