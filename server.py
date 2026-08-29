@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.6-DECISION-CONTROL"
-MODEL_TYPE = "heuristic-v5.6-decision-control-not-calibrated"
+VERSION = "V5.7-SELF-LEARNING"
+MODEL_TYPE = "heuristic-v5.7-self-learning-bounded-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -119,7 +119,7 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 # Lightweight journal
 # -------------------------
 
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_6_signals.jsonl")
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_7_signals.jsonl")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -1756,6 +1756,12 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "context_risk_layer",
             "priority_score",
             "decision_journal",
+            "bounded_self_learning",
+            "auto_outcome_resolution",
+            "market_specific_calibration",
+            "sample_gated_tuning",
+            "automatic_rollback",
+            "adaptive_take_now",
             "phase_quota_selection",
             "tournament_diversity_prefilter",
             "goal_chain_board",
@@ -2684,7 +2690,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5.6",
+            "source": "hidden-signal-v5.7",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
@@ -2692,7 +2698,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
             "final_freshness": freshness,
         }
     return {
-        "source": "hidden-signal-v5.6",
+        "source": "hidden-signal-v5.7",
         "version": VERSION,
         "report": structured_market_report(rep),
         "technical": {
@@ -2816,7 +2822,7 @@ async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
 
     total = sum(len(v) for v in sections.values())
     return {
-        "source": "hidden-signal-v5.6",
+        "source": "hidden-signal-v5.7",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_matches_found": len(matches),
@@ -2928,7 +2934,7 @@ async def analyze_screenshot_quick(
     )
     report = _quick_screenshot_report(live, metrics, source_note)
     return {
-        "source": "hidden-signal-v5.6.1-screenshot",
+        "source": "hidden-signal-v5.7.1-screenshot",
         "version": VERSION,
         "latency_ms": int((time.time() - started) * 1000),
         "live_match_found": bool(best_match and best_similarity >= 0.58),
@@ -3042,7 +3048,7 @@ async def scan_thinking_live(limit: int = 12, concurrency: int = 2) -> Dict[str,
     )
 
     return {
-        "source": "hidden-signal-v5.6",
+        "source": "hidden-signal-v5.7",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -5099,6 +5105,560 @@ def _v56_apply_decision_control(
     )
     return view
 
+
+# ============================================================
+# V5.7 BOUNDED SELF-LEARNING
+#
+# IMPORTANT:
+# - Does NOT rewrite server.py.
+# - Learns only bounded configuration parameters.
+# - Auto-resolves only outcomes that can be inferred reliably
+#   from later live score/minute snapshots.
+# - Broad/ambiguous markets are observed but not used for
+#   automatic tuning unless they resolve unambiguously.
+# ============================================================
+
+V57_MIN_RESOLVED = 30
+V57_TUNE_EVERY = 10
+V57_MAX_RECORDS_PER_MARKET = 120
+V57_PENDING_KEEP = 250
+V57_MARKET_DEFAULTS = {
+    "GOAL_NEXT_5": {"probability_bias": 0.0, "enter_offset": 0.0, "soon_offset": 0.0, "trend_min": 24.0},
+    "GOAL_NEXT_10": {"probability_bias": 0.0, "enter_offset": 0.0, "soon_offset": 0.0, "trend_min": 24.0},
+    "GOAL_BEFORE_HALFTIME": {"probability_bias": 0.0, "enter_offset": 0.0, "soon_offset": 0.0, "trend_min": 26.0},
+    "GOAL_BEFORE_FULLTIME": {"probability_bias": 0.0, "enter_offset": 0.0, "soon_offset": 0.0, "trend_min": 22.0},
+    "TEAM_GOAL": {"probability_bias": 0.0, "enter_offset": 0.0, "soon_offset": 0.0, "trend_min": 25.0},
+    "BTTS": {"probability_bias": 0.0, "enter_offset": 0.0, "soon_offset": 0.0, "trend_min": 26.0},
+}
+
+
+def _v57_default_learning_state() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "updated_at": now_iso(),
+        "markets": {
+            k: {
+                **dict(v),
+                "records": [],
+                "resolved_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "last_tuned_at_resolved": 0,
+                "config_version": 1,
+                "last_change": None,
+                "previous_config": None,
+            }
+            for k, v in V57_MARKET_DEFAULTS.items()
+        },
+        "pending": [],
+        "resolved_total": 0,
+        "learning_mode": "BOUNDED_AUTO_TUNING",
+        "notes": [
+            "source code is never rewritten automatically",
+            "automatic tuning is bounded and sample-gated",
+            "unresolved/ambiguous outcomes do not tune the model",
+        ],
+    }
+
+
+def _v57_load_state() -> Dict[str, Any]:
+    try:
+        with open(LEARNING_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return _v57_default_learning_state()
+    except Exception:
+        return _v57_default_learning_state()
+
+    defaults = _v57_default_learning_state()
+    data.setdefault("markets", {})
+    for market, base in defaults["markets"].items():
+        cur = data["markets"].setdefault(market, {})
+        for k, v in base.items():
+            cur.setdefault(k, v)
+    data.setdefault("pending", [])
+    data.setdefault("resolved_total", 0)
+    data.setdefault("learning_mode", "BOUNDED_AUTO_TUNING")
+    return data
+
+
+def _v57_save_state(state: Dict[str, Any]) -> None:
+    try:
+        state["updated_at"] = now_iso()
+        tmp = LEARNING_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, LEARNING_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _v57_market_cfg(state: Dict[str, Any], market: str) -> Dict[str, Any]:
+    markets = state.setdefault("markets", {})
+    if market not in markets:
+        base = dict(V57_MARKET_DEFAULTS.get(market, {
+            "probability_bias": 0.0,
+            "enter_offset": 0.0,
+            "soon_offset": 0.0,
+            "trend_min": 24.0,
+        }))
+        markets[market] = {
+            **base,
+            "records": [],
+            "resolved_count": 0,
+            "wins": 0,
+            "losses": 0,
+            "last_tuned_at_resolved": 0,
+            "config_version": 1,
+            "last_change": None,
+            "previous_config": None,
+        }
+    return markets[market]
+
+
+def _v57_clamp_cfg(cfg: Dict[str, Any]) -> None:
+    # Hard safety bounds: learning can refine, not reinvent the model.
+    cfg["probability_bias"] = round1(clamp(float(cfg.get("probability_bias") or 0), -3.0, 3.0))
+    cfg["enter_offset"] = round1(clamp(float(cfg.get("enter_offset") or 0), -2.0, 5.0))
+    cfg["soon_offset"] = round1(clamp(float(cfg.get("soon_offset") or 0), -2.0, 4.0))
+    cfg["trend_min"] = round1(clamp(float(cfg.get("trend_min") or 24), 18.0, 36.0))
+
+
+def _v57_brier(records: List[Dict[str, Any]]) -> Optional[float]:
+    vals = []
+    for r in records:
+        try:
+            p = float(r.get("probability")) / 100.0
+            y = 1.0 if int(r.get("outcome")) == 1 else 0.0
+            vals.append((p - y) ** 2)
+        except Exception:
+            continue
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 4)
+
+
+def _v57_learning_summary(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    records = list(cfg.get("records") or [])
+    n = len(records)
+    if not n:
+        return {
+            "resolved": 0,
+            "hit_rate": None,
+            "avg_model_score": None,
+            "calibration_gap": None,
+            "brier": None,
+        }
+
+    outcomes = [int(r.get("outcome") or 0) for r in records]
+    probs = [float(r.get("probability") or 0) for r in records]
+    hit = sum(outcomes) / n
+    avgp = sum(probs) / n / 100.0
+    return {
+        "resolved": n,
+        "hit_rate": round1(hit * 100),
+        "avg_model_score": round1(avgp * 100),
+        "calibration_gap": round1((hit - avgp) * 100),
+        "brier": _v57_brier(records),
+    }
+
+
+def _v57_tune_market(state: Dict[str, Any], market: str) -> Optional[Dict[str, Any]]:
+    cfg = _v57_market_cfg(state, market)
+    records = list(cfg.get("records") or [])
+    n = len(records)
+    last_tuned = int(cfg.get("last_tuned_at_resolved") or 0)
+
+    if n < V57_MIN_RESOLVED or n - last_tuned < V57_TUNE_EVERY:
+        return None
+
+    recent = records[-min(40, n):]
+    summary = _v57_learning_summary({**cfg, "records": recent})
+    gap = float(summary.get("calibration_gap") or 0)
+
+    previous = {
+        "probability_bias": float(cfg.get("probability_bias") or 0),
+        "enter_offset": float(cfg.get("enter_offset") or 0),
+        "soon_offset": float(cfg.get("soon_offset") or 0),
+        "trend_min": float(cfg.get("trend_min") or 24),
+    }
+    cfg["previous_config"] = previous
+
+    changes = []
+
+    # Calibration-guided small steps only.
+    # If realized hit rate is well below the model score, become stricter.
+    if gap <= -12:
+        cfg["probability_bias"] = previous["probability_bias"] - 0.5
+        cfg["enter_offset"] = previous["enter_offset"] + 1.0
+        cfg["soon_offset"] = previous["soon_offset"] + 0.5
+        cfg["trend_min"] = previous["trend_min"] + 1.0
+        changes.append("ужесточены пороги: фактический результат ниже модельной оценки")
+    elif gap <= -6:
+        cfg["probability_bias"] = previous["probability_bias"] - 0.3
+        cfg["enter_offset"] = previous["enter_offset"] + 0.5
+        cfg["trend_min"] = previous["trend_min"] + 0.5
+        changes.append("слегка ужесточён вход")
+    elif gap >= 12:
+        cfg["probability_bias"] = previous["probability_bias"] + 0.5
+        cfg["enter_offset"] = previous["enter_offset"] - 0.5
+        cfg["soon_offset"] = previous["soon_offset"] - 0.5
+        changes.append("слегка смягчены пороги: результат устойчиво выше модельной оценки")
+    elif gap >= 6:
+        cfg["probability_bias"] = previous["probability_bias"] + 0.3
+        cfg["soon_offset"] = previous["soon_offset"] - 0.5
+        changes.append("слегка смягчён переход в TAKE_SOON")
+    else:
+        changes.append("калибровка стабильна — параметры оставлены без изменения")
+
+    _v57_clamp_cfg(cfg)
+    cfg["last_tuned_at_resolved"] = n
+    cfg["config_version"] = int(cfg.get("config_version") or 1) + 1
+    cfg["last_change"] = {
+        "at": now_iso(),
+        "resolved": n,
+        "market": market,
+        "summary": summary,
+        "changes": changes,
+        "new_config": {
+            "probability_bias": cfg["probability_bias"],
+            "enter_offset": cfg["enter_offset"],
+            "soon_offset": cfg["soon_offset"],
+            "trend_min": cfg["trend_min"],
+        },
+    }
+    return cfg["last_change"]
+
+
+def _v57_maybe_rollback(state: Dict[str, Any], market: str) -> Optional[Dict[str, Any]]:
+    """
+    Conservative rollback:
+    after a tune, wait for at least 10 newer outcomes.
+    If recent Brier score is materially worse than the preceding window,
+    restore the previous bounded config.
+    """
+    cfg = _v57_market_cfg(state, market)
+    prev_cfg = cfg.get("previous_config")
+    last_tuned = int(cfg.get("last_tuned_at_resolved") or 0)
+    records = list(cfg.get("records") or [])
+
+    if not prev_cfg or len(records) < last_tuned + 10 or last_tuned < 20:
+        return None
+
+    before = records[max(0, last_tuned - 20):last_tuned]
+    after = records[last_tuned:min(len(records), last_tuned + 20)]
+    if len(after) < 10:
+        return None
+
+    b_before = _v57_brier(before)
+    b_after = _v57_brier(after)
+    if b_before is None or b_after is None:
+        return None
+
+    # Lower Brier is better. Roll back only on clear degradation.
+    if b_after > b_before + 0.08:
+        for k in ("probability_bias", "enter_offset", "soon_offset", "trend_min"):
+            cfg[k] = prev_cfg[k]
+        _v57_clamp_cfg(cfg)
+        cfg["previous_config"] = None
+        cfg["config_version"] = int(cfg.get("config_version") or 1) + 1
+        cfg["last_change"] = {
+            "at": now_iso(),
+            "market": market,
+            "rollback": True,
+            "reason": "качество после настройки ухудшилось",
+            "brier_before": b_before,
+            "brier_after": b_after,
+            "restored_config": {
+                "probability_bias": cfg["probability_bias"],
+                "enter_offset": cfg["enter_offset"],
+                "soon_offset": cfg["soon_offset"],
+                "trend_min": cfg["trend_min"],
+            },
+        }
+        return cfg["last_change"]
+    return None
+
+
+def _v57_pending_id(match_id: str, item: Dict[str, Any], minute: int) -> str:
+    return f"{match_id}:{item.get('market')}:{item.get('title')}:{minute}"
+
+
+def _v57_register_pending(
+    state: Dict[str, Any],
+    match_id: str,
+    match: Dict[str, Any],
+    item: Dict[str, Any],
+) -> Optional[str]:
+    flow = item.get("FLOW") or {}
+    controlled = str(flow.get("state") or "")
+    if controlled != "TAKE_NOW":
+        return None
+
+    market = str(item.get("market") or "")
+    if market not in V57_MARKET_DEFAULTS:
+        return None
+
+    minute = int(match.get("minute") or 0)
+    score = match.get("score") or {}
+    sid = _v57_pending_id(match_id, item, minute)
+
+    pending = state.setdefault("pending", [])
+    if any(x.get("id") == sid for x in pending):
+        return sid
+
+    # Auto-learning is most reliable for these horizons.
+    if market == "GOAL_NEXT_5":
+        deadline = minute + 5
+        resolution_mode = "SHORT_WINDOW"
+    elif market == "GOAL_NEXT_10":
+        deadline = minute + 10
+        resolution_mode = "SHORT_WINDOW"
+    elif market == "GOAL_BEFORE_HALFTIME" and minute <= 44:
+        deadline = 45
+        resolution_mode = "FIRST_HALF"
+    elif market == "GOAL_BEFORE_FULLTIME":
+        deadline = 96
+        resolution_mode = "FULLTIME_GOAL"
+    else:
+        # Team goal / BTTS can be ambiguous without side-specific event resolution.
+        # Keep them for audit, but do not auto-tune from them.
+        deadline = None
+        resolution_mode = "AUDIT_ONLY"
+
+    pending.append({
+        "id": sid,
+        "created_at": now_iso(),
+        "match_id": match_id,
+        "market": market,
+        "title": item.get("title"),
+        "minute": minute,
+        "deadline": deadline,
+        "resolution_mode": resolution_mode,
+        "score_home": int(score.get("home") or 0),
+        "score_away": int(score.get("away") or 0),
+        "score_total": int(score.get("home") or 0) + int(score.get("away") or 0),
+        "probability": float(flow.get("adjusted_probability") or item.get("probability") or 0),
+        "priority_score": float(item.get("PRIORITY_SCORE") or 0),
+        "resolved": False,
+    })
+    state["pending"] = pending[-V57_PENDING_KEEP:]
+    return sid
+
+
+def _v57_record_resolution(
+    state: Dict[str, Any],
+    pending: Dict[str, Any],
+    outcome: int,
+    resolved_minute: int,
+    reason: str,
+) -> None:
+    market = str(pending.get("market") or "")
+    cfg = _v57_market_cfg(state, market)
+    records = list(cfg.get("records") or [])
+    records.append({
+        "signal_id": pending.get("id"),
+        "at": now_iso(),
+        "minute": pending.get("minute"),
+        "resolved_minute": resolved_minute,
+        "probability": pending.get("probability"),
+        "priority_score": pending.get("priority_score"),
+        "outcome": int(outcome),
+        "reason": reason,
+    })
+    cfg["records"] = records[-V57_MAX_RECORDS_PER_MARKET:]
+    cfg["resolved_count"] = len(cfg["records"])
+    cfg["wins"] = sum(int(x.get("outcome") or 0) for x in cfg["records"])
+    cfg["losses"] = len(cfg["records"]) - cfg["wins"]
+    state["resolved_total"] = int(state.get("resolved_total") or 0) + 1
+    pending["resolved"] = True
+    pending["outcome"] = int(outcome)
+    pending["resolved_at"] = now_iso()
+    pending["resolution_reason"] = reason
+
+
+def _v57_resolve_pending_for_match(
+    state: Dict[str, Any],
+    match_id: str,
+    match: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    score = match.get("score") or {}
+    cur_total = int(score.get("home") or 0) + int(score.get("away") or 0)
+    minute = int(match.get("minute") or 0)
+    stage = str(match.get("stage") or "").lower()
+    resolved = []
+
+    for p in state.get("pending") or []:
+        if p.get("resolved") or str(p.get("match_id")) != str(match_id):
+            continue
+
+        mode = p.get("resolution_mode")
+        start_total = int(p.get("score_total") or 0)
+        deadline = p.get("deadline")
+
+        if mode == "AUDIT_ONLY":
+            continue
+
+        # A later goal is an unambiguous win for total-goal horizons.
+        if cur_total > start_total:
+            if mode == "FIRST_HALF":
+                # Only auto-resolve as win while still in first half or at HT.
+                if minute <= 45 or "half time" in stage or "halftime" in stage:
+                    _v57_record_resolution(state, p, 1, minute, "гол появился до конца 1-го тайма")
+                    resolved.append(p)
+                # If already in 2H, exact timing is ambiguous -> leave unresolved.
+            else:
+                if deadline is None or minute <= int(deadline) + 1:
+                    _v57_record_resolution(state, p, 1, minute, "счёт увеличился внутри отслеживаемого окна")
+                    resolved.append(p)
+                elif mode == "FULLTIME_GOAL":
+                    _v57_record_resolution(state, p, 1, minute, "гол появился позже входа до конца матча")
+                    resolved.append(p)
+            continue
+
+        # Loss only when the tracked window has clearly expired with unchanged score.
+        if deadline is not None and minute > int(deadline):
+            if mode in {"SHORT_WINDOW", "FIRST_HALF"}:
+                _v57_record_resolution(state, p, 0, minute, "окно истекло без изменения счёта")
+                resolved.append(p)
+            elif mode == "FULLTIME_GOAL" and minute >= 96:
+                _v57_record_resolution(state, p, 0, minute, "до 96-й минуты счёт не изменился")
+                resolved.append(p)
+
+    return resolved
+
+
+def _v57_adaptive_control(
+    state: Dict[str, Any],
+    view: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Final bounded adaptive layer after V5.6.
+    It can move at most one ladder step relative to the controlled state.
+    """
+    trend = view.get("PRESSURE_TREND") or {}
+    trend_score = float(trend.get("score") or 0)
+    freshness = str((view.get("freshness") or view.get("FRESHNESS") or ""))
+    items = []
+
+    # V5.6 already produced controlled decision items.
+    for x in list(view.get("DECISION_CONTROL_ITEMS") or []):
+        y = dict(x)
+        y["FLOW"] = dict(y.get("FLOW") or {})
+        market = str(y.get("market") or "")
+        cfg = _v57_market_cfg(state, market)
+
+        p_raw = float(y["FLOW"].get("adjusted_probability") or y.get("probability") or 0)
+        p_learned = round1(clamp(p_raw + float(cfg.get("probability_bias") or 0), 0, 99))
+        enter_threshold = 78.0 + float(cfg.get("enter_offset") or 0)
+        soon_threshold = 65.0 + float(cfg.get("soon_offset") or 0)
+        trend_min = float(cfg.get("trend_min") or 24)
+
+        cur = str(y["FLOW"].get("state") or "PASS")
+        adaptive = cur
+        reason = "адаптивный слой не менял решение"
+
+        # One-step bounded upgrade/downgrade only.
+        if cur == "TAKE_NOW" and p_learned < enter_threshold:
+            adaptive = "TAKE_SOON"
+            reason = "самообучение сделало порог TAKE NOW строже"
+        elif cur == "TAKE_SOON":
+            stable = int((y.get("DECISION_CONTROL") or {}).get("stable_count") or 1)
+            if p_learned >= enter_threshold and trend_score >= trend_min and stable >= 2:
+                adaptive = "TAKE_NOW"
+                reason = "история рынка + два сильных скана разрешили TAKE NOW"
+            elif p_learned < soon_threshold:
+                adaptive = "TAKE_LATER"
+                reason = "адаптивный порог TAKE SOON пока не достигнут"
+        elif cur == "TAKE_LATER":
+            if p_learned >= soon_threshold and trend_score >= trend_min:
+                adaptive = "TAKE_SOON"
+                reason = "рынок исторически допускает более ранний переход при текущем тренде"
+        elif cur in {"EMERGING", "RADAR"}:
+            if p_learned >= soon_threshold and trend_score >= trend_min:
+                adaptive = "TAKE_LATER"
+                reason = "ранний сигнал усилился, но самообучение не позволяет перепрыгнуть сразу в вход"
+
+        y["FLOW"]["state_before_learning"] = cur
+        y["FLOW"]["state"] = adaptive
+        y["SELF_LEARNING"] = {
+            "market_config_version": cfg.get("config_version"),
+            "raw_probability": round1(p_raw),
+            "learned_probability": p_learned,
+            "probability_bias": cfg.get("probability_bias"),
+            "enter_threshold": round1(enter_threshold),
+            "soon_threshold": round1(soon_threshold),
+            "trend_min": round1(trend_min),
+            "state_before_learning": cur,
+            "adaptive_state": adaptive,
+            "reason": reason,
+            "samples": len(cfg.get("records") or []),
+        }
+        items.append(y)
+
+    order = {"TAKE_NOW": 5, "TAKE_SOON": 4, "TAKE_LATER": 3, "EMERGING": 2, "RADAR": 1, "PASS": 0}
+    items.sort(
+        key=lambda z: (
+            order.get((z.get("FLOW") or {}).get("state"), 0),
+            float(z.get("PRIORITY_SCORE") or 0),
+        ),
+        reverse=True,
+    )
+
+    best = items[0] if items else None
+    if best:
+        state_name = (best.get("FLOW") or {}).get("state")
+        sl = best.get("SELF_LEARNING") or {}
+        if state_name == "TAKE_NOW":
+            action = f"🟢 БРАТЬ СЕЙЧАС — {best.get('title')} ({sl.get('learned_probability')}%)"
+        elif state_name == "TAKE_SOON":
+            action = f"🟡 СКОРО — {best.get('title')} ({sl.get('learned_probability')}%)"
+        elif state_name == "TAKE_LATER":
+            action = f"🟠 ПОЗЖЕ — {best.get('title')} ({sl.get('learned_probability')}%)"
+        elif state_name in {"EMERGING", "RADAR"}:
+            action = f"👀 НАЗРЕВАЕТ — {best.get('title')} ({sl.get('learned_probability')}%)"
+        else:
+            action = "🔴 ПРОПУСКАЕМ"
+    else:
+        action = "🔴 ПРОПУСКАЕМ"
+
+    view["ADAPTIVE_ITEMS"] = items
+    view["BEST_ADAPTIVE_SIGNAL"] = best
+    view["WHEN_TO_ENTER_ADAPTIVE"] = action
+    return view
+
+
+def _v57_learning_report(state: Dict[str, Any]) -> Dict[str, Any]:
+    markets = {}
+    for market in sorted(state.get("markets") or {}):
+        cfg = _v57_market_cfg(state, market)
+        markets[market] = {
+            "summary": _v57_learning_summary(cfg),
+            "config": {
+                "probability_bias": cfg.get("probability_bias"),
+                "enter_offset": cfg.get("enter_offset"),
+                "soon_offset": cfg.get("soon_offset"),
+                "trend_min": cfg.get("trend_min"),
+                "config_version": cfg.get("config_version"),
+            },
+            "last_change": cfg.get("last_change"),
+            "ready_to_tune": len(cfg.get("records") or []) >= V57_MIN_RESOLVED,
+        }
+    return {
+        "learning_mode": state.get("learning_mode"),
+        "resolved_total": state.get("resolved_total"),
+        "pending_unresolved": sum(1 for x in state.get("pending") or [] if not x.get("resolved")),
+        "minimum_samples_before_tuning": V57_MIN_RESOLVED,
+        "markets": markets,
+        "safety": {
+            "rewrites_source_code": False,
+            "bounded_probability_bias": "[-3,+3]",
+            "bounded_enter_offset": "[-2,+5]",
+            "rollback_enabled": True,
+            "ambiguous_outcomes_tune_model": False,
+        },
+    }
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -5119,6 +5679,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     previous_state = _load_scan_state()
     scan_history = _v55_load_history()
     decision_journal = _v56_load_journal()
+    learning_state = _v57_load_state()
 
     # ---------- First broad snapshot ----------
     client = ZylaClient()
@@ -5236,6 +5797,12 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             })
             continue
 
+        _v57_resolve_pending_for_match(
+            learning_state,
+            mid,
+            rep.get("match") or {},
+        )
+
         view = _v54_attach_timing(_v53_human_view(rep, momentum, freshness))
         view = _v55_enrich_view(
             rep,
@@ -5249,6 +5816,18 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             decision_journal,
             mid,
         )
+        view = _v57_adaptive_control(
+            learning_state,
+            view,
+        )
+
+        for adaptive_item in list(view.get("ADAPTIVE_ITEMS") or []):
+            _v57_register_pending(
+                learning_state,
+                mid,
+                rep.get("match") or {},
+                adaptive_item,
+            )
         visible = view.get("goal_board_65_99") or []
         radar = view.get("RISING_RADAR_55_64") or []
 
@@ -5333,6 +5912,22 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
 
 
     _v56_save_journal(decision_journal)
+    learning_changes = []
+    learning_rollbacks = []
+    for _market in list((learning_state.get("markets") or {}).keys()):
+        _rb = _v57_maybe_rollback(learning_state, _market)
+        if _rb:
+            learning_rollbacks.append(_rb)
+        _ch = _v57_tune_market(learning_state, _market)
+        if _ch:
+            learning_changes.append(_ch)
+    _v57_save_state(learning_state)
+
+
+    adaptive_take_now = []
+    adaptive_take_soon = []
+    adaptive_take_later = []
+    adaptive_emerging = []
 
     controlled_take_now = []
     controlled_take_soon = []
@@ -5347,6 +5942,17 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     pressure_trend_now = []
 
     for c in candidates:
+        adaptive_best = c.get("BEST_ADAPTIVE_SIGNAL") or {}
+        adaptive_state = (adaptive_best.get("FLOW") or {}).get("state")
+        if adaptive_state == "TAKE_NOW":
+            adaptive_take_now.append(c)
+        elif adaptive_state == "TAKE_SOON":
+            adaptive_take_soon.append(c)
+        elif adaptive_state == "TAKE_LATER":
+            adaptive_take_later.append(c)
+        elif adaptive_state in {"EMERGING", "RADAR"}:
+            adaptive_emerging.append(c)
+
         controlled_best = c.get("BEST_CONTROLLED_SIGNAL") or {}
         controlled_state = (controlled_best.get("FLOW") or {}).get("state")
         if controlled_state == "TAKE_NOW":
@@ -5400,7 +6006,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             take_later.append(c)
 
     return {
-        "source": "hidden-signal-v5.6-complete-live",
+        "source": "hidden-signal-v5.7-complete-live",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_snapshot_at": now_iso(),
@@ -5429,6 +6035,15 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "CONTROLLED_TAKE_SOON": controlled_take_soon,
         "CONTROLLED_TAKE_LATER": controlled_take_later,
         "CONTROLLED_EMERGING": controlled_emerging,
+
+        # V5.7 final adaptive ladder:
+        "ADAPTIVE_TAKE_NOW": adaptive_take_now,
+        "ADAPTIVE_TAKE_SOON": adaptive_take_soon,
+        "ADAPTIVE_TAKE_LATER": adaptive_take_later,
+        "ADAPTIVE_EMERGING": adaptive_emerging,
+        "SELF_LEARNING_REPORT": _v57_learning_report(learning_state),
+        "SELF_LEARNING_CHANGES_THIS_SCAN": learning_changes,
+        "SELF_LEARNING_ROLLBACKS_THIS_SCAN": learning_rollbacks,
 
         # V5.4 human timing split:
         "GOAL_FIRST_HALF": first_half_now,
@@ -5479,8 +6094,41 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             f"memory {len(new_state)}."
         ),
 
-        "mode": "DECISION_CONTROL_STABLE_FLOW",
+        "mode": "BOUNDED_SELF_LEARNING_FLOW",
     }
+
+
+
+@mcp.tool()
+async def get_self_learning_report() -> Dict[str, Any]:
+    """Show what V5.7 has learned without changing anything."""
+    state = _v57_load_state()
+    return {
+        "version": VERSION,
+        "model_type": MODEL_TYPE,
+        **_v57_learning_report(state),
+    }
+
+
+@mcp.tool()
+async def reset_self_learning() -> Dict[str, Any]:
+    """Reset only adaptive learning data/config. Core model and other scan memory remain intact."""
+    try:
+        if os.path.exists(LEARNING_STATE_PATH):
+            os.remove(LEARNING_STATE_PATH)
+        state = _v57_default_learning_state()
+        _v57_save_state(state)
+        return {
+            "ok": True,
+            "version": VERSION,
+            "message": "Self-learning state reset to safe defaults.",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "version": VERSION,
+            "error": str(e),
+        }
 
 
 @mcp.tool()
@@ -5493,6 +6141,8 @@ async def reset_scan_memory() -> Dict[str, Any]:
             os.remove(SCAN_HISTORY_PATH)
         if os.path.exists(DECISION_JOURNAL_PATH):
             os.remove(DECISION_JOURNAL_PATH)
+        if os.path.exists(LEARNING_STATE_PATH):
+            os.remove(LEARNING_STATE_PATH)
         return {"ok": True, "message": "Память предыдущего лайв-скана очищена."}
     except Exception as e:
         return {"ok": False, "error": repr(e)}
@@ -5625,7 +6275,7 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
     ]
 
     return {
-        "source": "hidden-signal-v5.6.1-goal-hunter",
+        "source": "hidden-signal-v5.7.1-goal-hunter",
         "version": VERSION,
         "live_snapshot_at": now_iso(),
         "live_matches_found": len(matches),
@@ -5670,14 +6320,14 @@ async def analyze_goal_hunter_match(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v5.6",
+            "source": "hidden-signal-v5.7",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
             "message": "Сигнал скрыт: live уже изменился.",
         }
     return {
-        "source": "hidden-signal-v5.6",
+        "source": "hidden-signal-v5.7",
         "version": VERSION,
         "report": _goal_hunter_view(rep),
         "technical": {
@@ -5779,7 +6429,7 @@ async def quick_screenshot_goal_hunter(
     }
 
     return {
-        "source": "hidden-signal-v5.6.1-screenshot",
+        "source": "hidden-signal-v5.7.1-screenshot",
         "version": VERSION,
         "live_match_found": bool(best_match and best_similarity >= 0.58),
         "match_similarity": round1(best_similarity * 100),
