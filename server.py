@@ -14,8 +14,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V4.6-WARM-REACTOR"
-MODEL_TYPE = "heuristic-v4.3-anti-stale-next-goal-not-calibrated"
+VERSION = "V5.0-GOAL-HUNTER-FULL"
+MODEL_TYPE = "heuristic-v5-goal-hunter-full-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -119,7 +119,7 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 # Lightweight journal
 # -------------------------
 
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v4_signals.jsonl")
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_signals.jsonl")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -1476,7 +1476,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live:
             return {
-                "source": "football-reactor-v4.6",
+                "source": "football-reactor-v5",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "NOT_LIVE_OR_NOT_FOUND",
@@ -1485,7 +1485,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
 
         if not live.get("minute_valid", True):
             return {
-                "source": "football-reactor-v4.6",
+                "source": "football-reactor-v5",
                 "version": VERSION,
                 "match_id": match_id,
                 "status": "INVALID_LIVE_MINUTE",
@@ -1588,7 +1588,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         ]
 
         report = {
-            "source": "football-reactor-v4.6",
+            "source": "football-reactor-v5",
             "version": VERSION,
             "model_type": MODEL_TYPE,
             "match_id": match_id,
@@ -1727,6 +1727,13 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "signal_journal",
             "nearest_goal_engine",
             "anti_stale_final_refresh",
+            "our_analysis_engine",
+            "goal_hunter_old_style",
+            "goal_chain_board",
+            "quick_screenshot_goal_hunter",
+            "final_freshness_after_deep_scan",
+            "screenshot_quick_bridge",
+            "phase_balanced_live_collector",
         ],
         "notes": [
             "Probabilities are heuristic ranking estimates, not calibrated true probabilities.",
@@ -1743,7 +1750,7 @@ async def get_zyla_live_matches() -> Dict[str, Any]:
         r = await client.live()
         matches = flatten_live(r.get("data"))
         return {
-            "source": "football-reactor-v4.6",
+            "source": "football-reactor-v5",
             "version": VERSION,
             "http_status": r["status"],
             "live_matches_found": len(matches),
@@ -1774,7 +1781,7 @@ async def analyze_zyla_match(match_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def reactor_match_report(match_id: str) -> Dict[str, Any]:
-    """Full V4.3 reactor report for one live football match."""
+    """Full V4.7 thinking reactor report for one live football match."""
     return await analyze_match_internal(match_id)
 
 @mcp.tool()
@@ -1953,7 +1960,7 @@ async def scan_zyla_live(prefilter_limit: int = 12, deep_limit: int = 6) -> Dict
     )
 
     return {
-        "source": "football-reactor-v4.6",
+        "source": "football-reactor-v5",
         "version": VERSION,
         "status": "OK" if live_r.get("ok") else "LIVE_FETCH_ERROR",
         "live_http_status": live_r.get("status"),
@@ -2052,7 +2059,7 @@ async def get_zyla_team_context(team_id: str, page: int = 1) -> Dict[str, Any]:
             client.team_fixtures(team_id, page),
         )
         return {
-            "source": "football-reactor-v4.6", "version": VERSION, "team_id": team_id,
+            "source": "football-reactor-v5", "version": VERSION, "team_id": team_id,
             "recent_results_http": results_r.get("status"),
             "fixtures_http": fixtures_r.get("status"),
             "recent_summary": parse_team_history(results_r.get("data"), team_id),
@@ -2072,7 +2079,7 @@ async def get_zyla_team_profile(team_url: str, include_squad: bool = False) -> D
         else:
             details_r = await client.team_details(team_url); squad_r = {"status": None, "data": None}
         return {
-            "source": "football-reactor-v4.6", "version": VERSION, "team_url": team_url,
+            "source": "football-reactor-v5", "version": VERSION, "team_url": team_url,
             "details_http": details_r.get("status"), "details": details_r.get("data"),
             "squad_http": squad_r.get("status"), "squad": squad_r.get("data"),
         }
@@ -2090,7 +2097,7 @@ async def get_zyla_tournament_context(tournament_id: str, tournament_stage_id: s
             client.tournament_over_under(tournament_id, tournament_stage_id, type_, sub_type),
         )
         return {
-            "source": "football-reactor-v4.6", "version": VERSION,
+            "source": "football-reactor-v5", "version": VERSION,
             "tournament_id": tournament_id, "tournament_stage_id": tournament_stage_id,
             "details_http": details_r.get("status"), "details": details_r.get("data"),
             "form_http": form_r.get("status"), "form": form_r.get("data"),
@@ -2099,6 +2106,286 @@ async def get_zyla_tournament_context(tournament_id: str, tournament_stage_id: s
     finally:
         await client.close()
 
+
+
+
+# -------------------------
+# V4.7 Thinking Reactor — our football reasoning layer
+# -------------------------
+
+def _norm_team_name(name: Any) -> str:
+    s = str(name or "").lower().strip()
+    s = re.sub(r"[^a-zа-яё0-9]+", " ", s, flags=re.I)
+    tokens = [t for t in s.split() if t not in {"fc", "fk", "cf", "sc", "club", "football", "фк"}]
+    return " ".join(tokens)
+
+
+def _name_similarity(a: Any, b: Any) -> float:
+    a1, b1 = _norm_team_name(a), _norm_team_name(b)
+    if not a1 or not b1:
+        return 0.0
+    if a1 == b1:
+        return 1.0
+    sa, sb = set(a1.split()), set(b1.split())
+    overlap = len(sa & sb) / max(1, len(sa | sb))
+    contains = 0.9 if a1 in b1 or b1 in a1 else 0.0
+    return max(overlap, contains)
+
+
+def _match_similarity(live: Dict[str, Any], home: str, away: str) -> float:
+    direct = (_name_similarity(live.get("home"), home) + _name_similarity(live.get("away"), away)) / 2
+    swapped = (_name_similarity(live.get("home"), away) + _name_similarity(live.get("away"), home)) / 2
+    return max(direct, swapped * 0.72)
+
+
+def _metric_present(metrics: Dict[str, Any], key: str) -> bool:
+    return bool((metrics.get(key) or {}).get("present"))
+
+
+def _pair(metrics: Dict[str, Any], key: str) -> Tuple[float, float]:
+    m = metrics.get(key) or {}
+    return float(m.get("home") or 0), float(m.get("away") or 0)
+
+
+def _game_picture(metrics: Dict[str, Any], match: Dict[str, Any], pressure: Dict[str, Any]) -> Dict[str, Any]:
+    """Interpret the match, not just list statistics."""
+    score = match.get("score") or {}
+    h_score, a_score = int(score.get("home") or 0), int(score.get("away") or 0)
+    minute = int(match.get("minute") or 0)
+
+    h_attack = a_attack = 0.0
+    weights = {
+        "xg": 30.0,
+        "shots_on_target": 24.0,
+        "touches_in_box": 18.0,
+        "shots_in_box": 12.0,
+        "shots": 8.0,
+        "big_chances": 8.0,
+    }
+    for key, weight in weights.items():
+        if _metric_present(metrics, key):
+            h, a = _pair(metrics, key)
+            total = h + a
+            if total > 0:
+                h_attack += weight * h / total
+                a_attack += weight * a / total
+
+    h_attack += float(pressure.get("home") or 0) * 0.22
+    a_attack += float(pressure.get("away") or 0) * 0.22
+    diff = h_attack - a_attack
+
+    if diff >= 15:
+        closer = match.get("home")
+        control = "хозяева заметно ближе к голу"
+    elif diff <= -15:
+        closer = match.get("away")
+        control = "гости заметно ближе к голу"
+    elif diff >= 6:
+        closer = match.get("home")
+        control = "небольшой перевес хозяев"
+    elif diff <= -6:
+        closer = match.get("away")
+        control = "небольшой перевес гостей"
+    else:
+        closer = "неясно"
+        control = "игра достаточно равная"
+
+    xg = _pair(metrics, "xg") if _metric_present(metrics, "xg") else None
+    sot = _pair(metrics, "shots_on_target") if _metric_present(metrics, "shots_on_target") else None
+    score_story = "счёт примерно соответствует игре"
+    if xg:
+        expected_edge = xg[0] - xg[1]
+        actual_edge = h_score - a_score
+        if actual_edge <= -2 and expected_edge > -0.35:
+            score_story = "счёт выглядит жёстче, чем сама игра — хозяева создали больше, чем показывает табло"
+        elif actual_edge >= 2 and expected_edge < 0.35:
+            score_story = "счёт выглядит крупнее, чем преимущество по моментам"
+        elif h_score == a_score and abs(expected_edge) >= 0.55:
+            score_story = "равный счёт немного обманывает: по моментам есть заметный перевес"
+
+    intensity = _human_pressure(float(pressure.get("total") or 0))
+    if sot and sum(sot) >= 7 and minute <= 70:
+        rhythm = "матч живой: команды регулярно доводят атаки до створа"
+    elif _metric_present(metrics, "touches_in_box") and sum(_pair(metrics, "touches_in_box")) >= 24:
+        rhythm = "много игры идёт через штрафную — матч не выглядит закрытым"
+    elif float(pressure.get("total") or 0) >= 65:
+        rhythm = "давление высокое, голевой эпизод может появиться быстро"
+    else:
+        rhythm = "темп пока не даёт ощущения обязательного скорого гола"
+
+    return {
+        "closer_team": closer,
+        "control": control,
+        "score_story": score_story,
+        "rhythm": rhythm,
+        "intensity": intensity,
+        "home_attack_index": round1(h_attack),
+        "away_attack_index": round1(a_attack),
+    }
+
+
+def _market_family(option: str) -> str:
+    s = str(option or "").lower()
+    if "1-м тайме" in s:
+        return "FIRST_HALF"
+    if "2-м тайме" in s or "до конца" in s:
+        return "FULLTIME_GOAL"
+    if "оз" in s:
+        return "BTTS"
+    if "5 минут" in s:
+        return "NEXT_5"
+    if "10 минут" in s:
+        return "NEXT_10"
+    if "гол" in s:
+        return "GOAL"
+    return "OTHER"
+
+
+def _thinking_engine(view: Dict[str, Any], rep: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare options against each other, like our old live discussion."""
+    match = rep.get("match") or {}
+    metrics = rep.get("metrics") or {}
+    pressure = rep.get("pressure") or {}
+    phase = view.get("phase")
+    picture = _game_picture(metrics, match, pressure)
+
+    candidates = []
+    fh = view.get("FIRST_HALF")
+    sh = view.get("SECOND_HALF")
+    oz = view.get("BTTS")
+    ng = view.get("NEAREST_GOAL") or {}
+    if isinstance(fh, dict) and fh.get("probability") is not None:
+        candidates.append({"name": "гол в 1-м тайме", **fh})
+    if isinstance(sh, dict) and sh.get("probability") is not None:
+        candidates.append({"name": "ещё гол во 2-м тайме / до конца", **sh})
+    if isinstance(oz, dict) and oz.get("status") != "ALREADY_WON" and oz.get("probability") is not None:
+        candidates.append({"name": "ОЗ — Да", **oz})
+    if isinstance(ng.get("5_min"), dict):
+        candidates.append({"name": "гол в ближайшие 5 минут", **ng["5_min"]})
+    if isinstance(ng.get("10_min"), dict):
+        candidates.append({"name": "гол в ближайшие 10 минут", **ng["10_min"]})
+
+    # Penalize ultra-short windows unless pressure/sample really support them.
+    for c in candidates:
+        p = float(c.get("probability") or 0)
+        fam = _market_family(c["name"])
+        adjusted = p
+        if fam == "NEXT_5":
+            adjusted -= 6
+        elif fam == "NEXT_10":
+            adjusted -= 2
+        if phase == "HALF_TIME":
+            adjusted = -1
+        if int(match.get("minute") or 0) <= 12:
+            adjusted -= 5
+        c["_choice_score"] = round1(adjusted)
+
+    candidates.sort(key=lambda x: x.get("_choice_score", 0), reverse=True)
+    best = candidates[0] if candidates and candidates[0]["_choice_score"] >= VISIBLE_SIGNAL_MIN - 4 else None
+    alternative = candidates[1] if len(candidates) > 1 and candidates[1]["_choice_score"] >= VISIBLE_SIGNAL_MIN - 4 else None
+
+    rejected = []
+    for c in candidates[1:]:
+        fam = _market_family(c["name"])
+        if fam == "NEXT_5":
+            why = "слишком короткое окно: даже при хорошем давлении дисперсия выше"
+        elif best and abs(float(best.get("probability") or 0) - float(c.get("probability") or 0)) < 4:
+            why = "вариант близкий, но основной рынок лучше совпадает с общей картиной игры"
+        else:
+            why = "по совокупности цифр и рисунка игры основной вариант выглядит чище"
+        rejected.append({"option": c["name"], "probability": c.get("probability"), "why_not": why})
+
+    if phase == "HALF_TIME":
+        verdict = "WAIT"
+        action = "Перерыв: не подтверждаем live-вход вслепую. Смотрим первые 2–5 минут второго тайма."
+    elif best and float(best.get("probability") or 0) >= 75:
+        verdict = "ENTER_CANDIDATE"
+        action = f"Главный вариант — {best['name']} ({best['probability']}%). Перед входом сверяем, что давление не исчезло."
+    elif best:
+        verdict = "WATCH"
+        action = f"Сигнал есть, но пока наблюдаем: {best['name']} ({best['probability']}%). Нужен ещё один импульс."
+    else:
+        verdict = "PASS"
+        action = "Сильного варианта от 65% нет — не натягиваем."
+
+    return {
+        "what_i_see": [
+            picture["control"],
+            picture["score_story"],
+            picture["rhythm"],
+        ],
+        "who_is_closer": picture["closer_team"],
+        "game_picture": picture,
+        "best_option": None if not best else {
+            "market": best["name"],
+            "probability": best.get("probability"),
+            "risk": best.get("risk"),
+            "reason": "лучше всего совпадает с текущей статистикой, фазой матча и направлением давления",
+        },
+        "alternative": None if not alternative else {
+            "market": alternative["name"],
+            "probability": alternative.get("probability"),
+        },
+        "why_not_others": rejected[:4],
+        "verdict": verdict,
+        "our_action": action,
+        "next_confirmation": (
+            "Рост xG, ещё 1–2 удара/створа, новые касания в штрафной или сохранение давления."
+            if phase != "HALF_TIME"
+            else "После старта 2Т ждём 2–5 минут свежей картины: створ, xG, штрафная, темп."
+        ),
+        "warning": "Это эвристический live-разбор, а не гарантированная или калиброванная вероятность.",
+    }
+
+
+def _screenshot_metrics(
+    xg_home=None, xg_away=None, shots_home=None, shots_away=None,
+    sot_home=None, sot_away=None, box_home=None, box_away=None,
+    corners_home=None, corners_away=None, possession_home=None, possession_away=None,
+    dangerous_home=None, dangerous_away=None, big_home=None, big_away=None,
+) -> Dict[str, Any]:
+    def metric(h, a):
+        hp, ap = safe_float(h), safe_float(a)
+        return {
+            "home": hp, "away": ap,
+            "total": (hp + ap) if hp is not None and ap is not None else None,
+            "present": hp is not None and ap is not None,
+        }
+    return {
+        "xg": metric(xg_home, xg_away),
+        "shots": metric(shots_home, shots_away),
+        "shots_on_target": metric(sot_home, sot_away),
+        "touches_in_box": metric(box_home, box_away),
+        "shots_in_box": metric(None, None),
+        "corners": metric(corners_home, corners_away),
+        "possession": metric(possession_home, possession_away),
+        "xa": metric(None, None),
+        "fouls": metric(None, None),
+        "big_chances": metric(big_home, big_away),
+        "dangerous_attacks": metric(dangerous_home, dangerous_away),
+        "red_cards": metric(0, 0),
+    }
+
+
+def _quick_screenshot_report(live: Dict[str, Any], metrics: Dict[str, Any], source_note: str) -> Dict[str, Any]:
+    q = quality_guard(metrics)
+    pressure = pressure_score(metrics, int(live.get("minute") or 0))
+    signals = build_signals(live, metrics, q, pressure, {"available": False})
+    nearest = nearest_goal_assessment(signals, live, q, pressure)
+    rep = {
+        "status": "OK",
+        "match_id": live.get("match_id"),
+        "match": live,
+        "metrics": metrics,
+        "pressure": pressure,
+        "data_quality": q,
+        "all_signals": signals,
+        "nearest_goal": nearest,
+    }
+    view = structured_market_report(rep)
+    view["OUR_ANALYSIS_ENGINE"] = _thinking_engine(view, rep)
+    view["source_note"] = source_note
+    return view
 
 
 # -------------------------
@@ -2316,7 +2603,7 @@ def structured_market_report(rep: Dict[str, Any]) -> Dict[str, Any]:
     else:
         decision = "⛔ Сигналов от 65% сейчас нет. Ждём."
 
-    return {
+    result = {
         "match": f"{match.get('home')} — {match.get('away')}",
         "minute": match.get("minute"),
         "score": match.get("score"),
@@ -2337,6 +2624,8 @@ def structured_market_report(rep: Dict[str, Any]) -> Dict[str, Any]:
         "visible_signal_min": VISIBLE_SIGNAL_MIN,
         "has_visible_signal": bool(options),
     }
+    result["OUR_ANALYSIS_ENGINE"] = _thinking_engine(result, rep)
+    return result
 
 
 async def _final_refresh_for_report(rep: Dict[str, Any]) -> Dict[str, Any]:
@@ -2366,7 +2655,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
     freshness = rep.get("final_freshness") or {}
     if not freshness.get("ok"):
         return {
-            "source": "hidden-signal-v4.6",
+            "source": "hidden-signal-v5",
             "version": VERSION,
             "blocked": True,
             "reason": freshness.get("reason"),
@@ -2374,7 +2663,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
             "final_freshness": freshness,
         }
     return {
-        "source": "hidden-signal-v4.6",
+        "source": "hidden-signal-v5",
         "version": VERSION,
         "report": structured_market_report(rep),
         "technical": {
@@ -2388,7 +2677,7 @@ async def structured_live_report(match_id: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
-    """Main V4.6 scan: only 65-99% candidates, clearly split by market."""
+    """Main V4.7 structured scan: only 65-99% candidates, clearly split by market."""
     client = ZylaClient()
     try:
         live_r = await client.live()
@@ -2498,7 +2787,7 @@ async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
 
     total = sum(len(v) for v in sections.values())
     return {
-        "source": "hidden-signal-v4.6",
+        "source": "hidden-signal-v5",
         "version": VERSION,
         "model_type": MODEL_TYPE,
         "live_matches_found": len(matches),
@@ -2522,6 +2811,708 @@ async def scan_structured_live(limit: int = 10) -> Dict[str, Any]:
             "outcome_discussion": True,
             "final_freshness_required": True,
         },
+    }
+
+
+
+@mcp.tool()
+async def analyze_screenshot_quick(
+    home: str,
+    away: str,
+    minute: int,
+    score_home: int,
+    score_away: int,
+    xg_home: Optional[float] = None,
+    xg_away: Optional[float] = None,
+    shots_home: Optional[float] = None,
+    shots_away: Optional[float] = None,
+    sot_home: Optional[float] = None,
+    sot_away: Optional[float] = None,
+    box_home: Optional[float] = None,
+    box_away: Optional[float] = None,
+    corners_home: Optional[float] = None,
+    corners_away: Optional[float] = None,
+    possession_home: Optional[float] = None,
+    possession_away: Optional[float] = None,
+    dangerous_home: Optional[float] = None,
+    dangerous_away: Optional[float] = None,
+    big_home: Optional[float] = None,
+    big_away: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Fast screenshot bridge.
+    ChatGPT reads the screenshot, sends visible numbers here, and V4.7 immediately
+    cross-checks the match against the current live list. Provider score/minute win
+    when a confident live match is found; screenshot stats fill the fast model.
+    """
+    started = time.time()
+    client = ZylaClient()
+    try:
+        live_r = await client.live()
+        matches = flatten_live(live_r.get("data"))
+    finally:
+        await client.close()
+
+    best_match = None
+    best_similarity = 0.0
+    for m in matches:
+        sim = _match_similarity(m, home, away)
+        if sim > best_similarity:
+            best_similarity, best_match = sim, m
+
+    screenshot_score = score_obj(score_home, score_away)
+    mismatch = []
+    if best_match and best_similarity >= 0.58:
+        live = dict(best_match)
+        if live.get("score") != screenshot_score:
+            mismatch.append({
+                "type": "score",
+                "screenshot": screenshot_score,
+                "live": live.get("score"),
+            })
+        if abs(int(live.get("minute") or 0) - int(minute or 0)) > 4:
+            mismatch.append({
+                "type": "minute",
+                "screenshot": minute,
+                "live": live.get("minute"),
+            })
+        source_note = "Скрин сопоставлен со свежим live. Счёт/минута провайдера используются как контроль свежести."
+    else:
+        live = {
+            "match_id": None,
+            "home": home,
+            "away": away,
+            "minute": max(0, min(int(minute or 0), 130)),
+            "minute_valid": 0 <= int(minute or 0) <= 130,
+            "stage": "Screenshot",
+            "score": screenshot_score,
+            "red_cards": {"home": 0, "away": 0},
+            "live_odds_1x2": {},
+        }
+        source_note = "Live-сопоставление не найдено уверенно. Быстрый разбор сделан только по данным со скрина."
+
+    metrics = _screenshot_metrics(
+        xg_home, xg_away, shots_home, shots_away,
+        sot_home, sot_away, box_home, box_away,
+        corners_home, corners_away, possession_home, possession_away,
+        dangerous_home, dangerous_away, big_home, big_away,
+    )
+    report = _quick_screenshot_report(live, metrics, source_note)
+    return {
+        "source": "hidden-signal-v5-screenshot",
+        "version": VERSION,
+        "latency_ms": int((time.time() - started) * 1000),
+        "live_match_found": bool(best_match and best_similarity >= 0.58),
+        "match_similarity": round1(best_similarity * 100),
+        "freshness_mismatch": mismatch,
+        "report": report,
+        "answer_style": {
+            "fast": True,
+            "human_reasoning_first": True,
+            "show_65_99_only": True,
+            "compare_markets": True,
+            "do_not_force_signal": True,
+        },
+    }
+
+
+@mcp.tool()
+async def scan_thinking_live(limit: int = 12, concurrency: int = 2) -> Dict[str, Any]:
+    """
+    Improved V4.7 live collector.
+    One live snapshot -> cheap prefilter -> limited concurrent deep analyses ->
+    one final freshness snapshot -> human reasoning for every surviving candidate.
+    """
+    started = time.time()
+    client = ZylaClient()
+    try:
+        live_r = await client.live()
+        matches = flatten_live(live_r.get("data"))
+    finally:
+        await client.close()
+
+    valid = []
+    for m in matches:
+        if not m.get("minute_valid", True):
+            continue
+        stage = str(m.get("stage") or "").lower()
+        if any(x in stage for x in ("finished", "cancelled", "postponed", "not started")):
+            continue
+        valid.append(m)
+
+    # Broader phase-aware prefilter: preserve 1H and 2H opportunities.
+    first_half = sorted([m for m in valid if int(m.get("minute") or 0) <= 45], key=cheap_rank, reverse=True)
+    second_half = sorted([m for m in valid if int(m.get("minute") or 0) > 45], key=cheap_rank, reverse=True)
+    target_n = max(1, min(int(limit), 14))
+    selected = []
+    while len(selected) < target_n and (first_half or second_half):
+        if first_half:
+            selected.append(first_half.pop(0))
+            if len(selected) >= target_n:
+                break
+        if second_half:
+            selected.append(second_half.pop(0))
+
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
+    async def run_one(m):
+        async with sem:
+            try:
+                return await analyze_match_internal(str(m["match_id"]), exact_live=m)
+            except Exception as e:
+                return {"status": "ERROR", "match_id": m.get("match_id"), "error": repr(e)}
+
+    reports = await asyncio.gather(*(run_one(m) for m in selected))
+
+    final_client = ZylaClient()
+    try:
+        final_r = await final_client.live()
+        final_matches = flatten_live(final_r.get("data"))
+    finally:
+        await final_client.close()
+    final_map = {str(m.get("match_id")): m for m in final_matches if m.get("match_id")}
+
+    candidates = []
+    blocked = []
+    parser_failures = 0
+    quality_blocked = 0
+
+    for rep in reports:
+        if rep.get("status") != "OK":
+            parser_failures += 1
+            continue
+        freshness = final_freshness_check(rep.get("match") or {}, final_map.get(str(rep.get("match_id") or "")))
+        if not freshness.get("ok"):
+            blocked.append({"match_id": rep.get("match_id"), "reason": freshness.get("reason")})
+            continue
+        q = rep.get("data_quality") or {}
+        if not q.get("basic_ok"):
+            quality_blocked += 1
+            continue
+
+        view = structured_market_report(rep)
+        thinking = view.get("OUR_ANALYSIS_ENGINE") or {}
+        best = thinking.get("best_option")
+        if best and float(best.get("probability") or 0) >= VISIBLE_SIGNAL_MIN:
+            candidates.append({
+                "match_id": rep.get("match_id"),
+                "match": view.get("match"),
+                "minute": view.get("minute"),
+                "score": view.get("score"),
+                "FIRST_HALF": view.get("FIRST_HALF"),
+                "SECOND_HALF": view.get("SECOND_HALF"),
+                "BTTS": view.get("BTTS"),
+                "NEAREST_GOAL": view.get("NEAREST_GOAL"),
+                "OUTCOMES_1X2": view.get("OUTCOMES_1X2"),
+                "OUR_REASONING": view.get("OUR_REASONING"),
+                "OUR_ANALYSIS_ENGINE": thinking,
+            })
+
+    candidates.sort(
+        key=lambda x: float(((x.get("OUR_ANALYSIS_ENGINE") or {}).get("best_option") or {}).get("probability") or 0),
+        reverse=True,
+    )
+
+    return {
+        "source": "hidden-signal-v5",
+        "version": VERSION,
+        "live_snapshot_at": now_iso(),
+        "live_matches_found": len(matches),
+        "selected_for_deep_analysis": len(selected),
+        "surviving_candidates": len(candidates),
+        "latency_ms": int((time.time() - started) * 1000),
+        "candidates": candidates,
+        "freshness_blocked": blocked,
+        "parser_failures": parser_failures,
+        "quality_blocked": quality_blocked,
+        "message": "Сильных вариантов от 65% сейчас нет — пропускаем." if not candidates else "Есть кандидаты. Сначала читаем OUR_ANALYSIS_ENGINE, а не просто самый высокий процент.",
+    }
+
+
+
+# -------------------------
+# V5.0 Goal Hunter — restore the original "goal after goal" workflow
+# -------------------------
+
+def _goal_market_priority(name: str) -> int:
+    s = str(name or "").lower()
+    if "1-м тайме" in s:
+        return 100
+    if "до конца" in s or "ещё гол" in s:
+        return 92
+    if "10 минут" in s:
+        return 88
+    if "5 минут" in s:
+        return 84
+    if "оз" in s:
+        return 78
+    if "команды" in s or "забь" in s:
+        return 74
+    return 50
+
+
+def _classic_goal_options(rep: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Build a human goal-board from all available goal-related markets."""
+    q = rep.get("data_quality") or {}
+    signals = rep.get("all_signals") or []
+    minute = int((rep.get("match") or {}).get("minute") or 0)
+    stage = str((rep.get("match") or {}).get("stage") or "").lower()
+    half_time = "half time" in stage or "halftime" in stage
+
+    out = []
+    seen = set()
+    for s in signals:
+        market = str(s.get("market") or "")
+        if market not in {
+            "GOAL_BEFORE_FULLTIME", "GOAL_BEFORE_HALFTIME",
+            "GOAL_NEXT_5", "GOAL_NEXT_10", "TEAM_GOAL", "BTTS", "OVER_UNDER"
+        }:
+            continue
+
+        selection = str(s.get("selection") or "")
+        # Keep only OVER side from O/U in the goal-hunter board.
+        if market == "OVER_UNDER" and not selection.lower().startswith("over"):
+            continue
+
+        p = _effective_probability(s)
+        if p < VISIBLE_SIGNAL_MIN:
+            continue
+        if s.get("data_quality_blocked"):
+            continue
+
+        if market == "GOAL_BEFORE_HALFTIME":
+            title = "Гол в 1-м тайме"
+        elif market == "GOAL_BEFORE_FULLTIME":
+            title = "Ещё минимум 1 гол до конца"
+        elif market == "GOAL_NEXT_5":
+            title = "Гол в ближайшие 5 минут"
+        elif market == "GOAL_NEXT_10":
+            title = "Гол в ближайшие 10 минут"
+        elif market == "BTTS":
+            title = "ОЗ — Да"
+        elif market == "TEAM_GOAL":
+            title = selection
+        else:
+            title = selection
+
+        key = (market, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        band = _signal_band(p)
+
+        decision = "ENTER" if p >= 75 and q.get("strong_eligible") else ("WATCH" if p >= 65 else "PASS")
+        if half_time and market in {"GOAL_NEXT_5", "GOAL_NEXT_10"}:
+            decision = "WAIT"
+
+        out.append({
+            "market": market,
+            "title": title,
+            "probability": p,
+            "safe": s.get("safe_probability"),
+            "live": s.get("live_probability"),
+            "emoji": band["emoji"],
+            "strength": band["label"],
+            "risk": "средний" if p >= 75 else ("повышенный" if p >= 70 else "высокий"),
+            "decision": decision,
+            "priority": _goal_market_priority(title),
+        })
+
+    out.sort(key=lambda x: (x["probability"], x["priority"]), reverse=True)
+    return out
+
+
+def _old_style_reasoning(rep: Dict[str, Any], board: List[Dict[str, Any]]) -> Dict[str, Any]:
+    match = rep.get("match") or {}
+    metrics = rep.get("metrics") or {}
+    pressure = rep.get("pressure") or {}
+    picture = _game_picture(metrics, match, pressure)
+    score = match.get("score") or {}
+    minute = int(match.get("minute") or 0)
+
+    facts = []
+    for key, label, integer in [
+        ("xg", "xG", False),
+        ("shots", "удары", True),
+        ("shots_on_target", "в створ", True),
+        ("touches_in_box", "касания в штрафной", True),
+        ("shots_in_box", "удары из штрафной", True),
+        ("big_chances", "большие моменты", True),
+        ("corners", "угловые", True),
+    ]:
+        pair = _metric_pair(metrics, key)
+        if pair:
+            a, b = pair
+            facts.append(f"{label} {int(a)}–{int(b)}" if integer else f"{label} {round1(a)}–{round1(b)}")
+
+    best = board[0] if board else None
+    backup = board[1] if len(board) > 1 else None
+
+    reasons_for = []
+    reasons_against = []
+
+    if float(pressure.get("total") or 0) >= 60:
+        reasons_for.append("давление высокое")
+    if _metric_present(metrics, "shots_on_target") and sum(_pair(metrics, "shots_on_target")) >= 4:
+        reasons_for.append("матч даёт реальные удары в створ")
+    if _metric_present(metrics, "xg") and sum(_pair(metrics, "xg")) >= 0.9:
+        reasons_for.append("xG подтверждает голевые моменты")
+    if _metric_present(metrics, "touches_in_box") and sum(_pair(metrics, "touches_in_box")) >= 14:
+        reasons_for.append("команды регулярно доходят до штрафной")
+
+    if minute <= 12:
+        reasons_against.append("ранняя минута — выборка ещё маленькая")
+    if float(pressure.get("total") or 0) < 40:
+        reasons_against.append("темп пока недостаточный")
+    stage = str(match.get("stage") or "").lower()
+    if "half time" in stage or "halftime" in stage:
+        reasons_against.append("перерыв — следующий live-импульс ещё не подтверждён")
+    if not reasons_against:
+        reasons_against.append("главный риск — резкое падение темпа или закрытие игры")
+
+    if best:
+        if best["decision"] == "ENTER":
+            voice = f"Мне нравится {best['title']}: {best['probability']}%. По игре это сейчас самый чистый вариант."
+        elif best["decision"] in {"WATCH", "WAIT"}:
+            voice = f"Сигнал есть по {best['title']} ({best['probability']}%), но сейчас я бы дождался подтверждения."
+        else:
+            voice = "Сигнал не дотягивает — не натягиваем."
+    else:
+        voice = "Сейчас голевой рынок не даёт честных 65% — пропускаем."
+
+    return {
+        "what_i_see": [
+            picture.get("control"),
+            picture.get("score_story"),
+            picture.get("rhythm"),
+        ],
+        "facts": facts[:7],
+        "who_is_closer": picture.get("closer_team"),
+        "our_voice": voice,
+        "best": best,
+        "backup": backup,
+        "for_signal": reasons_for[:4],
+        "against_signal": reasons_against[:3],
+        "what_confirms": "Ещё один створ/опасный момент, рост xG или серия заходов в штрафную.",
+        "what_breaks": "Падение темпа, длинная пауза, удаление, тактическое закрытие матча или свежий гол до входа.",
+    }
+
+
+def _goal_hunter_view(rep: Dict[str, Any]) -> Dict[str, Any]:
+    board = _classic_goal_options(rep)
+    reasoning = _old_style_reasoning(rep, board)
+    match = rep.get("match") or {}
+    score = match.get("score") or {}
+
+    # Special handling: if BTTS is actually "one remaining team must score", explain it.
+    for item in board:
+        if item["market"] == "BTTS":
+            if int(score.get("home") or 0) == 0 and int(score.get("away") or 0) > 0:
+                item["meaning_now"] = f"Для ОЗ нужен гол {match.get('home')}"
+            elif int(score.get("away") or 0) == 0 and int(score.get("home") or 0) > 0:
+                item["meaning_now"] = f"Для ОЗ нужен гол {match.get('away')}"
+
+    return {
+        "match": f"{match.get('home')} — {match.get('away')}",
+        "minute": match.get("minute"),
+        "score": score,
+        "stage": match.get("stage"),
+        "goal_board_65_99": board,
+        "OUR_THINKING": reasoning,
+        "OUTCOMES_1X2": _outcome_estimate(match, rep.get("pressure") or {}),
+        "final_decision": (
+            "PASS — не натягиваем."
+            if not board else
+            f"{board[0]['decision']} — {board[0]['title']} — {board[0]['probability']}%"
+        ),
+    }
+
+
+@mcp.tool()
+async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, Any]:
+    """
+    Main V5 scanner. Restores the original workflow:
+    find where a goal is brewing -> compare all goal markets -> explain who is closer ->
+    return only 65-99% candidates -> final live freshness check.
+    """
+    started = time.time()
+    client = ZylaClient()
+    try:
+        live_r = await client.live()
+        matches = flatten_live(live_r.get("data"))
+    finally:
+        await client.close()
+
+    valid = []
+    invalid_minute = 0
+    for m in matches:
+        if not m.get("minute_valid", True):
+            invalid_minute += 1
+            continue
+        stage = str(m.get("stage") or "").lower()
+        if any(x in stage for x in ("finished", "cancelled", "postponed", "not started")):
+            continue
+        valid.append(m)
+
+    # Balance 1H/2H so we do not miss first-half goals.
+    first = sorted([m for m in valid if int(m.get("minute") or 0) <= 45], key=cheap_rank, reverse=True)
+    second = sorted([m for m in valid if int(m.get("minute") or 0) > 45], key=cheap_rank, reverse=True)
+    n = max(1, min(int(limit), 20))
+    chosen = []
+    while len(chosen) < n and (first or second):
+        if first:
+            chosen.append(first.pop(0))
+            if len(chosen) >= n:
+                break
+        if second:
+            chosen.append(second.pop(0))
+
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
+
+    async def analyze_one(m):
+        async with sem:
+            try:
+                return await analyze_match_internal(str(m["match_id"]), exact_live=m)
+            except Exception as e:
+                return {"status": "ERROR", "match_id": m.get("match_id"), "error": repr(e)}
+
+    deep_reports = await asyncio.gather(*(analyze_one(m) for m in chosen))
+
+    # One final snapshot after all deep analysis: anti-stale / anti-goal-race guard.
+    final_client = ZylaClient()
+    try:
+        final_r = await final_client.live()
+        final_matches = flatten_live(final_r.get("data"))
+    finally:
+        await final_client.close()
+    final_map = {str(m.get("match_id")): m for m in final_matches if m.get("match_id")}
+
+    candidates = []
+    parser_failures = []
+    quality_blocked = []
+    stale_blocked = []
+
+    for rep in deep_reports:
+        if rep.get("status") != "OK":
+            parser_failures.append({
+                "match_id": rep.get("match_id"),
+                "error": rep.get("error") or rep.get("status")
+            })
+            continue
+
+        freshness = final_freshness_check(
+            rep.get("match") or {},
+            final_map.get(str(rep.get("match_id") or ""))
+        )
+        if not freshness.get("ok"):
+            stale_blocked.append({
+                "match_id": rep.get("match_id"),
+                "match": f"{(rep.get('match') or {}).get('home')} — {(rep.get('match') or {}).get('away')}",
+                "reason": freshness.get("reason"),
+            })
+            continue
+
+        q = rep.get("data_quality") or {}
+        if not q.get("basic_ok"):
+            quality_blocked.append({
+                "match_id": rep.get("match_id"),
+                "match": f"{(rep.get('match') or {}).get('home')} — {(rep.get('match') or {}).get('away')}",
+                "data_quality": q.get("score"),
+                "missing": q.get("missing"),
+            })
+            continue
+
+        view = _goal_hunter_view(rep)
+        board = view.get("goal_board_65_99") or []
+        if not board:
+            continue
+
+        # Suppress exact repeats unless probability/decision changed.
+        best = board[0]
+        pseudo = {
+            "market": best.get("market"),
+            "selection": best.get("title"),
+            "probability": best.get("probability"),
+            "decision": best.get("decision"),
+        }
+        fresh_signal = is_new_or_changed(str(rep.get("match_id")), pseudo)
+        view["new_or_changed"] = fresh_signal
+        candidates.append({
+            "match_id": rep.get("match_id"),
+            **view,
+        })
+
+        log_event({
+            "event": "goal_hunter_candidate",
+            "match_id": rep.get("match_id"),
+            "match": view.get("match"),
+            "minute": view.get("minute"),
+            "score": view.get("score"),
+            "best": best,
+        })
+
+    candidates.sort(
+        key=lambda x: float(((x.get("goal_board_65_99") or [{}])[0]).get("probability") or 0),
+        reverse=True
+    )
+
+    first_half = [c for c in candidates if int(c.get("minute") or 0) <= 45]
+    second_half = [c for c in candidates if int(c.get("minute") or 0) > 45]
+    enter = [
+        c for c in candidates
+        if (c.get("goal_board_65_99") or [{}])[0].get("decision") == "ENTER"
+    ]
+
+    return {
+        "source": "hidden-signal-v5-goal-hunter",
+        "version": VERSION,
+        "live_snapshot_at": now_iso(),
+        "live_matches_found": len(matches),
+        "selected_for_deep_analysis": len(chosen),
+        "invalid_minute": invalid_minute,
+        "parser_failures": parser_failures,
+        "quality_blocked": quality_blocked,
+        "stale_blocked": stale_blocked,
+        "FIRST_HALF": first_half,
+        "SECOND_HALF": second_half,
+        "ENTER_NOW": enter,
+        "ALL_65_99": candidates,
+        "message": (
+            "Сигналов 65-99% сейчас нет — пропускаем."
+            if not candidates else
+            "Нашёл голевые кандидаты. Смотри OUR_THINKING и лучший рынок, а не только цифру."
+        ),
+        "latency_ms": int((time.time() - started) * 1000),
+        "mode": "OLD_STYLE_PLUS_STRONG_PROGRAM",
+    }
+
+
+@mcp.tool()
+async def analyze_goal_hunter_match(match_id: str) -> Dict[str, Any]:
+    """Deep one-match version of the original goal-hunter workflow."""
+    rep = await reactor_match_report(match_id)
+    rep = await _final_refresh_for_report(rep)
+    if rep.get("status") != "OK":
+        return rep
+    freshness = rep.get("final_freshness") or {}
+    if not freshness.get("ok"):
+        return {
+            "source": "hidden-signal-v5",
+            "version": VERSION,
+            "blocked": True,
+            "reason": freshness.get("reason"),
+            "message": "Сигнал скрыт: live уже изменился.",
+        }
+    return {
+        "source": "hidden-signal-v5",
+        "version": VERSION,
+        "report": _goal_hunter_view(rep),
+        "technical": {
+            "parser_ok": rep.get("parser_ok"),
+            "score_sync": rep.get("score_sync"),
+            "data_quality": rep.get("data_quality"),
+            "final_freshness": freshness,
+        }
+    }
+
+
+@mcp.tool()
+async def quick_screenshot_goal_hunter(
+    home: str,
+    away: str,
+    minute: int,
+    score_home: int,
+    score_away: int,
+    xg_home: Optional[float] = None,
+    xg_away: Optional[float] = None,
+    shots_home: Optional[float] = None,
+    shots_away: Optional[float] = None,
+    sot_home: Optional[float] = None,
+    sot_away: Optional[float] = None,
+    box_home: Optional[float] = None,
+    box_away: Optional[float] = None,
+    corners_home: Optional[float] = None,
+    corners_away: Optional[float] = None,
+    possession_home: Optional[float] = None,
+    possession_away: Optional[float] = None,
+    dangerous_home: Optional[float] = None,
+    dangerous_away: Optional[float] = None,
+    big_home: Optional[float] = None,
+    big_away: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Fast screenshot mode for ChatGPT vision:
+    visible screenshot numbers -> current live cross-check -> same V5 Goal Hunter logic.
+    """
+    started = time.time()
+    client = ZylaClient()
+    try:
+        live_r = await client.live()
+        matches = flatten_live(live_r.get("data"))
+    finally:
+        await client.close()
+
+    best_match = None
+    best_similarity = 0.0
+    for m in matches:
+        sim = _match_similarity(m, home, away)
+        if sim > best_similarity:
+            best_similarity, best_match = sim, m
+
+    screenshot_score = score_obj(score_home, score_away)
+    mismatch = []
+
+    if best_match and best_similarity >= 0.58:
+        live = dict(best_match)
+        if live.get("score") != screenshot_score:
+            mismatch.append({"type": "score", "screenshot": screenshot_score, "live": live.get("score")})
+        if abs(int(live.get("minute") or 0) - int(minute or 0)) > 4:
+            mismatch.append({"type": "minute", "screenshot": minute, "live": live.get("minute")})
+        source_note = "Скрин найден в свежем live: счёт и минута перепроверены."
+    else:
+        live = {
+            "match_id": None,
+            "home": home,
+            "away": away,
+            "minute": max(0, min(int(minute or 0), 130)),
+            "minute_valid": 0 <= int(minute or 0) <= 130,
+            "stage": "Screenshot",
+            "score": screenshot_score,
+            "red_cards": {"home": 0, "away": 0},
+            "live_odds_1x2": {},
+        }
+        source_note = "Уверенное live-сопоставление не найдено: считаю по самому скрину."
+
+    metrics = _screenshot_metrics(
+        xg_home, xg_away, shots_home, shots_away,
+        sot_home, sot_away, box_home, box_away,
+        corners_home, corners_away, possession_home, possession_away,
+        dangerous_home, dangerous_away, big_home, big_away,
+    )
+
+    q = quality_guard(metrics)
+    pressure = pressure_score(metrics, int(live.get("minute") or 0))
+    signals = build_signals(live, metrics, q, pressure, {"available": False})
+    nearest = nearest_goal_assessment(signals, live, q, pressure)
+    rep = {
+        "status": "OK",
+        "match_id": live.get("match_id"),
+        "match": live,
+        "metrics": metrics,
+        "pressure": pressure,
+        "data_quality": q,
+        "all_signals": signals,
+        "nearest_goal": nearest,
+    }
+
+    return {
+        "source": "hidden-signal-v5-screenshot",
+        "version": VERSION,
+        "live_match_found": bool(best_match and best_similarity >= 0.58),
+        "match_similarity": round1(best_similarity * 100),
+        "freshness_mismatch": mismatch,
+        "source_note": source_note,
+        "report": _goal_hunter_view(rep),
+        "latency_ms": int((time.time() - started) * 1000),
     }
 
 
