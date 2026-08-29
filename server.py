@@ -1,6 +1,7 @@
 
 import os
 import json
+import hashlib
 import math
 import re
 import time
@@ -14,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.2-RATE-LIMIT-GUARD"
-MODEL_TYPE = "heuristic-v5.7.2-rate-limit-guard-not-calibrated"
+VERSION = "V5.7.3-QUOTA-GUARD"
+MODEL_TYPE = "heuristic-v5.7.3-quota-guard-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -290,6 +291,101 @@ def final_freshness_check(
 # Zyla client
 # -------------------------
 
+
+# ===== V5.7.3 QUOTA GUARD =====
+PROVIDER_CACHE_TTL = float(os.environ.get("PROVIDER_CACHE_TTL", "15"))
+PROVIDER_LIVE_CACHE_TTL = float(os.environ.get("PROVIDER_LIVE_CACHE_TTL", "8"))
+PROVIDER_MIN_GAP = float(os.environ.get("PROVIDER_MIN_GAP", "0.45"))
+PROVIDER_MAX_CALLS_PER_MINUTE = int(os.environ.get("PROVIDER_MAX_CALLS_PER_MINUTE", "24"))
+PROVIDER_MAX_CALLS_PER_SCAN = int(os.environ.get("PROVIDER_MAX_CALLS_PER_SCAN", "14"))
+
+_PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
+_PROVIDER_CALL_TIMES: List[float] = []
+_PROVIDER_LAST_CALL_AT = 0.0
+_PROVIDER_LOCK = asyncio.Lock()
+_SCAN_BUDGET = {"active": False, "used": 0, "limit": PROVIDER_MAX_CALLS_PER_SCAN}
+
+def _v573_cache_key(name: str, params: Optional[Dict[str, Any]]) -> str:
+    raw = json.dumps({"name": name, "params": params or {}}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+def _v573_cache_get(name: str, params: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    key = _v573_cache_key(name, params)
+    row = _PROVIDER_CACHE.get(key)
+    if not row:
+        return None
+    ttl = PROVIDER_LIVE_CACHE_TTL if name == "live" else PROVIDER_CACHE_TTL
+    age = _v572_epoch() - float(row.get("at") or 0)
+    if age > ttl:
+        _PROVIDER_CACHE.pop(key, None)
+        return None
+    data = dict(row.get("response") or {})
+    data["cache_hit"] = True
+    data["cache_age_seconds"] = round(age, 2)
+    return data
+
+def _v573_cache_put(name: str, params: Optional[Dict[str, Any]], response: Dict[str, Any]) -> None:
+    if not response.get("ok"):
+        return
+    key = _v573_cache_key(name, params)
+    clean = dict(response)
+    clean["cache_hit"] = False
+    _PROVIDER_CACHE[key] = {"at": _v572_epoch(), "response": clean}
+    if len(_PROVIDER_CACHE) > 300:
+        oldest = sorted(_PROVIDER_CACHE.items(), key=lambda kv: kv[1].get("at", 0))[:80]
+        for k, _ in oldest:
+            _PROVIDER_CACHE.pop(k, None)
+
+def _v573_trim_calls(now: float) -> None:
+    global _PROVIDER_CALL_TIMES
+    _PROVIDER_CALL_TIMES = [t for t in _PROVIDER_CALL_TIMES if now - t < 60.0]
+
+def _v573_scan_budget_start() -> None:
+    _SCAN_BUDGET["active"] = True
+    _SCAN_BUDGET["used"] = 0
+    _SCAN_BUDGET["limit"] = PROVIDER_MAX_CALLS_PER_SCAN
+
+def _v573_scan_budget_status() -> Dict[str, Any]:
+    used = int(_SCAN_BUDGET.get("used") or 0)
+    limit = int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN)
+    return {"active": bool(_SCAN_BUDGET.get("active")), "used": used, "limit": limit, "remaining": max(0, limit-used)}
+
+async def _v573_provider_gate(name: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    global _PROVIDER_LAST_CALL_AT
+
+    rs = _v572_rate_status()
+    if rs.get("active"):
+        return {"allowed": False, "reason": "RATE_LIMIT_COOLDOWN", "rate_limit": rs}
+
+    if _SCAN_BUDGET.get("active") and int(_SCAN_BUDGET.get("used") or 0) >= int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN):
+        return {"allowed": False, "reason": "SCAN_API_BUDGET_EXHAUSTED", "budget": _v573_scan_budget_status()}
+
+    async with _PROVIDER_LOCK:
+        now = _v572_epoch()
+        _v573_trim_calls(now)
+
+        if len(_PROVIDER_CALL_TIMES) >= PROVIDER_MAX_CALLS_PER_MINUTE:
+            wait = max(1.0, 60.0 - (now - min(_PROVIDER_CALL_TIMES)))
+            return {
+                "allowed": False,
+                "reason": "LOCAL_RATE_LIMIT",
+                "retry_after": round(wait, 1),
+                "calls_last_60s": len(_PROVIDER_CALL_TIMES),
+                "limit_per_minute": PROVIDER_MAX_CALLS_PER_MINUTE,
+            }
+
+        gap = now - _PROVIDER_LAST_CALL_AT
+        if gap < PROVIDER_MIN_GAP:
+            await asyncio.sleep(PROVIDER_MIN_GAP - gap)
+            now = _v572_epoch()
+
+        _PROVIDER_LAST_CALL_AT = now
+        _PROVIDER_CALL_TIMES.append(now)
+        if _SCAN_BUDGET.get("active"):
+            _SCAN_BUDGET["used"] = int(_SCAN_BUDGET.get("used") or 0) + 1
+
+        return {"allowed": True, "budget": _v573_scan_budget_status()}
+
 class ZylaClient:
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(timeout=18.0, headers=headers())
@@ -300,6 +396,10 @@ class ZylaClient:
     async def get(self, name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not ZYLA_API_KEY:
             return {"ok": False, "status": 0, "data": None, "error": "ZYLA_API_KEY missing"}
+
+        cached = _v573_cache_get(name, params)
+        if cached is not None:
+            return cached
 
         # V5.7.2 shared quota protection. The live guard itself is allowed
         # to make the recovery probe; deep endpoints are blocked in cooldown.
@@ -315,6 +415,18 @@ class ZylaClient:
                     "error": "RATE_LIMIT_COOLDOWN",
                     "rate_limit": rs,
                 }
+        gate = await _v573_provider_gate(name, params)
+        if not gate.get("allowed"):
+            return {
+                "ok": False,
+                "status": 429 if gate.get("reason") in {"RATE_LIMIT_COOLDOWN", "LOCAL_RATE_LIMIT"} else 0,
+                "data": None,
+                "headers": {},
+                "retry_after": gate.get("retry_after"),
+                "error": gate.get("reason"),
+                "quota_guard": gate,
+            }
+
         try:
             r = await self.client.get(endpoint_url(name), params=params or {})
             data: Any
@@ -326,7 +438,7 @@ class ZylaClient:
             if r.status_code == 429 and "_v572_activate_cooldown" in globals():
                 _v572_activate_cooldown(r.headers.get("retry-after"))
 
-            return {
+            response = {
                 "ok": 200 <= r.status_code < 300,
                 "status": r.status_code,
                 "data": data,
@@ -334,6 +446,8 @@ class ZylaClient:
                 "retry_after": r.headers.get("retry-after"),
                 "error": None if 200 <= r.status_code < 300 else str(data)[:500],
             }
+            _v573_cache_put(name, params, response)
+            return response
         except Exception as e:
             return {"ok": False, "status": 0, "data": None, "error": repr(e)}
 
@@ -5932,6 +6046,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     scan_history = _v55_load_history()
     decision_journal = _v56_load_journal()
     learning_state = _v57_load_state()
+    _v573_scan_budget_start()
 
     # ---------- First broad snapshot, protected by V5.7.1 Feed Guard ----------
     feed_guard = await _v571_guarded_live_snapshot()
@@ -6365,6 +6480,26 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     }
 
 
+
+
+@mcp.tool()
+async def get_provider_guard_status() -> Dict[str, Any]:
+    """Show cooldown, local limiter, cache and per-scan provider budget."""
+    now = _v572_epoch()
+    _v573_trim_calls(now)
+    return {
+        "version": VERSION,
+        "rate_limit": _v572_rate_status(),
+        "calls_last_60s": len(_PROVIDER_CALL_TIMES),
+        "max_calls_per_minute": PROVIDER_MAX_CALLS_PER_MINUTE,
+        "min_gap_seconds": PROVIDER_MIN_GAP,
+        "cache_ttl_seconds": PROVIDER_CACHE_TTL,
+        "live_cache_ttl_seconds": PROVIDER_LIVE_CACHE_TTL,
+        "max_calls_per_scan": PROVIDER_MAX_CALLS_PER_SCAN,
+        "cache_entries": len(_PROVIDER_CACHE),
+        "scan_budget": _v573_scan_budget_status(),
+        "note": "Provider-side exhausted account quota cannot be bypassed; this layer removes duplicate/burst traffic.",
+    }
 
 @mcp.tool()
 async def get_self_learning_report() -> Dict[str, Any]:
