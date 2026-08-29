@@ -22,7 +22,13 @@ ZYLA_BASE_URL = (
 )
 
 mcp = MCPServer("Hidden Signal Live")
-
+@mcp.custom_route("/", methods=["GET", "HEAD"])
+async def health_root(request: Request) -> Response:
+    return JSONResponse({
+        "status": "ok",
+        "service": "Hidden Signal Live",
+        "version": VERSION,
+    })
 
 # ============================================================
 # SETTINGS
