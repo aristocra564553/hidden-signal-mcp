@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5c1-ADAPTIVE-BRIDGE-HOTFIX"
-MODEL_TYPE = "heuristic-v5.7.5c1-adaptive-bridge-hotfix-not-calibrated"
+VERSION = "V5.7.5c2-ADAPTIVE-AUDIT-LOG"
+MODEL_TYPE = "heuristic-v5.7.5c2-adaptive-audit-log-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -5157,6 +5157,147 @@ def _v56_save_journal(data: Dict[str, Any]) -> None:
         pass
 
 
+V575C2_SCAN_AUDIT_KEY = "__SCAN_AUDIT__"
+
+
+def _v575c2_signal_audit(item: Dict[str, Any]) -> Dict[str, Any]:
+    flow = item.get("FLOW") or {}
+    ctrl = item.get("DECISION_CONTROL") or {}
+    bridge = item.get("ADAPTIVE_BRIDGE") or {}
+    learning = item.get("SELF_LEARNING") or {}
+
+    return {
+        "key": _v56_signal_key(item),
+        "market": item.get("market"),
+        "title": item.get("title"),
+        "base_decision": item.get("decision"),
+        "base_probability": item.get("probability"),
+        "adjusted_probability": flow.get("adjusted_probability"),
+        "adaptive_probability": learning.get("learned_probability"),
+        "flow_state": flow.get("state"),
+        "state_before_learning": flow.get("state_before_learning"),
+        "stable_count": ctrl.get("stable_count"),
+        "previous_state": ctrl.get("previous_state"),
+        "previous_probability": ctrl.get("previous_probability"),
+        "decision_control_reason": ctrl.get("reason"),
+        "priority_score": item.get("PRIORITY_SCORE"),
+        "entry_expiry": item.get("ENTRY_EXPIRY"),
+        "ADAPTIVE_BRIDGE": {
+            "applied": bool(bridge.get("applied")),
+            "target": bridge.get("target"),
+            "reason": bridge.get("reason"),
+            "hard_block": bridge.get("hard_block"),
+            "trend_score": bridge.get("trend_score"),
+            "false_pressure_penalty": bridge.get("false_pressure_penalty"),
+            "context_risk": bridge.get("context_risk"),
+            "market_conflict": bridge.get("market_conflict"),
+            "freshness_status": bridge.get("freshness_status"),
+            "freshness_reason": bridge.get("freshness_reason"),
+            "stable_count": bridge.get("stable_count"),
+        },
+    }
+
+
+def _v575c2_attach_match_audit(
+    journal: Dict[str, Any],
+    match_id: str,
+    view: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Enrich the journal row that V5.6 just created for this match.
+    This runs AFTER V5.7 adaptive control, so the saved row contains the
+    fields needed to audit Bridge decisions without another live scan.
+    """
+    rows = list(journal.get(match_id) or [])
+    if not rows:
+        return {}
+
+    adaptive_items = list(view.get("ADAPTIVE_ITEMS") or [])
+    best = view.get("BEST_ADAPTIVE_SIGNAL") or {}
+    best_bridge = best.get("ADAPTIVE_BRIDGE") or {}
+    trend = view.get("PRESSURE_TREND") or {}
+    false_pressure = view.get("FALSE_PRESSURE") or {}
+    conflicts = view.get("MARKET_CONFLICTS") or {}
+    context_risk = view.get("CONTEXT_RISK") or {}
+    freshness = view.get("freshness") or view.get("FRESHNESS") or {}
+
+    audit = {
+        "trend_score": float(trend.get("score") or 0),
+        "PRESSURE_TREND": trend,
+        "FALSE_PRESSURE": false_pressure,
+        "market_conflict": bool(conflicts.get("detected")),
+        "MARKET_CONFLICTS": conflicts,
+        "context_risk": context_risk,
+        "freshness": freshness,
+        "best_adaptive_state": (best.get("FLOW") or {}).get("state"),
+        "best_adaptive_title": best.get("title"),
+        "best_adaptive_probability": (
+            (best.get("SELF_LEARNING") or {}).get("learned_probability")
+            or (best.get("FLOW") or {}).get("adjusted_probability")
+            or best.get("probability")
+        ),
+        "ADAPTIVE_BRIDGE": {
+            "applied": bool(best_bridge.get("applied")),
+            "target": best_bridge.get("target"),
+            "reason": best_bridge.get("reason"),
+            "hard_block": best_bridge.get("hard_block"),
+        },
+        "signals": [_v575c2_signal_audit(x) for x in adaptive_items],
+    }
+
+    rows[-1] = dict(rows[-1])
+    rows[-1]["adaptive_audit"] = audit
+    journal[match_id] = rows[-V56_JOURNAL_KEEP:]
+    return audit
+
+
+def _v575c2_compact_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
+    best = c.get("BEST_ADAPTIVE_SIGNAL") or {}
+    base = (c.get("goal_board_65_99") or [None])[0] or {}
+    return {
+        "match_id": c.get("match_id"),
+        "match": c.get("match"),
+        "minute": c.get("minute"),
+        "score": c.get("score"),
+        "base_market": base.get("market"),
+        "base_title": base.get("title"),
+        "base_probability": base.get("probability"),
+        "base_decision": base.get("decision"),
+        "trend_score": float((c.get("PRESSURE_TREND") or {}).get("score") or 0),
+        "freshness": c.get("freshness"),
+        "FALSE_PRESSURE": c.get("FALSE_PRESSURE"),
+        "stable_count": ((best.get("DECISION_CONTROL") or {}).get("stable_count")),
+        "market_conflict": bool((c.get("MARKET_CONFLICTS") or {}).get("detected")),
+        "context_risk": c.get("CONTEXT_RISK"),
+        "adaptive_state": (best.get("FLOW") or {}).get("state"),
+        "ADAPTIVE_BRIDGE": best.get("ADAPTIVE_BRIDGE"),
+    }
+
+
+def _v575c2_append_scan_audit(
+    journal: Dict[str, Any],
+    adaptive_take_now: List[Dict[str, Any]],
+    adaptive_take_soon: List[Dict[str, Any]],
+    adaptive_take_later: List[Dict[str, Any]],
+    adaptive_emerging: List[Dict[str, Any]],
+    adaptive_bridge_applied: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    row = {
+        "at": now_iso(),
+        "ADAPTIVE_TAKE_NOW": [_v575c2_compact_candidate(x) for x in adaptive_take_now],
+        "ADAPTIVE_TAKE_SOON": [_v575c2_compact_candidate(x) for x in adaptive_take_soon],
+        "ADAPTIVE_TAKE_LATER": [_v575c2_compact_candidate(x) for x in adaptive_take_later],
+        "ADAPTIVE_EMERGING": [_v575c2_compact_candidate(x) for x in adaptive_emerging],
+        "ADAPTIVE_BRIDGE_APPLIED": [_v575c2_compact_candidate(x) for x in adaptive_bridge_applied],
+        "ALL_BASE_CANDIDATES": [_v575c2_compact_candidate(x) for x in candidates],
+    }
+    rows = list(journal.get(V575C2_SCAN_AUDIT_KEY) or [])
+    rows.append(row)
+    journal[V575C2_SCAN_AUDIT_KEY] = rows[-V56_JOURNAL_KEEP:]
+    return row
+
+
 def _v56_signal_key(item: Dict[str, Any]) -> str:
     return f"{item.get('market')}::{item.get('title')}"
 
@@ -6949,6 +7090,11 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             learning_state,
             view,
         )
+        _v575c2_attach_match_audit(
+            decision_journal,
+            mid,
+            view,
+        )
 
         for adaptive_item in list(view.get("ADAPTIVE_ITEMS") or []):
             _v57_register_pending(
@@ -7040,7 +7186,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     ]
 
 
-    _v56_save_journal(decision_journal)
+    # V5.7.5c2: journal save is deferred until global adaptive sections
+    # are assembled, so one saved scan contains both per-match and scan-level audit.
     learning_changes = []
     learning_rollbacks = []
     for _market in list((learning_state.get("markets") or {}).keys()):
@@ -7138,6 +7285,17 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         elif action == "LATER":
             take_later.append(c)
 
+    adaptive_audit_log = _v575c2_append_scan_audit(
+        decision_journal,
+        adaptive_take_now,
+        adaptive_take_soon,
+        adaptive_take_later,
+        adaptive_emerging,
+        adaptive_bridge_applied,
+        candidates,
+    )
+    _v56_save_journal(decision_journal)
+
     return {
         "source": "hidden-signal-v5.7-complete-live",
         "version": VERSION,
@@ -7178,6 +7336,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "ADAPTIVE_TAKE_LATER": adaptive_take_later,
         "ADAPTIVE_EMERGING": adaptive_emerging,
         "ADAPTIVE_BRIDGE_APPLIED": adaptive_bridge_applied,
+        "ADAPTIVE_AUDIT_LOG": adaptive_audit_log,
         "ADAPTIVE_BRIDGE_CONFIG": {
             "soon_probability": ADAPTIVE_BRIDGE_SOON_PROB,
             "soon_trend": ADAPTIVE_BRIDGE_SOON_TREND,
@@ -7272,6 +7431,38 @@ async def verify_live_match(match_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
+async def get_adaptive_audit_log(
+    match_id: Optional[str] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """
+    Read saved Adaptive/Bridge audit data without calling Zyla.
+    If match_id is provided, returns that match's journal rows.
+    Otherwise returns recent scan-level audit rows.
+    """
+    journal = _v56_load_journal()
+    n = max(1, min(int(limit), V56_JOURNAL_KEEP))
+
+    if match_id:
+        rows = list(journal.get(str(match_id)) or [])
+        return {
+            "version": VERSION,
+            "source": "local_decision_journal",
+            "provider_calls": 0,
+            "match_id": str(match_id),
+            "rows": rows[-n:],
+        }
+
+    rows = list(journal.get(V575C2_SCAN_AUDIT_KEY) or [])
+    return {
+        "version": VERSION,
+        "source": "local_decision_journal",
+        "provider_calls": 0,
+        "rows": rows[-n:],
+    }
+
+
+@mcp.tool()
 async def get_provider_guard_status() -> Dict[str, Any]:
     """Show cooldown, local limiter, cache and per-scan provider budget."""
     now = _v572_epoch()
@@ -7288,6 +7479,12 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "atomic_budget_guard": True,
+        "adaptive_audit_log": {
+            "enabled": True,
+            "journal_path": DECISION_JOURNAL_PATH,
+            "scan_rows_kept": V56_JOURNAL_KEEP,
+            "provider_calls_to_read": 0,
+        },
         "adaptive_bridge": {
             "enabled": True,
             "soon_probability": ADAPTIVE_BRIDGE_SOON_PROB,
