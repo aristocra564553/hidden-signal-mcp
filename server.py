@@ -15,8 +15,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.3-QUOTA-GUARD"
-MODEL_TYPE = "heuristic-v5.7.3-quota-guard-not-calibrated"
+VERSION = "V5.7.4-FINAL-MATCH-VERIFY"
+MODEL_TYPE = "heuristic-v5.7.4-final-match-verify-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -6025,6 +6025,230 @@ async def _v571_guarded_live_snapshot() -> Dict[str, Any]:
         "message": "Live feed remained suspicious after retries. Signals and Self Learning are frozen.",
     }
 
+
+# ===== V5.7.4 TARGETED FINAL MATCH VERIFY =====
+# If a strong candidate disappears from the final whole-live snapshot,
+# verify only that match_id via details/summary before downgrading freshness.
+# This uses the existing provider quota guard and does NOT change probabilities.
+
+FINAL_VERIFY_MIN_PROB = float(os.environ.get("FINAL_VERIFY_MIN_PROB", "65"))
+FINAL_VERIFY_MAX_MATCHES = int(os.environ.get("FINAL_VERIFY_MAX_MATCHES", "3"))
+
+
+def _v574_extract_score_minute(payload: Any) -> Dict[str, Any]:
+    """
+    Best-effort parser for targeted details/summary responses.
+    Returns {"ok": bool, "home": int|None, "away": int|None, "minute": int|None, "in_progress": bool|None}
+    """
+    out = {"ok": False, "home": None, "away": None, "minute": None, "in_progress": None}
+    if payload is None:
+        return out
+
+    # Normalize nested dict/list structures.
+    nodes = []
+    if isinstance(payload, dict):
+        nodes.append(payload)
+        for key in ("match", "data", "details", "event"):
+            v = payload.get(key)
+            if isinstance(v, dict):
+                nodes.append(v)
+            elif isinstance(v, list):
+                nodes.extend([x for x in v if isinstance(x, dict)])
+    elif isinstance(payload, list):
+        nodes.extend([x for x in payload if isinstance(x, dict)])
+
+    def as_int(v):
+        try:
+            if v is None or v == "":
+                return None
+            s = str(v).strip()
+            # Accept 45+2 / 90+4
+            if "+" in s:
+                a, b = s.replace("'", "").split("+", 1)
+                return int(float(a)) + int(float(b))
+            return int(float(s.replace("'", "")))
+        except Exception:
+            return None
+
+    for n in nodes:
+        scores = n.get("scores") if isinstance(n.get("scores"), dict) else None
+        if scores:
+            h = as_int(scores.get("home"))
+            a = as_int(scores.get("away"))
+            if h is not None and a is not None:
+                out["home"], out["away"] = h, a
+                out["ok"] = True
+
+        # Common alternate shapes.
+        for hk, ak in (
+            ("home_score", "away_score"),
+            ("score_home", "score_away"),
+            ("home", "away"),
+        ):
+            if out["home"] is None or out["away"] is None:
+                h = as_int(n.get(hk))
+                a = as_int(n.get(ak))
+                if h is not None and a is not None:
+                    out["home"], out["away"] = h, a
+                    out["ok"] = True
+                    break
+
+        ms = n.get("match_status") if isinstance(n.get("match_status"), dict) else {}
+        minute = (
+            ms.get("live_time")
+            or n.get("minute")
+            or n.get("live_time")
+            or n.get("time")
+        )
+        mi = parse_minute(minute) if "parse_minute" in globals() else as_int(minute)
+        if mi is not None:
+            out["minute"] = mi
+
+        ip = ms.get("is_in_progress")
+        if isinstance(ip, bool):
+            out["in_progress"] = ip
+        elif isinstance(n.get("is_in_progress"), bool):
+            out["in_progress"] = n.get("is_in_progress")
+
+    return out
+
+
+async def _v574_verify_match_id(match_id: str) -> Dict[str, Any]:
+    """
+    One targeted verification for a candidate missing from final live list.
+    Tries details first, then summary only if details cannot confirm.
+    """
+    client = ZylaClient()
+    attempts = []
+    try:
+        for endpoint in ("details", "summary"):
+            try:
+                r = await client.get(endpoint, {"match_id": match_id})
+            except Exception as e:
+                attempts.append({"endpoint": endpoint, "ok": False, "error": f"{type(e).__name__}: {str(e)[:160]}"})
+                continue
+
+            parsed = _v574_extract_score_minute(r.get("data"))
+            attempts.append({
+                "endpoint": endpoint,
+                "http_status": r.get("status"),
+                "ok": bool(r.get("ok")),
+                "parsed": parsed,
+                "cache_hit": r.get("cache_hit", False),
+            })
+            if r.get("ok") and parsed.get("ok"):
+                return {
+                    "verified": True,
+                    "endpoint": endpoint,
+                    "http_status": r.get("status"),
+                    "score_home": parsed.get("home"),
+                    "score_away": parsed.get("away"),
+                    "minute": parsed.get("minute"),
+                    "in_progress": parsed.get("in_progress"),
+                    "attempts": attempts,
+                }
+
+            # Stop immediately on quota/cooldown signals.
+            if int(r.get("status") or 0) == 429 or r.get("error") in {"RATE_LIMIT_COOLDOWN", "LOCAL_RATE_LIMIT", "SCAN_API_BUDGET_EXHAUSTED"}:
+                break
+    finally:
+        await client.close()
+
+    return {"verified": False, "attempts": attempts}
+
+
+def _v574_candidate_probability(view: Dict[str, Any]) -> float:
+    vals = []
+    for key in ("goal_board_65_99", "DECISION_CONTROL_ITEMS", "ADAPTIVE_ITEMS", "signals", "all_signals"):
+        items = view.get(key)
+        if isinstance(items, list):
+            for x in items:
+                if not isinstance(x, dict):
+                    continue
+                for pk in ("adaptive_probability", "adjusted_probability", "probability", "p", "percent"):
+                    try:
+                        if x.get(pk) is not None:
+                            vals.append(float(x.get(pk)))
+                    except Exception:
+                        pass
+    for pk in ("probability", "best_probability", "top_probability"):
+        try:
+            if view.get(pk) is not None:
+                vals.append(float(view.get(pk)))
+        except Exception:
+            pass
+    return max(vals) if vals else 0.0
+
+
+async def _v574_targeted_freshness_recovery(
+    analyzed_views: List[Dict[str, Any]],
+    final_live_matches: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Recover only strong candidates that were otherwise marked
+    FINAL_LIVE_SNAPSHOT_MISSING.
+    """
+    recovered = {}
+    checked = []
+    final_ids = {str(m.get("match_id")) for m in final_live_matches if isinstance(m, dict) and m.get("match_id")}
+
+    candidates = []
+    for v in analyzed_views:
+        if not isinstance(v, dict):
+            continue
+        mid = v.get("match_id") or (v.get("match") or {}).get("match_id")
+        if not mid or str(mid) in final_ids:
+            continue
+        p = _v574_candidate_probability(v)
+        if p >= FINAL_VERIFY_MIN_PROB:
+            candidates.append((p, str(mid), v))
+
+    candidates.sort(reverse=True, key=lambda t: t[0])
+
+    for p, mid, v in candidates[:FINAL_VERIFY_MAX_MATCHES]:
+        ver = await _v574_verify_match_id(mid)
+        item = {"match_id": mid, "probability": p, "verification": ver}
+        checked.append(item)
+        if not ver.get("verified"):
+            continue
+
+        # Compare with analyzed score; score conflict remains a hard block.
+        match = v.get("match") if isinstance(v.get("match"), dict) else v
+        old_h = match.get("score_home")
+        old_a = match.get("score_away")
+        if old_h is None or old_a is None:
+            score = match.get("score")
+            if isinstance(score, dict):
+                old_h, old_a = score.get("home"), score.get("away")
+
+        try:
+            score_ok = (old_h is None or old_a is None) or (
+                int(old_h) == int(ver.get("score_home")) and int(old_a) == int(ver.get("score_away"))
+            )
+        except Exception:
+            score_ok = True
+
+        if not score_ok:
+            item["result"] = "BLOCKED_SCORE_CONFLICT"
+            continue
+
+        if ver.get("in_progress") is False:
+            item["result"] = "BLOCKED_NOT_IN_PROGRESS"
+            continue
+
+        recovered[mid] = {
+            "status": "CONFIRMED",
+            "reason": "TARGETED_MATCH_VERIFY",
+            "verified_endpoint": ver.get("endpoint"),
+            "verified_http_status": ver.get("http_status"),
+            "verified_score": [ver.get("score_home"), ver.get("score_away")],
+            "verified_minute": ver.get("minute"),
+        }
+        item["result"] = "RECOVERED_CONFIRMED"
+
+    return {"recovered": recovered, "checked": checked}
+
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -6055,7 +6279,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         return {
             "version": VERSION,
             "model_type": MODEL_TYPE,
-            "LIVE_FEED_STATUS": feed_guard.get("status"),
+            "FINAL_MATCH_VERIFY": targeted_final_verify if "targeted_final_verify" in locals() else {"recovered": {}, "checked": []},
+        "LIVE_FEED_STATUS": feed_guard.get("status"),
             "LIVE_FEED_GUARD": feed_guard,
             "ADAPTIVE_TAKE_NOW": [],
             "ADAPTIVE_TAKE_SOON": [],
@@ -6131,6 +6356,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     try:
         final_r = await final_client.live()
         final_matches = flatten_live(final_r.get("data"))
+        targeted_final_verify = await _v574_targeted_freshness_recovery(analyzed_views if "analyzed_views" in locals() else analyzed, final_matches)
+
     finally:
         await final_client.close()
 
@@ -6160,12 +6387,44 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             continue
 
         resolved = _v53_find_final_match(match, mid, final_matches)
+
+        # V5.7.4: if the whole-live final snapshot missed this strong match,
+        # use the targeted details/summary verification as a synthetic final match.
+        targeted_recovery = (targeted_final_verify.get("recovered") or {}).get(mid)
+        if resolved.get("match") is None and targeted_recovery:
+            verified_minute = targeted_recovery.get("verified_minute")
+            if verified_minute is None:
+                verified_minute = int(match.get("minute") or 0)
+
+            verified_score = targeted_recovery.get("verified_score") or [None, None]
+            synthetic_final = {
+                "match_id": mid,
+                "home": match.get("home"),
+                "away": match.get("away"),
+                "score": {
+                    "home": verified_score[0],
+                    "away": verified_score[1],
+                },
+                "minute": int(verified_minute or 0),
+                "minute_valid": True,
+                "is_in_progress": True,
+            }
+            resolved = {
+                "match": synthetic_final,
+                "method": "TARGETED_MATCH_VERIFY",
+                "confidence": 0.96,
+            }
+
         freshness = _v53_freshness_check(
             match,
             resolved.get("match"),
             resolved.get("method"),
             float(resolved.get("confidence") or 0),
         )
+
+        if resolved.get("method") == "TARGETED_MATCH_VERIFY" and freshness.get("status") == "CONFIRMED":
+            freshness["reason"] = "TARGETED_MATCH_VERIFY"
+            freshness["targeted_verify"] = targeted_recovery
 
         if freshness.get("status") == "BLOCKED":
             hard_blocked.append({
@@ -6480,6 +6739,20 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     }
 
 
+
+
+
+@mcp.tool()
+async def verify_live_match(match_id: str) -> Dict[str, Any]:
+    """Targeted freshness check for one match_id using details/summary."""
+    result = await _v574_verify_match_id(match_id)
+    return {
+        "version": VERSION,
+        "match_id": match_id,
+        "TARGETED_VERIFY": result,
+        "rate_limit": _v572_rate_status(),
+        "scan_budget": _v573_scan_budget_status(),
+    }
 
 
 @mcp.tool()
