@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5e-ADAPTIVE-NOW-STABILITY-FIX"
-MODEL_TYPE = "heuristic-v5.7.5e-adaptive-now-stability-fix-not-calibrated"
+VERSION = "V5.7.5f-DIAGNOSTICS-PERSISTENT-STATE"
+MODEL_TYPE = "heuristic-v5.7.5f-diagnostics-persistent-state-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -118,15 +118,87 @@ def weighted_mean(items: List[Tuple[float, float]]) -> float:
 
 
 # -------------------------
-# Lightweight journal
+# Lightweight journal + V5.7.5f persistent state resolver
 # -------------------------
 
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "/tmp/hidden_signal_v5_7_signals.jsonl")
-SCAN_STATE_PATH = os.getenv("SCAN_STATE_PATH", "/tmp/hidden_signal_v5_7_scan_state.json")
-SCAN_HISTORY_PATH = os.getenv("SCAN_HISTORY_PATH", "/tmp/hidden_signal_v5_7_scan_history.json")
-DECISION_JOURNAL_PATH = os.getenv("DECISION_JOURNAL_PATH", "/tmp/hidden_signal_v5_7_decision_journal.json")
-LEARNING_STATE_PATH = os.getenv("LEARNING_STATE_PATH", "/tmp/hidden_signal_v5_7_learning_state.json")
-FEED_GUARD_STATE_PATH = os.getenv("FEED_GUARD_STATE_PATH", "/tmp/hidden_signal_v5_7_5a_feed_guard_state.json")
+def _v575f_probe_writable_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".hidden_signal_write_probe")
+        with open(probe, "a", encoding="utf-8") as f:
+            f.write("")
+        try:
+            os.remove(probe)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _v575f_resolve_state_dir() -> Tuple[str, str, bool]:
+    # Best option: explicitly mount a persistent Render disk and point this env
+    # variable at it, e.g. HIDDEN_SIGNAL_STATE_DIR=/var/data/hidden_signal.
+    explicit = (
+        os.getenv("HIDDEN_SIGNAL_STATE_DIR", "").strip()
+        or os.getenv("PERSISTENT_STORAGE_DIR", "").strip()
+        or os.getenv("RENDER_DISK_PATH", "").strip()
+    )
+    candidates: List[Tuple[str, str, bool]] = []
+    if explicit:
+        candidates.append((explicit, "ENV_CONFIGURED", not explicit.startswith("/tmp")))
+
+    # Common persistent-disk mount locations. Auto-detect them only when the
+    # mount root already exists; never create /var/data or /data ourselves and
+    # then incorrectly label an ordinary filesystem path as persistent.
+    if os.path.isdir("/var/data"):
+        candidates.append(("/var/data/hidden_signal", "AUTO_VAR_DATA", True))
+    if os.path.isdir("/data"):
+        candidates.append(("/data/hidden_signal", "AUTO_DATA", True))
+    candidates.append(("/tmp/hidden_signal", "TMP_FALLBACK", False))
+
+    seen = set()
+    for path, mode, persistent in candidates:
+        path = os.path.abspath(path)
+        if path in seen:
+            continue
+        seen.add(path)
+        if _v575f_probe_writable_dir(path):
+            return path, mode, persistent
+
+    # Extremely defensive last resort. Existing write helpers remain fail-soft.
+    return "/tmp", "TMP_LAST_RESORT", False
+
+
+def _v575f_configured_path(env_name: str, filename: str) -> str:
+    raw = os.getenv(env_name, "").strip()
+    if raw:
+        try:
+            parent = os.path.dirname(os.path.abspath(raw)) or "."
+            if _v575f_probe_writable_dir(parent):
+                return os.path.abspath(raw)
+        except Exception:
+            pass
+    return os.path.join(STATE_STORAGE_DIR, filename)
+
+
+STATE_STORAGE_DIR, STATE_STORAGE_MODE, STATE_STORAGE_PERSISTENT = _v575f_resolve_state_dir()
+STATE_STORAGE_WARNING = (
+    None
+    if STATE_STORAGE_PERSISTENT
+    else (
+        "State is using temporary storage. Attach a persistent disk and set "
+        "HIDDEN_SIGNAL_STATE_DIR (for example /var/data/hidden_signal) so scan history, "
+        "adaptive stable_count, decision journal and self-learning survive restarts/redeploys."
+    )
+)
+
+SIGNAL_LOG_PATH = _v575f_configured_path("SIGNAL_LOG_PATH", "signals.jsonl")
+SCAN_STATE_PATH = _v575f_configured_path("SCAN_STATE_PATH", "scan_state.json")
+SCAN_HISTORY_PATH = _v575f_configured_path("SCAN_HISTORY_PATH", "scan_history.json")
+DECISION_JOURNAL_PATH = _v575f_configured_path("DECISION_JOURNAL_PATH", "decision_journal.json")
+LEARNING_STATE_PATH = _v575f_configured_path("LEARNING_STATE_PATH", "learning_state.json")
+FEED_GUARD_STATE_PATH = _v575f_configured_path("FEED_GUARD_STATE_PATH", "feed_guard_state.json")
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -2047,6 +2119,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "targeted_score_minute_sync_guard",
             "score_conflict_recalculation",
             "adaptive_now_stability_guard",
+            "persistent_state_guard",
+            "diagnostics_budget_skip_separation",
             "data_quality_guard",
             "early_match_guard",
             "small_sample_guard",
@@ -2113,6 +2187,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "automatic_rollback",
             "adaptive_take_now",
             "adaptive_final_state_persistence",
+            "persistent_state_resolver",
+            "diagnostics_budget_skip_separation",
             "phase_quota_selection",
             "tournament_diversity_prefilter",
             "goal_chain_board",
@@ -2121,11 +2197,17 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "screenshot_quick_bridge",
             "phase_balanced_live_collector",
         ],
+        "state_storage": {
+            "directory": STATE_STORAGE_DIR,
+            "mode": STATE_STORAGE_MODE,
+            "persistent": STATE_STORAGE_PERSISTENT,
+            "warning": STATE_STORAGE_WARNING,
+        },
         "notes": [
             "Probabilities are heuristic ranking estimates, not calibrated true probabilities.",
             "H2H and historical team context have low weight and cannot create ENTER by themselves.",
             "Correlated signals are grouped and should not be counted as independent.",
-            "Signal journal is local unless SIGNAL_LOG_PATH points to persistent storage.",
+            "Persistent state uses HIDDEN_SIGNAL_STATE_DIR/PERSISTENT_STORAGE_DIR/RENDER_DISK_PATH when configured, then common disk mounts, then /tmp only as fallback.",
         ],
     }
 
@@ -6358,8 +6440,8 @@ def _v57_learning_report(state: Dict[str, Any]) -> Dict[str, Any]:
 # 429 is not retried aggressively. A shared cooldown prevents a single scan
 # from hammering the provider through live/stats/odds/detail calls.
 
-RATE_LIMIT_STATE_PATH = os.environ.get(
-    "RATE_LIMIT_STATE_PATH", "/tmp/hidden_signal_v5_7_2_rate_limit.json"
+RATE_LIMIT_STATE_PATH = _v575f_configured_path(
+    "RATE_LIMIT_STATE_PATH", "rate_limit_state.json"
 )
 FEED_GUARD_RETRIES = 3
 FEED_EMPTY_200_MAX_ATTEMPTS = int(os.environ.get("FEED_EMPTY_200_MAX_ATTEMPTS", "2"))
@@ -7033,6 +7115,25 @@ def _v575d_guard_allows_strong(view: Dict[str, Any]) -> bool:
     return str(guard.get("status") or "") == "VERIFIED"
 
 
+V575F_BUDGET_SKIP_CODES = {
+    "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+    "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
+    "TARGETED_VERIFY_RESERVE_EXHAUSTED",
+    "SCAN_API_BUDGET_EXHAUSTED",
+}
+
+def _v575f_is_budget_skip(error: Any) -> bool:
+    s = str(error or "")
+    return any(code in s for code in V575F_BUDGET_SKIP_CODES)
+
+
+def _v575f_failure_item(rep: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "match_id": rep.get("match_id"),
+        "error": rep.get("error") or rep.get("status"),
+    }
+
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -7101,14 +7202,16 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     new_state = {}
     momentum_map = {}
     parser_failures = []
+    budget_skipped = []
 
     ok_reports = []
     for rep in deep_reports:
         if rep.get("status") != "OK":
-            parser_failures.append({
-                "match_id": rep.get("match_id"),
-                "error": rep.get("error") or rep.get("status"),
-            })
+            failure = _v575f_failure_item(rep)
+            if _v575f_is_budget_skip(failure.get("error")):
+                budget_skipped.append(failure)
+            else:
+                parser_failures.append(failure)
             continue
 
         mid = str(rep.get("match_id") or "")
@@ -7181,7 +7284,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     targeted_verification_cache: Dict[str, Dict[str, Any]] = {}
 
     score_sync_guard = {
-        "version": "V5.7.5d",
+        "version": VERSION,
+        "component_origin": "V5.7.5d-SCORE-SYNC-GUARD",
         "checked": [],
         "conflicts": [],
         "recalculated": [],
@@ -7923,6 +8027,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "hard_freshness_blocked": hard_blocked,
         "quality_blocked": quality_blocked,
         "parser_failures": parser_failures,
+        "budget_skipped": budget_skipped,
+        "budget_skipped_count": len(budget_skipped),
         "scan_memory_matches": len(new_state),
         "final_live_matches_found": len(final_matches),
         "FINAL_SNAPSHOT_STATUS": final_snapshot_status,
@@ -7963,7 +8069,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         ),
 
         "message": (
-            f"V5.6: ENTER {len(enter_now)}, 65–99% {len(candidates)}, "
+            f"{VERSION}: ENTER {len(enter_now)}, 65–99% {len(candidates)}, "
             f"rising {len(rising_now)}, radar 55–64 {len(radar_rising)}, "
             f"memory {len(new_state)}, final_snapshot {final_snapshot_status}, "
             f"targeted_recovered {len(targeted_final_verify.get('recovered') or {})}."
@@ -8059,12 +8165,20 @@ async def get_provider_guard_status() -> Dict[str, Any]:
             "tier_3": "player_stats+h2h_if_budget",
         },
         "cache_entries": len(_PROVIDER_CACHE),
+        "persistence": {
+            "directory": STATE_STORAGE_DIR,
+            "mode": STATE_STORAGE_MODE,
+            "persistent": STATE_STORAGE_PERSISTENT,
+            "warning": STATE_STORAGE_WARNING,
+        },
         "persistence_paths": {
+            "signal_log": SIGNAL_LOG_PATH,
             "scan_state": SCAN_STATE_PATH,
             "scan_history": SCAN_HISTORY_PATH,
             "decision_journal": DECISION_JOURNAL_PATH,
             "learning_state": LEARNING_STATE_PATH,
             "feed_guard_state": FEED_GUARD_STATE_PATH,
+            "rate_limit_state": RATE_LIMIT_STATE_PATH,
         },
         "feed_guard_state": _v575a_load_feed_guard_state(),
         "scan_budget": _v573_scan_budget_status(),
@@ -8174,15 +8288,17 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
 
     candidates = []
     parser_failures = []
+    budget_skipped = []
     quality_blocked = []
     stale_blocked = []
 
     for rep in deep_reports:
         if rep.get("status") != "OK":
-            parser_failures.append({
-                "match_id": rep.get("match_id"),
-                "error": rep.get("error") or rep.get("status")
-            })
+            failure = _v575f_failure_item(rep)
+            if _v575f_is_budget_skip(failure.get("error")):
+                budget_skipped.append(failure)
+            else:
+                parser_failures.append(failure)
             continue
 
         freshness = final_freshness_check(
@@ -8268,6 +8384,8 @@ async def scan_goal_hunter(limit: int = 16, concurrency: int = 2) -> Dict[str, A
         ],
         "invalid_minute": invalid_minute,
         "parser_failures": parser_failures,
+        "budget_skipped": budget_skipped,
+        "budget_skipped_count": len(budget_skipped),
         "quality_blocked": quality_blocked,
         "stale_blocked": stale_blocked,
         "FIRST_HALF": first_half,
@@ -8430,7 +8548,9 @@ async def get_signal_log(limit: int = 50) -> Dict[str, Any]:
     return {
         "version": VERSION,
         "path": SIGNAL_LOG_PATH,
-        "persistent_storage_warning": "On Render free instances /tmp is ephemeral unless persistent storage/external DB is configured.",
+        "state_storage_persistent": STATE_STORAGE_PERSISTENT,
+        "state_storage_mode": STATE_STORAGE_MODE,
+        "persistent_storage_warning": STATE_STORAGE_WARNING,
         "count_returned": min(limit, len(rows)),
         "events": rows[-limit:],
     }
