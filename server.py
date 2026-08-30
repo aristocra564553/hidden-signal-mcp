@@ -6,6 +6,7 @@ import math
 import re
 import time
 import asyncio
+import copy
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5c2-ADAPTIVE-AUDIT-LOG"
-MODEL_TYPE = "heuristic-v5.7.5c2-adaptive-audit-log-not-calibrated"
+VERSION = "V5.7.5d-SCORE-SYNC-GUARD"
+MODEL_TYPE = "heuristic-v5.7.5d-score-sync-guard-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -2043,6 +2044,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
         "visible_signal_min": VISIBLE_SIGNAL_MIN,
         "guards": [
             "score_sync_guard",
+            "targeted_score_minute_sync_guard",
+            "score_conflict_recalculation",
             "data_quality_guard",
             "early_match_guard",
             "small_sample_guard",
@@ -6782,6 +6785,186 @@ async def _v574_targeted_freshness_recovery(
     return {"recovered": recovered, "checked": checked}
 
 
+# ============================================================
+# V5.7.5d — SCORE SYNC GUARD
+# Every ENTER 75%+ / ADAPTIVE TAKE_SOON / TAKE_NOW must pass
+# a targeted details->summary score+minute verification before
+# it can be exposed as a strong signal.
+# ============================================================
+
+V575D_SCORE_SYNC_MIN_PROB = 75.0
+
+
+def _v575d_score_sync_requirement(view: Dict[str, Any]) -> Dict[str, Any]:
+    reasons: List[str] = []
+    strongest_enter = 0.0
+
+    for item in list(view.get("goal_board_65_99") or []):
+        try:
+            p = float(item.get("probability") or 0)
+        except Exception:
+            p = 0.0
+        if item.get("decision") == "ENTER" and p >= V575D_SCORE_SYNC_MIN_PROB:
+            strongest_enter = max(strongest_enter, p)
+
+    if strongest_enter >= V575D_SCORE_SYNC_MIN_PROB:
+        reasons.append(f"ENTER_{round1(strongest_enter)}")
+
+    adaptive_states = []
+    for item in list(view.get("ADAPTIVE_ITEMS") or []):
+        state = str((item.get("FLOW") or {}).get("state") or "")
+        if state in {"TAKE_SOON", "TAKE_NOW"}:
+            adaptive_states.append(state)
+
+    best_adaptive = view.get("BEST_ADAPTIVE_SIGNAL") or {}
+    best_state = str((best_adaptive.get("FLOW") or {}).get("state") or "")
+    if best_state in {"TAKE_SOON", "TAKE_NOW"}:
+        adaptive_states.append(best_state)
+
+    adaptive_states = sorted(set(adaptive_states))
+    reasons.extend(adaptive_states)
+
+    return {
+        "required": bool(reasons),
+        "reasons": reasons,
+        "strongest_enter_probability": round1(strongest_enter),
+        "adaptive_states": adaptive_states,
+    }
+
+
+def _v575d_targeted_live(
+    rep: Dict[str, Any],
+    verification: Dict[str, Any],
+) -> Dict[str, Any]:
+    match = rep.get("match") or {}
+    old_score = match.get("score") or {}
+    vh = verification.get("score_home")
+    va = verification.get("score_away")
+    vm = verification.get("minute")
+
+    if vh is None:
+        vh = old_score.get("home")
+    if va is None:
+        va = old_score.get("away")
+    if vm is None:
+        vm = match.get("minute")
+
+    return {
+        "match_id": str(rep.get("match_id") or match.get("match_id") or ""),
+        "home": match.get("home"),
+        "away": match.get("away"),
+        "tournament": match.get("tournament"),
+        "minute": int(vm or 0),
+        "minute_valid": True,
+        "raw_live_time": vm,
+        "stage": match.get("stage"),
+        "score": score_obj(vh, va),
+        "red_cards": match.get("red_cards") or {"home": 0, "away": 0},
+        "is_in_progress": verification.get("in_progress") is not False,
+    }
+
+
+def _v575d_recalculate_report_from_targeted(
+    rep: Dict[str, Any],
+    verification: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Recalculate the model with the already-fetched metrics/context, but with
+    targeted details/summary score+minute as the only authoritative live state.
+    No extra stats request is made here.
+    """
+    out = copy.deepcopy(rep)
+    live = _v575d_targeted_live(out, verification)
+
+    metrics = out.get("metrics") or {}
+    q = out.get("data_quality") or {}
+    lineups = out.get("lineups") or parse_lineups(None)
+    odds = out.get("odds_snapshot") or compact_odds(None)
+    h2h = out.get("h2h_context") or h2h_context(None)
+
+    pressure = pressure_score(metrics, int(live.get("minute") or 0))
+    signals = build_signals(live, metrics, q, pressure, lineups)
+
+    for s in signals:
+        s["new_or_changed"] = is_new_or_changed(str(out.get("match_id") or ""), s)
+
+    strong = [s for s in signals if s.get("decision") == "ENTER"]
+    live_watch = [s for s in signals if s.get("live_decision") in {"LIVE_ENTER", "WATCH"}]
+    live_watch.sort(key=lambda x: float(x.get("live_probability") or 0), reverse=True)
+
+    top3 = signals[:3]
+    corr = correlation_groups(signals)
+    consensus = consensus_report(
+        live,
+        metrics,
+        q,
+        pressure,
+        lineups,
+        odds,
+        h2h,
+        top3[0] if top3 else None,
+    )
+
+    out["match"] = {
+        **(out.get("match") or {}),
+        "home": live.get("home"),
+        "away": live.get("away"),
+        "tournament": live.get("tournament"),
+        "minute": live.get("minute"),
+        "minute_valid": True,
+        "raw_live_time": live.get("raw_live_time"),
+        "stage": live.get("stage"),
+        "score": live.get("score"),
+        "red_cards": live.get("red_cards"),
+    }
+    out["pressure"] = pressure
+    out["consensus"] = consensus
+    out["correlation_groups"] = corr
+    out["nearest_goal"] = nearest_goal_assessment(signals, live, q, pressure)
+    out["top_candidate"] = top3[0] if top3 else None
+    out["top_3_signals"] = top3
+    out["strong_signals"] = strong
+    out["live_watchlist"] = live_watch[:5]
+    out["quality_blocked_signals"] = [s for s in signals if s.get("data_quality_blocked")]
+    out["all_signals"] = signals
+
+    old_sync = out.get("score_sync") or {}
+    out["score_sync"] = {
+        **old_sync,
+        "ok": True,
+        "live_score": old_sync.get("live_score"),
+        "details_score": live.get("score"),
+        "authoritative_source": f"targeted_{verification.get('endpoint') or 'details_summary'}",
+        "verified_minute": live.get("minute"),
+        "recalculated": True,
+    }
+    out.setdefault("diagnostic", {})
+    out["diagnostic"]["v575d_recalculated_from_targeted"] = True
+    out["diagnostic"]["v575d_targeted_endpoint"] = verification.get("endpoint")
+    return out
+
+
+def _v575d_fail_closed_freshness(
+    prior: Dict[str, Any],
+    reason: str,
+    verification: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        **(prior or {}),
+        "status": "UNCONFIRMED",
+        "ok_for_display": True,
+        "ok_for_enter": False,
+        "reason": reason,
+        "score_changed": False,
+        "targeted_verify": verification,
+    }
+
+
+def _v575d_guard_allows_strong(view: Dict[str, Any]) -> bool:
+    guard = view.get("SCORE_SYNC_GUARD") or {}
+    return str(guard.get("status") or "") == "VERIFIED"
+
+
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
     """
@@ -6795,8 +6978,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
       5) compare with previous scan for rising pressure
       6) second live snapshot
       7) exact-id or team-name freshness resolution
-      8) hard block only real conflicts; missing final snapshot becomes WATCH, not deletion
-      9) expose ENTER 75+, visible 65–99, and radar 55–64
+      8) targeted Score Sync Guard for every ENTER 75%+ / TAKE_SOON / TAKE_NOW
+      9) SCORE_CONFLICT kills stale ENTER and recalculates on targeted score+minute
+      10) expose only score-synced strong entries; visible WATCH/radar remain available
     """
     started = time.time()
     previous_state = _load_scan_state()
@@ -6926,6 +7110,16 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
 
     targeted_final_verify = {"recovered": {}, "checked": []}
     targeted_checked_count = 0
+    targeted_verification_cache: Dict[str, Dict[str, Any]] = {}
+
+    score_sync_guard = {
+        "version": "V5.7.5d",
+        "checked": [],
+        "conflicts": [],
+        "recalculated": [],
+        "unverified_blocked": [],
+        "not_in_progress_blocked": [],
+    }
 
     # ---------- Build results ----------
     candidates = []
@@ -6983,6 +7177,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             if provisional_best >= FINAL_VERIFY_MIN_PROB:
                 targeted_checked_count += 1
                 verification = await _v574_verify_match_id(mid)
+                targeted_verification_cache[mid] = verification
                 check_item = {
                     "match_id": mid,
                     "match": f"{match.get('home')} — {match.get('away')}",
@@ -7067,6 +7262,244 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             })
             continue
 
+        # ----------------------------------------------------
+        # V5.7.5d SCORE SYNC GUARD
+        # Probe the final ladder on COPY state first. This avoids writing
+        # journal/self-learning side effects before score+minute verification.
+        # ----------------------------------------------------
+        probe_journal = copy.deepcopy(decision_journal)
+        probe_learning = copy.deepcopy(learning_state)
+
+        probe_view = _v54_attach_timing(_v53_human_view(rep, momentum, freshness))
+        probe_view = _v55_enrich_view(
+            rep,
+            probe_view,
+            list(scan_history.get(mid) or []),
+            freshness,
+        )
+        probe_view = _v56_apply_decision_control(
+            rep,
+            probe_view,
+            probe_journal,
+            mid,
+        )
+        probe_view = _v57_adaptive_control(
+            probe_learning,
+            probe_view,
+        )
+        sync_requirement = _v575d_score_sync_requirement(probe_view)
+
+        sync_meta = {
+            "required": bool(sync_requirement.get("required")),
+            "trigger_reasons": sync_requirement.get("reasons") or [],
+            "status": "NOT_REQUIRED",
+            "old_score": (rep.get("match") or {}).get("score"),
+            "old_minute": (rep.get("match") or {}).get("minute"),
+            "authoritative_source": None,
+            "old_enter_blocked": False,
+            "recalculated": False,
+        }
+
+        if sync_requirement.get("required"):
+            verification = targeted_verification_cache.get(mid)
+            if verification is None:
+                verification = await _v574_verify_match_id(mid)
+                targeted_verification_cache[mid] = verification
+
+            sync_check = {
+                "match_id": mid,
+                "match": f"{match.get('home')} — {match.get('away')}",
+                "trigger_reasons": sync_requirement.get("reasons") or [],
+                "verification": verification,
+                "result": "UNVERIFIED",
+            }
+            score_sync_guard["checked"].append(sync_check)
+
+            if not verification.get("verified"):
+                sync_meta.update({
+                    "status": "UNVERIFIED",
+                    "old_enter_blocked": True,
+                    "verification": verification,
+                })
+                freshness = _v575d_fail_closed_freshness(
+                    freshness,
+                    "SCORE_SYNC_UNVERIFIED",
+                    verification,
+                )
+                score_sync_guard["unverified_blocked"].append({
+                    "match_id": mid,
+                    "match": sync_check["match"],
+                    "reason": "SCORE_SYNC_UNVERIFIED",
+                })
+                sync_check["result"] = "BLOCKED_UNVERIFIED"
+
+            elif verification.get("in_progress") is False:
+                sync_meta.update({
+                    "status": "MATCH_NOT_IN_PROGRESS",
+                    "old_enter_blocked": True,
+                    "verification": verification,
+                })
+                score_sync_guard["not_in_progress_blocked"].append({
+                    "match_id": mid,
+                    "match": sync_check["match"],
+                    "reason": "MATCH_NOT_IN_PROGRESS",
+                })
+                sync_check["result"] = "BLOCKED_NOT_IN_PROGRESS"
+                hard_blocked.append({
+                    "match_id": mid,
+                    "match": sync_check["match"],
+                    "reason": "MATCH_NOT_IN_PROGRESS",
+                    "freshness": {
+                        **freshness,
+                        "status": "BLOCKED",
+                        "ok_for_display": False,
+                        "ok_for_enter": False,
+                        "reason": "MATCH_NOT_IN_PROGRESS",
+                    },
+                    "SCORE_SYNC_GUARD": sync_meta,
+                })
+                continue
+
+            else:
+                targeted_live = _v575d_targeted_live(rep, verification)
+                old_match = rep.get("match") or {}
+                old_score = old_match.get("score") or {}
+                new_score = targeted_live.get("score") or {}
+                old_minute = int(old_match.get("minute") or 0)
+                new_minute = int(targeted_live.get("minute") or old_minute)
+                minute_drift = new_minute - old_minute
+                score_conflict = not score_equal(old_score, new_score)
+                minute_conflict = abs(minute_drift) > int(FINAL_MINUTE_DRIFT_MAX)
+
+                sync_meta.update({
+                    "verification": verification,
+                    "verified_score": new_score,
+                    "verified_minute": new_minute,
+                    "minute_drift": minute_drift,
+                    "authoritative_source": f"targeted_{verification.get('endpoint') or 'details_summary'}",
+                })
+
+                if score_conflict:
+                    # Register the score change against the old state first.
+                    # This activates the existing post-goal cooldown and kills
+                    # the stale pre-goal ENTER deterministically.
+                    _v53_freshness_check(
+                        old_match,
+                        targeted_live,
+                        "TARGETED_SCORE_SYNC",
+                        1.0,
+                    )
+
+                    sync_meta.update({
+                        "status": "SCORE_CONFLICT",
+                        "old_enter_blocked": True,
+                        "recalculated": True,
+                        "conflict_type": "SCORE",
+                    })
+                    score_sync_guard["conflicts"].append({
+                        "match_id": mid,
+                        "match": sync_check["match"],
+                        "type": "SCORE_CONFLICT",
+                        "old_score": old_score,
+                        "fresh_score": new_score,
+                        "old_minute": old_minute,
+                        "fresh_minute": new_minute,
+                    })
+
+                    rep = _v575d_recalculate_report_from_targeted(rep, verification)
+                    match = rep.get("match") or {}
+                    momentum = _momentum_from_history(rep, previous_state.get(mid))
+                    momentum_map[mid] = momentum
+
+                    freshness = _v53_freshness_check(
+                        rep.get("match") or {},
+                        targeted_live,
+                        "TARGETED_SCORE_SYNC",
+                        1.0,
+                    )
+                    # Even if another freshness branch changes later, the old
+                    # ENTER is never allowed to survive a detected score conflict.
+                    if freshness.get("ok_for_enter"):
+                        freshness = _v575d_fail_closed_freshness(
+                            freshness,
+                            "SCORE_CONFLICT_RECALCULATED",
+                            verification,
+                        )
+
+                    score_sync_guard["recalculated"].append({
+                        "match_id": mid,
+                        "match": sync_check["match"],
+                        "fresh_score": new_score,
+                        "fresh_minute": new_minute,
+                    })
+                    sync_check["result"] = "SCORE_CONFLICT_RECALCULATED"
+
+                elif minute_conflict:
+                    # Targeted minute is authoritative, but a material time
+                    # disagreement blocks a strong entry on this scan.
+                    sync_meta.update({
+                        "status": "MINUTE_CONFLICT",
+                        "old_enter_blocked": True,
+                        "recalculated": True,
+                        "conflict_type": "MINUTE",
+                    })
+                    score_sync_guard["conflicts"].append({
+                        "match_id": mid,
+                        "match": sync_check["match"],
+                        "type": "MINUTE_CONFLICT",
+                        "score": new_score,
+                        "old_minute": old_minute,
+                        "fresh_minute": new_minute,
+                    })
+
+                    rep = _v575d_recalculate_report_from_targeted(rep, verification)
+                    match = rep.get("match") or {}
+                    momentum = _momentum_from_history(rep, previous_state.get(mid))
+                    momentum_map[mid] = momentum
+                    freshness = _v575d_fail_closed_freshness(
+                        freshness,
+                        "MINUTE_CONFLICT",
+                        verification,
+                    )
+                    score_sync_guard["recalculated"].append({
+                        "match_id": mid,
+                        "match": sync_check["match"],
+                        "fresh_score": new_score,
+                        "fresh_minute": new_minute,
+                    })
+                    sync_check["result"] = "MINUTE_CONFLICT_RECALCULATED"
+
+                else:
+                    # Same score and acceptable minute drift: targeted state
+                    # becomes authoritative. Recalculate on targeted minute so
+                    # the shown minute and the model are synchronized.
+                    rep = _v575d_recalculate_report_from_targeted(rep, verification)
+                    match = rep.get("match") or {}
+                    momentum = _momentum_from_history(rep, previous_state.get(mid))
+                    momentum_map[mid] = momentum
+                    freshness = _v53_freshness_check(
+                        rep.get("match") or {},
+                        targeted_live,
+                        "TARGETED_SCORE_SYNC",
+                        1.0,
+                    )
+                    if freshness.get("status") == "CONFIRMED":
+                        freshness["reason"] = "TARGETED_SCORE_SYNC"
+                        freshness["targeted_verify"] = {
+                            "endpoint": verification.get("endpoint"),
+                            "http_status": verification.get("http_status"),
+                            "score": new_score,
+                            "minute": new_minute,
+                        }
+
+                    sync_meta.update({
+                        "status": "VERIFIED",
+                        "recalculated": bool(minute_drift),
+                    })
+                    sync_check["result"] = "VERIFIED"
+
+        # Resolve learning and write the real decision journal only after the
+        # targeted Score Sync Guard has selected the authoritative live state.
         _v57_resolve_pending_for_match(
             learning_state,
             mid,
@@ -7090,6 +7523,53 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             learning_state,
             view,
         )
+        view["SCORE_SYNC_GUARD"] = sync_meta
+
+        # Last fail-closed invariant: a real strong output may exist only after
+        # targeted verification. Any accidental strong state without VERIFIED
+        # is downgraded before audit/registration/output.
+        final_sync_requirement = _v575d_score_sync_requirement(view)
+        if final_sync_requirement.get("required") and not _v575d_guard_allows_strong(view):
+            fail_reason = str(sync_meta.get("status") or "SCORE_SYNC_UNVERIFIED")
+            view["ADAPTIVE_BRIDGE_APPLIED"] = False
+            view["ADAPTIVE_BRIDGE_ITEMS"] = []
+            for _item in list(view.get("goal_board_65_99") or []):
+                if _item.get("decision") == "ENTER":
+                    _item["decision"] = "WATCH"
+                    _item["freshness_downgrade"] = True
+                    _item["score_sync_guard_block"] = fail_reason
+            for _item in list(view.get("DECISION_CONTROL_ITEMS") or []):
+                _flow = _item.get("FLOW") or {}
+                if _flow.get("state") in {"TAKE_SOON", "TAKE_NOW"}:
+                    _flow["state"] = "TAKE_LATER"
+                    _item["SCORE_SYNC_GUARD_BLOCK"] = fail_reason
+            for _item in list(view.get("ADAPTIVE_ITEMS") or []):
+                _flow = _item.get("FLOW") or {}
+                if _flow.get("state") in {"TAKE_SOON", "TAKE_NOW"}:
+                    _flow["state"] = "TAKE_LATER"
+                    _item["SCORE_SYNC_GUARD_BLOCK"] = fail_reason
+
+            # Refresh best pointers/text after fail-closed downgrade.
+            _order = {"TAKE_NOW": 5, "TAKE_SOON": 4, "TAKE_LATER": 3, "EMERGING": 2, "RADAR": 1, "PASS": 0}
+            _adaptive_items = list(view.get("ADAPTIVE_ITEMS") or [])
+            _adaptive_items.sort(
+                key=lambda z: (
+                    _order.get((z.get("FLOW") or {}).get("state"), 0),
+                    float(z.get("PRIORITY_SCORE") or 0),
+                ),
+                reverse=True,
+            )
+            view["ADAPTIVE_ITEMS"] = _adaptive_items
+            view["BEST_ADAPTIVE_SIGNAL"] = _adaptive_items[0] if _adaptive_items else None
+            _best = view.get("BEST_ADAPTIVE_SIGNAL") or {}
+            _state = (_best.get("FLOW") or {}).get("state")
+            if _state == "TAKE_LATER":
+                view["WHEN_TO_ENTER_ADAPTIVE"] = f"🟠 ПОЗЖЕ — Score Sync Guard: {fail_reason}"
+            elif _state in {"EMERGING", "RADAR"}:
+                view["WHEN_TO_ENTER_ADAPTIVE"] = f"👀 НАЗРЕВАЕТ — Score Sync Guard: {fail_reason}"
+            else:
+                view["WHEN_TO_ENTER_ADAPTIVE"] = f"🔴 ПРОПУСКАЕМ — Score Sync Guard: {fail_reason}"
+
         _v575c2_attach_match_audit(
             decision_journal,
             mid,
@@ -7172,7 +7652,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     enter_now = [
         c for c in candidates
         if (c.get("goal_board_65_99") or [{}])[0].get("decision") == "ENTER"
+        and float(((c.get("goal_board_65_99") or [{}])[0]).get("probability") or 0) >= V575D_SCORE_SYNC_MIN_PROB
         and (c.get("freshness") or {}).get("status") == "CONFIRMED"
+        and _v575d_guard_allows_strong(c)
     ]
 
     rising_now = [
@@ -7219,25 +7701,26 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     pressure_trend_now = []
 
     for c in candidates:
+        strong_sync_ok = _v575d_guard_allows_strong(c)
         adaptive_best = c.get("BEST_ADAPTIVE_SIGNAL") or {}
         adaptive_state = (adaptive_best.get("FLOW") or {}).get("state")
-        if adaptive_state == "TAKE_NOW":
+        if adaptive_state == "TAKE_NOW" and strong_sync_ok:
             adaptive_take_now.append(c)
-        elif adaptive_state == "TAKE_SOON":
+        elif adaptive_state == "TAKE_SOON" and strong_sync_ok:
             adaptive_take_soon.append(c)
         elif adaptive_state == "TAKE_LATER":
             adaptive_take_later.append(c)
         elif adaptive_state in {"EMERGING", "RADAR"}:
             adaptive_emerging.append(c)
 
-        if c.get("ADAPTIVE_BRIDGE_APPLIED"):
+        if c.get("ADAPTIVE_BRIDGE_APPLIED") and strong_sync_ok:
             adaptive_bridge_applied.append(c)
 
         controlled_best = c.get("BEST_CONTROLLED_SIGNAL") or {}
         controlled_state = (controlled_best.get("FLOW") or {}).get("state")
-        if controlled_state == "TAKE_NOW":
+        if controlled_state == "TAKE_NOW" and strong_sync_ok:
             controlled_take_now.append(c)
-        elif controlled_state == "TAKE_SOON":
+        elif controlled_state == "TAKE_SOON" and strong_sync_ok:
             controlled_take_soon.append(c)
         elif controlled_state == "TAKE_LATER":
             controlled_take_later.append(c)
@@ -7248,9 +7731,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             emerging_goal_now.append(c)
         if c.get("FIRST_HALF_EMERGING"):
             first_half_emerging_now.append(c)
-        if c.get("FLOW_TAKE_NOW"):
+        if c.get("FLOW_TAKE_NOW") and strong_sync_ok:
             flow_take_now.append(c)
-        if c.get("FLOW_TAKE_SOON"):
+        if c.get("FLOW_TAKE_SOON") and strong_sync_ok:
             flow_take_soon.append(c)
         if c.get("FLOW_TAKE_LATER"):
             flow_take_later.append(c)
@@ -7266,6 +7749,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     take_later = []
 
     for c in candidates:
+        strong_sync_ok = _v575d_guard_allows_strong(c)
         ts = c.get("TIMING_SECTIONS") or {}
         if ts.get("FIRST_HALF_GOAL"):
             first_half_now.append(c)
@@ -7278,9 +7762,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
 
         best_t = c.get("BEST_TIMING_ACTION") or {}
         action = (best_t.get("timing") or {}).get("action")
-        if action == "TAKE_NOW":
+        if action == "TAKE_NOW" and strong_sync_ok:
             take_now.append(c)
-        elif action == "SOON":
+        elif action == "SOON" and strong_sync_ok:
             take_soon.append(c)
         elif action == "LATER":
             take_later.append(c)
@@ -7376,6 +7860,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "FINAL_SNAPSHOT_BUDGET_AFTER": final_budget_after,
         "FINAL_MATCH_VERIFY": targeted_final_verify,
         "TARGETED_MATCH_VERIFY": targeted_final_verify.get("checked") or [],
+        "SCORE_SYNC_GUARD": score_sync_guard,
         "scan_budget_end": _v573_scan_budget_status(),
         "SCAN_BUDGET_INVARIANT_OK": int(_SCAN_BUDGET.get("used") or 0) <= int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN),
         "calls_last_60s_end": len(_PROVIDER_CALL_TIMES),
