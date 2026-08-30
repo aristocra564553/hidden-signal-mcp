@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5i-FIRST-HALF-V3.1.2-DIAGNOSTICS-PERSISTENT-STATE"
-MODEL_TYPE = "heuristic-v5.7.5i-first-half-v3.1.2-diagnostics-persistent-state-not-calibrated"
+VERSION = "V5.7.5k-FIRST-HALF-SMART-BUDGET-ROLLING-LIMIT-V3.1.2"
+MODEL_TYPE = "heuristic-v5.7.5k-first-half-smart-budget-rolling-limit-v3.1.2-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -199,6 +199,46 @@ SCAN_HISTORY_PATH = _v575f_configured_path("SCAN_HISTORY_PATH", "scan_history.js
 DECISION_JOURNAL_PATH = _v575f_configured_path("DECISION_JOURNAL_PATH", "decision_journal.json")
 LEARNING_STATE_PATH = _v575f_configured_path("LEARNING_STATE_PATH", "learning_state.json")
 FEED_GUARD_STATE_PATH = _v575f_configured_path("FEED_GUARD_STATE_PATH", "feed_guard_state.json")
+DEEP_ROTATION_QUEUE_PATH = _v575f_configured_path("DEEP_ROTATION_QUEUE_PATH", "deep_rotation_queue.json")
+
+def _v575j_state_storage_health() -> Dict[str, Any]:
+    """Atomic write/read probe. Persistent=True only means a non-/tmp state path is configured/detected."""
+    probe = os.path.join(STATE_STORAGE_DIR, ".v575j_state_health")
+    token = f"{os.getpid()}-{time.time_ns()}"
+    writable = False
+    roundtrip_ok = False
+    try:
+        tmp = probe + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(token)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, probe)
+        writable = True
+        with open(probe, "r", encoding="utf-8") as f:
+            roundtrip_ok = f.read() == token
+    except Exception:
+        writable = False
+        roundtrip_ok = False
+    finally:
+        for p in (probe, probe + ".tmp"):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    return {
+        "directory": STATE_STORAGE_DIR,
+        "mode": STATE_STORAGE_MODE,
+        "persistent": STATE_STORAGE_PERSISTENT,
+        "writable": writable,
+        "atomic_roundtrip_ok": roundtrip_ok,
+        "restart_survival_expected": bool(STATE_STORAGE_PERSISTENT and writable and roundtrip_ok),
+        "warning": STATE_STORAGE_WARNING,
+    }
+
 _REPEAT_MEMORY: Dict[str, Dict[str, Any]] = {}
 _MATCH_STATE_MEMORY: Dict[str, Dict[str, Any]] = {}
 _GOAL_COOLDOWN_UNTIL: Dict[str, float] = {}
@@ -379,11 +419,30 @@ PROVIDER_MAX_CALLS_PER_SCAN = int(os.environ.get("PROVIDER_MAX_CALLS_PER_SCAN", 
 PROVIDER_FINAL_SNAPSHOT_RESERVE = int(os.environ.get("PROVIDER_FINAL_SNAPSHOT_RESERVE", "1"))
 PROVIDER_TARGETED_VERIFY_RESERVE = int(os.environ.get("PROVIDER_TARGETED_VERIFY_RESERVE", "1"))
 
+# V5.7.5k: proactive budget planner. The balanced mode keeps the V5.7.5j
+# rotation logic, while focus="first_half" spends provider calls on 10'–40'
+# first halves first and uses a stats-first strategy.
+V575J_ENRICHMENT_RESERVE = max(0, int(os.environ.get("V575J_ENRICHMENT_RESERVE", "3")))
+V575J_FIRST_HALF_DEEP_SHARE = max(0.0, min(0.80, float(os.environ.get("V575J_FIRST_HALF_DEEP_SHARE", "0.55"))))
+V575J_ROTATION_KEEP_SECONDS = max(300, int(os.environ.get("V575J_ROTATION_KEEP_SECONDS", "1800")))
+V575J_ROTATION_MAX = max(20, int(os.environ.get("V575J_ROTATION_MAX", "100")))
+V575J_ROTATION_BOOST_PER_DEFER = max(1.0, float(os.environ.get("V575J_ROTATION_BOOST_PER_DEFER", "8")))
+V575J_ROTATION_BOOST_CAP = max(8.0, float(os.environ.get("V575J_ROTATION_BOOST_CAP", "32")))
+V575K_FIRST_HALF_START_MINUTE = max(1, int(os.environ.get("V575K_FIRST_HALF_START_MINUTE", "10")))
+V575K_FIRST_HALF_END_MINUTE = max(V575K_FIRST_HALF_START_MINUTE, int(os.environ.get("V575K_FIRST_HALF_END_MINUTE", "40")))
+V575K_FIRST_HALF_ENRICH_THRESHOLD = max(65.0, min(90.0, float(os.environ.get("V575K_FIRST_HALF_ENRICH_THRESHOLD", "70"))))
+V575K_FIRST_HALF_ENRICH_RESERVE = max(0, min(3, int(os.environ.get("V575K_FIRST_HALF_ENRICH_RESERVE", "0"))))
+V575K_ROLLING_MINUTE_FINAL_RESERVE = max(1, int(os.environ.get("V575K_ROLLING_MINUTE_FINAL_RESERVE", "1")))
+V575K_ROLLING_MINUTE_TARGETED_RESERVE = max(0, int(os.environ.get("V575K_ROLLING_MINUTE_TARGETED_RESERVE", "1")))
+_SCAN_FOCUS = {"mode": "balanced"}
+
 _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROVIDER_CALL_TIMES: List[float] = []
 _PROVIDER_LAST_CALL_AT = 0.0
 _PROVIDER_LOCK = asyncio.Lock()
 _SCAN_BUDGET = {"active": False, "used": 0, "limit": PROVIDER_MAX_CALLS_PER_SCAN}
+_SCAN_ENRICHMENT_BUDGET = {"active": False, "used": 0, "limit": V575J_ENRICHMENT_RESERVE}
+_SCAN_CORE_RESERVATION = {"active": False, "remaining": 0, "initial": 0}
 
 def _v573_cache_key(name: str, params: Optional[Dict[str, Any]]) -> str:
     raw = json.dumps({"name": name, "params": params or {}}, sort_keys=True, ensure_ascii=False)
@@ -424,6 +483,67 @@ def _v573_scan_budget_start() -> None:
     _SCAN_BUDGET["active"] = True
     _SCAN_BUDGET["used"] = 0
     _SCAN_BUDGET["limit"] = PROVIDER_MAX_CALLS_PER_SCAN
+    _SCAN_ENRICHMENT_BUDGET["active"] = True
+    _SCAN_ENRICHMENT_BUDGET["used"] = 0
+    _SCAN_ENRICHMENT_BUDGET["limit"] = V575J_ENRICHMENT_RESERVE
+    _SCAN_CORE_RESERVATION["active"] = True
+    _SCAN_CORE_RESERVATION["remaining"] = 0
+    _SCAN_CORE_RESERVATION["initial"] = 0
+
+def _v575j_enrichment_status() -> Dict[str, Any]:
+    used = int(_SCAN_ENRICHMENT_BUDGET.get("used") or 0)
+    limit = int(_SCAN_ENRICHMENT_BUDGET.get("limit") or 0)
+    return {
+        "active": bool(_SCAN_ENRICHMENT_BUDGET.get("active")),
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+    }
+
+def _v575j_core_reservation_status() -> Dict[str, Any]:
+    return {
+        "active": bool(_SCAN_CORE_RESERVATION.get("active")),
+        "initial": int(_SCAN_CORE_RESERVATION.get("initial") or 0),
+        "remaining": int(_SCAN_CORE_RESERVATION.get("remaining") or 0),
+    }
+
+def _v575j_set_core_reservation(slots: int) -> None:
+    slots = max(0, int(slots))
+    _SCAN_CORE_RESERVATION["active"] = True
+    _SCAN_CORE_RESERVATION["initial"] = slots
+    _SCAN_CORE_RESERVATION["remaining"] = slots
+
+async def _v575j_release_core_reservation(slots: int = 1) -> None:
+    slots = max(0, int(slots))
+    if slots <= 0:
+        return
+    async with _PROVIDER_LOCK:
+        remaining = int(_SCAN_CORE_RESERVATION.get("remaining") or 0)
+        _SCAN_CORE_RESERVATION["remaining"] = max(0, remaining - slots)
+
+async def _v575j_reserve_enrichment(cost: int) -> bool:
+    cost = max(0, int(cost))
+    if cost == 0:
+        return True
+    async with _PROVIDER_LOCK:
+        if not _SCAN_ENRICHMENT_BUDGET.get("active"):
+            return _v575b_normal_budget_remaining() >= cost if "_v575b_normal_budget_remaining" in globals() else True
+        used = int(_SCAN_ENRICHMENT_BUDGET.get("used") or 0)
+        limit = int(_SCAN_ENRICHMENT_BUDGET.get("limit") or 0)
+        if used + cost > limit:
+            return False
+        # Also respect actual provider budget AND core-stat slots that were
+        # already admitted but have not yet reached the provider gate. This is
+        # the stats-first guarantee: enrichment starts only after those core
+        # reservations can no longer be stolen by a fast coroutine.
+        st = _v573_scan_budget_status()
+        normal_remaining = max(0, int(st.get("normal_call_ceiling") or 0) - int(st.get("used") or 0))
+        core_remaining = int(_SCAN_CORE_RESERVATION.get("remaining") or 0)
+        optional_capacity = max(0, normal_remaining - core_remaining)
+        if optional_capacity < cost:
+            return False
+        _SCAN_ENRICHMENT_BUDGET["used"] = used + cost
+        return True
 
 def _v573_scan_budget_status() -> Dict[str, Any]:
     used = int(_SCAN_BUDGET.get("used") or 0)
@@ -477,12 +597,33 @@ async def _v573_provider_gate(
             normal_ceiling = max(0, limit - final_reserve - targeted_reserve)
             final_ceiling = max(0, limit - targeted_reserve)
 
-            if purpose == "normal" and used >= normal_ceiling:
+            if purpose in {"normal", "core_stats", "enrichment", "optional_context"} and used >= normal_ceiling:
                 return {
                     "allowed": False,
                     "reason": "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
                     "budget": _v573_scan_budget_status(),
                 }
+
+            # Optional calls may never steal budget reserved for core stats that
+            # have already been admitted by the deep planner but have not yet
+            # reached the provider gate. This closes the concurrency race where
+            # one fast visible match could consume 3 enrichment calls first.
+            if purpose in {"enrichment", "optional_context"}:
+                core_remaining = int(_SCAN_CORE_RESERVATION.get("remaining") or 0)
+                optional_ceiling = max(0, normal_ceiling - core_remaining)
+                if used >= optional_ceiling:
+                    return {
+                        "allowed": False,
+                        "reason": "DEEP_CORE_RESERVE_PROTECTED",
+                        "core_reservation": _v575j_core_reservation_status(),
+                        "budget": _v573_scan_budget_status(),
+                    }
+
+            if purpose == "core_stats" and _SCAN_CORE_RESERVATION.get("active"):
+                remaining = int(_SCAN_CORE_RESERVATION.get("remaining") or 0)
+                if remaining > 0:
+                    _SCAN_CORE_RESERVATION["remaining"] = remaining - 1
+
             if purpose == "final_snapshot" and used >= final_ceiling:
                 return {
                     "allowed": False,
@@ -534,6 +675,8 @@ class ZylaClient:
         if not force_refresh:
             cached = _v573_cache_get(name, params)
             if cached is not None:
+                if purpose == "core_stats":
+                    await _v575j_release_core_reservation(1)
                 return cached
 
         # V5.7.2 shared quota protection. The live guard itself is allowed
@@ -552,6 +695,8 @@ class ZylaClient:
                 }
         gate = await _v573_provider_gate(name, params, purpose=purpose)
         if not gate.get("allowed"):
+            if purpose == "core_stats":
+                await _v575j_release_core_reservation(1)
             return {
                 "ok": False,
                 "status": 429 if gate.get("reason") in {"RATE_LIMIT_COOLDOWN", "LOCAL_RATE_LIMIT"} else 0,
@@ -598,32 +743,32 @@ class ZylaClient:
             purpose=purpose,
         )
 
-    async def details(self, match_id: str) -> Dict[str, Any]:
-        return await self.get("details", {"match_id": match_id})
+    async def details(self, match_id: str, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("details", {"match_id": match_id}, purpose=purpose)
 
     async def summary(self, match_id: str) -> Dict[str, Any]:
         return await self.get("summary", {"match_id": match_id})
 
-    async def stats(self, match_id: str) -> Dict[str, Any]:
-        return await self.get("stats", {"match_id": match_id})
+    async def stats(self, match_id: str, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("stats", {"match_id": match_id}, purpose=purpose)
 
-    async def lineups(self, match_id: str) -> Dict[str, Any]:
-        return await self.get("lineups", {"match_id": match_id})
+    async def lineups(self, match_id: str, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("lineups", {"match_id": match_id}, purpose=purpose)
 
-    async def player_stats(self, match_id: str) -> Dict[str, Any]:
-        return await self.get("player_stats", {"match_id": match_id})
+    async def player_stats(self, match_id: str, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("player_stats", {"match_id": match_id}, purpose=purpose)
 
-    async def odds(self, match_id: str) -> Dict[str, Any]:
-        return await self.get("odds", {"match_id": match_id})
+    async def odds(self, match_id: str, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("odds", {"match_id": match_id}, purpose=purpose)
 
-    async def h2h(self, match_id: str) -> Dict[str, Any]:
-        return await self.get("h2h", {"match_id": match_id})
+    async def h2h(self, match_id: str, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("h2h", {"match_id": match_id}, purpose=purpose)
 
     async def team_details(self, team_url: str) -> Dict[str, Any]:
         return await self.get("team_details", {"team_url": team_url})
 
-    async def team_results(self, team_id: str, page: int = 1) -> Dict[str, Any]:
-        return await self.get("team_results", {"team_id": team_id, "page": max(1, int(page))})
+    async def team_results(self, team_id: str, page: int = 1, purpose: str = "normal") -> Dict[str, Any]:
+        return await self.get("team_results", {"team_id": team_id, "page": max(1, int(page))}, purpose=purpose)
 
     async def team_fixtures(self, team_id: str, page: int = 1) -> Dict[str, Any]:
         return await self.get("team_fixtures", {"team_id": team_id, "page": max(1, int(page))})
@@ -1827,7 +1972,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         odds_r = _v575b_not_requested()
         h2h_r = _v575b_not_requested()
 
-        stats_r = await client.stats(match_id)
+        stats_r = await client.stats(match_id, purpose="core_stats")
         api_calls += _v575b_real_call_count(stats_r)
 
         # If the core stats request was locally blocked because the normal
@@ -1891,20 +2036,32 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         # Tier 2: only a visible 65%+ candidate gets freshness/lineup/market
         # context. These endpoints may run concurrently, but the atomic budget
         # gate guarantees they cannot consume the final reserves.
-        if preliminary_best >= VISIBLE_SIGNAL_MIN:
-            details_r, lineups_r, odds_r = await asyncio.gather(
-                client.details(match_id),
-                client.lineups(match_id),
-                client.odds(match_id),
-            )
-            api_calls += _v575b_real_call_count(details_r, lineups_r, odds_r)
+        enrichment_threshold = (
+            V575K_FIRST_HALF_ENRICH_THRESHOLD
+            if _v575k_focus_mode() == "first_half"
+            else VISIBLE_SIGNAL_MIN
+        )
+        if preliminary_best >= enrichment_threshold:
+            # V5.7.5j: reserve all three Tier-2 calls atomically before starting
+            # them. This prevents two concurrent visible candidates from eating
+            # the core-stat slots of matches that were already admitted to deep.
+            if await _v575j_reserve_enrichment(3):
+                details_r, lineups_r, odds_r = await asyncio.gather(
+                    client.details(match_id, purpose="enrichment"),
+                    client.lineups(match_id, purpose="enrichment"),
+                    client.odds(match_id, purpose="enrichment"),
+                )
+                api_calls += _v575b_real_call_count(details_r, lineups_r, odds_r)
 
-            lineups = parse_lineups(lineups_r.get("data"))
-            odds = compact_odds(odds_r.get("data"))
+                lineups = parse_lineups(lineups_r.get("data"))
+                odds = compact_odds(odds_r.get("data"))
 
-            # Rebuild because lineup formation can make a small bounded change.
-            signals = build_signals(live, metrics, q, pressure, lineups)
-            analysis_tier = "VISIBLE_65_ENRICHED"
+                # Rebuild because lineup formation can make a small bounded change.
+                signals = build_signals(live, metrics, q, pressure, lineups)
+                analysis_tier = "VISIBLE_THRESHOLD_ENRICHED"
+            else:
+                # Core stats remain valid; only optional context is skipped.
+                analysis_tier = "VISIBLE_THRESHOLD_CORE_ONLY_ENRICHMENT_RESERVED"
 
         enriched_best = max(
             [
@@ -1919,10 +2076,14 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         # Tier 3: player/H2H context is descriptive, not required to create
         # the signal. Spend it only on a very strong candidate and only if
         # at least two normal-budget slots remain.
-        if enriched_best >= 78.0 and _v575b_normal_budget_remaining() >= 2:
+        if (
+            _v575k_focus_mode() != "first_half"
+            and enriched_best >= 78.0
+            and _v575b_normal_budget_remaining() >= 2
+        ):
             player_r, h2h_r = await asyncio.gather(
-                client.player_stats(match_id),
-                client.h2h(match_id),
+                client.player_stats(match_id, purpose="optional_context"),
+                client.h2h(match_id, purpose="optional_context"),
             )
             api_calls += _v575b_real_call_count(player_r, h2h_r)
             players = parse_player_stats(player_r.get("data"))
@@ -1937,7 +2098,8 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         history_context = {"available": False, "reason": "not_requested_by_priority_budget"}
         history_http = {"home": None, "away": None}
         if (
-            top_pre_context
+            _v575k_focus_mode() != "first_half"
+            and top_pre_context
             and max(
                 float(top_pre_context.get("probability") or 0),
                 float(top_pre_context.get("live_probability") or 0),
@@ -1948,8 +2110,8 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             away_id = live.get("away_team_id")
             if home_id and away_id:
                 home_hist_r, away_hist_r = await asyncio.gather(
-                    client.team_results(str(home_id), 1),
-                    client.team_results(str(away_id), 1),
+                    client.team_results(str(home_id), 1, purpose="optional_context"),
+                    client.team_results(str(away_id), 1, purpose="optional_context"),
                 )
                 api_calls += _v575b_real_call_count(home_hist_r, away_hist_r)
                 history_http = {"home": home_hist_r.get("status"), "away": away_hist_r.get("status")}
@@ -2061,6 +2223,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                 "team_history_http": history_http,
                 "estimated_api_calls": api_calls,
                 "scan_budget_at_report": _v573_scan_budget_status(),
+                "enrichment_budget_at_report": _v575j_enrichment_status(),
             },
         }
 
@@ -2121,6 +2284,11 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "adaptive_now_stability_guard",
             "persistent_state_guard",
             "diagnostics_budget_skip_separation",
+            "proactive_deep_budget_guard",
+            "rolling_minute_budget_guard",
+            "first_half_stats_first_guard",
+            "rotation_queue_guard",
+            "persistent_state_health_guard",
             "data_quality_guard",
             "early_match_guard",
             "small_sample_guard",
@@ -2190,6 +2358,14 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "persistent_state_resolver",
             "diagnostics_budget_skip_separation",
             "phase_quota_selection",
+            "dynamic_deep_budget_planner",
+            "rolling_60s_budget_planner",
+            "first_half_focus_mode",
+            "first_half_stats_first_pipeline",
+            "deferred_match_rotation_queue",
+            "first_half_deep_slot_reservation",
+            "atomic_tier2_enrichment_reserve",
+            "persistent_rotation_queue",
             "tournament_diversity_prefilter",
             "goal_chain_board",
             "quick_screenshot_goal_hunter",
@@ -2202,6 +2378,21 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "mode": STATE_STORAGE_MODE,
             "persistent": STATE_STORAGE_PERSISTENT,
             "warning": STATE_STORAGE_WARNING,
+            "health": _v575j_state_storage_health(),
+            "rotation_queue_path": DEEP_ROTATION_QUEUE_PATH,
+        },
+        "deep_budget_policy": {
+            "max_calls_per_scan": PROVIDER_MAX_CALLS_PER_SCAN,
+            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+            "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+            "tier2_enrichment_reserve_balanced": V575J_ENRICHMENT_RESERVE,
+            "tier2_enrichment_reserve_first_half": V575K_FIRST_HALF_ENRICH_RESERVE,
+            "first_half_deep_share_balanced": V575J_FIRST_HALF_DEEP_SHARE,
+            "first_half_focus_share": 1.0,
+            "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
+            "first_half_enrich_threshold": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+            "rolling_minute_aware": True,
+            "rotation_queue_enabled": True,
         },
         "notes": [
             "Probabilities are heuristic ranking estimates, not calibrated true probabilities.",
@@ -4127,6 +4318,292 @@ def _stage2_deep_selection(pool: List[Dict[str, Any]], limit: int) -> List[Dict[
     """
     return _diversified_scout_selection(pool, max(1, min(int(limit), 20)))
 
+
+# ============================================================
+# V5.7.5j — proactive deep budget + rotation queue
+# ============================================================
+
+def _v575j_load_rotation_queue() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(DEEP_ROTATION_QUEUE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _v575j_save_rotation_queue(queue: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        rows = sorted(
+            queue.items(),
+            key=lambda kv: (
+                int((kv[1] or {}).get("deferred_scans") or 0),
+                float((kv[1] or {}).get("last_scout_score") or 0),
+                float((kv[1] or {}).get("last_deferred_at") or 0),
+            ),
+            reverse=True,
+        )[:V575J_ROTATION_MAX]
+        payload = {k: v for k, v in rows}
+        tmp = DEEP_ROTATION_QUEUE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, DEEP_ROTATION_QUEUE_PATH)
+    except Exception:
+        pass
+
+
+def _v575j_prune_rotation_queue(
+    queue: Dict[str, Dict[str, Any]],
+    live_matches: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    now = time.time()
+    live_ids = {str(m.get("match_id") or "") for m in live_matches if m.get("match_id")}
+    out: Dict[str, Dict[str, Any]] = {}
+    for mid, row in (queue or {}).items():
+        if not mid or mid not in live_ids:
+            continue
+        age = now - float((row or {}).get("last_deferred_at") or now)
+        if age > V575J_ROTATION_KEEP_SECONDS:
+            continue
+        out[mid] = dict(row or {})
+    return out
+
+
+def _v575j_is_priority_first_half(m: Dict[str, Any]) -> bool:
+    minute = int(m.get("minute") or 0)
+    stage = str(m.get("stage") or "").lower()
+    return V575K_FIRST_HALF_START_MINUTE <= minute <= V575K_FIRST_HALF_END_MINUTE and "1st half" in stage
+
+
+def _v575k_normalize_focus(focus: Optional[str]) -> str:
+    raw = str(focus or "balanced").strip().lower().replace("-", "_")
+    if raw in {"1h", "firsthalf", "first_half", "fh", "first"}:
+        return "first_half"
+    return "balanced"
+
+
+def _v575k_focus_mode() -> str:
+    return _v575k_normalize_focus((_SCAN_FOCUS or {}).get("mode"))
+
+
+def _v575k_rolling_minute_status() -> Dict[str, Any]:
+    now = _v572_epoch()
+    _v573_trim_calls(now)
+    used = len(_PROVIDER_CALL_TIMES)
+    limit = max(1, int(PROVIDER_MAX_CALLS_PER_MINUTE))
+    remaining = max(0, limit - used)
+    final_reserve = min(remaining, max(1, int(V575K_ROLLING_MINUTE_FINAL_RESERVE)))
+    after_final = max(0, remaining - final_reserve)
+    targeted_reserve = min(after_final, max(0, int(V575K_ROLLING_MINUTE_TARGETED_RESERVE)))
+    normal_remaining = max(0, remaining - final_reserve - targeted_reserve)
+    oldest_age = None
+    seconds_until_one_slot = 0.0
+    if used >= limit and _PROVIDER_CALL_TIMES:
+        oldest = min(_PROVIDER_CALL_TIMES)
+        oldest_age = max(0.0, now - oldest)
+        seconds_until_one_slot = max(0.0, 60.0 - oldest_age)
+    return {
+        "used": used,
+        "limit": limit,
+        "remaining": remaining,
+        "final_snapshot_reserve": final_reserve,
+        "targeted_verify_reserve": targeted_reserve,
+        "normal_calls_available_now": normal_remaining,
+        "seconds_until_one_slot_if_full": round(seconds_until_one_slot, 1),
+        "oldest_call_age_seconds": None if oldest_age is None else round(oldest_age, 1),
+    }
+
+
+def _v575j_rotation_boost(m: Dict[str, Any], queue: Dict[str, Dict[str, Any]]) -> float:
+    row = queue.get(str(m.get("match_id") or "")) or {}
+    deferred = max(0, int(row.get("deferred_scans") or 0))
+    return min(V575J_ROTATION_BOOST_CAP, deferred * V575J_ROTATION_BOOST_PER_DEFER)
+
+
+def _v575j_budgeted_rank(m: Dict[str, Any], queue: Dict[str, Dict[str, Any]]) -> float:
+    score = float(smart_scout_rank(m) or 0)
+    score += _v575j_rotation_boost(m, queue)
+    # First-half windows decay quickly, so a small urgency bonus is justified.
+    if _v575j_is_priority_first_half(m):
+        score += 6.0
+    return score
+
+
+def _v575j_select_with_rotation(
+    pool: List[Dict[str, Any]],
+    limit: int,
+    queue: Dict[str, Dict[str, Any]],
+    focus: str = "balanced",
+) -> List[Dict[str, Any]]:
+    target = max(0, min(int(limit), 20))
+    if target <= 0:
+        return []
+
+    focus_mode = _v575k_normalize_focus(focus)
+    eligible_pool = list(pool)
+    if focus_mode == "first_half":
+        eligible_pool = [m for m in pool if _v575j_is_priority_first_half(m)]
+
+    ranked = sorted(eligible_pool, key=lambda m: _v575j_budgeted_rank(m, queue), reverse=True)
+    first_half_target = target if focus_mode == "first_half" else min(
+        target,
+        max(1, int(math.ceil(target * V575J_FIRST_HALF_DEEP_SHARE))),
+    )
+
+    selected: List[Dict[str, Any]] = []
+    ids = set()
+    tournament_counts: Dict[str, int] = {}
+
+    def can_add(m: Dict[str, Any], tournament_cap: int = 2) -> bool:
+        mid = str(m.get("match_id") or "")
+        if not mid or mid in ids:
+            return False
+        tid = str(m.get("tournament_id") or m.get("tournament") or "")
+        if tid and tournament_counts.get(tid, 0) >= tournament_cap:
+            return False
+        return True
+
+    def add(m: Dict[str, Any]) -> None:
+        mid = str(m.get("match_id") or "")
+        selected.append(m)
+        ids.add(mid)
+        tid = str(m.get("tournament_id") or m.get("tournament") or "")
+        if tid:
+            tournament_counts[tid] = tournament_counts.get(tid, 0) + 1
+
+    # Pass 1: reserve ~55% of safe deep slots for the 15'–40' first-half window.
+    for m in ranked:
+        if len(selected) >= first_half_target:
+            break
+        if not _v575j_is_priority_first_half(m) or not can_add(m):
+            continue
+        add(m)
+
+    # Pass 2: highest priority overall, with rotation boost and league diversity.
+    for m in ranked:
+        if len(selected) >= target:
+            break
+        if not can_add(m):
+            continue
+        add(m)
+
+    # Pass 3: if tournament caps prevented filling, relax diversity but not duplicates.
+    for m in ranked:
+        if len(selected) >= target:
+            break
+        mid = str(m.get("match_id") or "")
+        if not mid or mid in ids:
+            continue
+        add(m)
+
+    return selected
+
+
+def _v575j_deep_budget_plan(requested_limit: int, focus: str = "balanced") -> Dict[str, Any]:
+    focus_mode = _v575k_normalize_focus(focus)
+    st = _v573_scan_budget_status()
+    used = int(st.get("used") or 0)
+    normal_ceiling = int(st.get("normal_call_ceiling") or 0)
+    scan_normal_remaining = max(0, normal_ceiling - used)
+    requested = max(0, min(int(requested_limit), 20))
+
+    # V5.7.5k root fix: per-scan budget alone is insufficient. If the rolling
+    # 60-second window is already near 24/24, admitting 18 deep matches merely
+    # turns them into LOCAL_RATE_LIMIT failures. Plan against BOTH ceilings.
+    rolling = _v575k_rolling_minute_status()
+    rolling_normal_remaining = int(rolling.get("normal_calls_available_now") or 0)
+    normal_remaining = min(scan_normal_remaining, rolling_normal_remaining)
+
+    # In first-half focus, maximize coverage: core stats first. Expensive
+    # details/lineups/odds are not pre-reserved; they may use only genuine
+    # leftover capacity after admitted core calls. Balanced mode preserves j's
+    # one-candidate Tier-2 reserve.
+    desired_reserve = V575K_FIRST_HALF_ENRICH_RESERVE if focus_mode == "first_half" else V575J_ENRICHMENT_RESERVE
+    reserve = min(desired_reserve, max(0, normal_remaining - 1))
+    effective = min(requested, max(0, normal_remaining - reserve))
+    if requested > 0 and normal_remaining > 0 and effective <= 0:
+        effective = 1
+        reserve = max(0, normal_remaining - effective)
+
+    if rolling_normal_remaining < scan_normal_remaining:
+        binding = "ROLLING_60S_LIMIT"
+    elif scan_normal_remaining < rolling_normal_remaining:
+        binding = "PER_SCAN_LIMIT"
+    else:
+        binding = "BOTH_OR_EQUAL"
+
+    first_half_share = 1.0 if focus_mode == "first_half" else V575J_FIRST_HALF_DEEP_SHARE
+    return {
+        "focus": focus_mode,
+        "requested_limit": requested,
+        "effective_core_slots": effective,
+        "normal_budget_used_before_deep": used,
+        "normal_call_ceiling": normal_ceiling,
+        "scan_normal_calls_remaining_before_deep": scan_normal_remaining,
+        "rolling_minute": rolling,
+        "rolling_normal_calls_remaining_before_deep": rolling_normal_remaining,
+        "effective_normal_calls_available": normal_remaining,
+        "binding_constraint": binding,
+        "enrichment_reserve": reserve,
+        "expected_core_plus_enrichment_calls": effective + reserve,
+        "first_half_share_target": first_half_share,
+        "first_half_slots_target": min(
+            effective,
+            int(math.ceil(effective * first_half_share)) if effective else 0,
+        ),
+        "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
+        "first_half_enrich_threshold": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+        "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+        "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+        "proactive_budgeting": True,
+        "rolling_minute_budgeting": True,
+        "stats_first": focus_mode == "first_half",
+    }
+
+
+def _v575j_mark_deferred(
+    queue: Dict[str, Dict[str, Any]],
+    m: Dict[str, Any],
+    reason: str = "DEFERRED_BY_BUDGET",
+) -> Dict[str, Any]:
+    mid = str(m.get("match_id") or "")
+    if not mid:
+        return {}
+    now = time.time()
+    old = queue.get(mid) or {}
+    row = {
+        "match_id": mid,
+        "home": m.get("home"),
+        "away": m.get("away"),
+        "tournament": m.get("tournament"),
+        "bucket": _scout_bucket(m),
+        "last_minute": m.get("minute"),
+        "last_score": m.get("score"),
+        "first_deferred_at": float(old.get("first_deferred_at") or now),
+        "last_deferred_at": now,
+        "deferred_scans": int(old.get("deferred_scans") or 0) + 1,
+        "last_scout_score": float(smart_scout_rank(m) or 0),
+        "priority_boost_next_scan": min(
+            V575J_ROTATION_BOOST_CAP,
+            (int(old.get("deferred_scans") or 0) + 1) * V575J_ROTATION_BOOST_PER_DEFER,
+        ),
+        "reason": reason,
+    }
+    queue[mid] = row
+    return row
+
+
+def _v575j_queue_item_public(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "match_id": row.get("match_id"),
+        "match": f"{row.get('home')} — {row.get('away')}",
+        "minute": row.get("last_minute"),
+        "score": row.get("last_score"),
+        "bucket": row.get("bucket"),
+        "deferred_scans": row.get("deferred_scans"),
+        "priority_boost_next_scan": row.get("priority_boost_next_scan"),
+        "reason": row.get("reason"),
+    }
 
 
 # ============================================================
@@ -7487,6 +7964,9 @@ V575F_BUDGET_SKIP_CODES = {
     "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
     "TARGETED_VERIFY_RESERVE_EXHAUSTED",
     "SCAN_API_BUDGET_EXHAUSTED",
+    "DEEP_CORE_RESERVE_PROTECTED",
+    "LOCAL_RATE_LIMIT",
+    "RATE_LIMIT_COOLDOWN",
 }
 
 def _v575f_is_budget_skip(error: Any) -> bool:
@@ -7502,7 +7982,7 @@ def _v575f_failure_item(rep: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2) -> Dict[str, Any]:
+async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
     """
     Hidden Signal V5.3 — main live scanner.
 
@@ -7519,6 +7999,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
       10) expose only score-synced strong entries; visible WATCH/radar remain available
     """
     started = time.time()
+    focus_mode = _v575k_normalize_focus(focus)
+    _SCAN_FOCUS["mode"] = focus_mode
     previous_state = _load_scan_state()
     scan_history = _v55_load_history()
     decision_journal = _v56_load_journal()
@@ -7547,7 +8029,30 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         }
 
     pool = _stage1_live_pool(matches, max_pool=max_pool)
-    chosen = _stage2_deep_selection(pool, limit=limit)
+
+    # V5.7.5j: do not admit 18 matches when the provider budget can only
+    # guarantee ~8 core-stat calls after final/targeted/enrichment reserves.
+    rotation_queue = _v575j_prune_rotation_queue(_v575j_load_rotation_queue(), matches)
+    rotation_queue_before = len(rotation_queue)
+    deep_budget_plan = _v575j_deep_budget_plan(limit, focus=focus_mode)
+    requested_candidates = _v575j_select_with_rotation(pool, deep_budget_plan["requested_limit"], rotation_queue, focus=focus_mode)
+    chosen = _v575j_select_with_rotation(pool, deep_budget_plan["effective_core_slots"], rotation_queue, focus=focus_mode)
+    _v575j_set_core_reservation(len(chosen))
+    chosen_ids = {str(m.get("match_id") or "") for m in chosen}
+
+    budget_deferred = []
+    for m in requested_candidates:
+        if str(m.get("match_id") or "") in chosen_ids:
+            continue
+        defer_reason = (
+            "DEFERRED_BY_ROLLING_MINUTE_BUDGET"
+            if deep_budget_plan.get("binding_constraint") == "ROLLING_60S_LIMIT"
+            else "DEFERRED_BY_PROACTIVE_BUDGET"
+        )
+        row = _v575j_mark_deferred(rotation_queue, m, reason=defer_reason)
+        if row:
+            budget_deferred.append(_v575j_queue_item_public(row))
+    _v575j_save_rotation_queue(rotation_queue)
 
     # ---------- Deep analysis ----------
     sem = asyncio.Semaphore(max(1, min(int(concurrency), 3)))
@@ -7571,17 +8076,25 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     parser_failures = []
     budget_skipped = []
 
+    chosen_by_id = {str(m.get("match_id") or ""): m for m in chosen}
     ok_reports = []
     for rep in deep_reports:
+        mid = str(rep.get("match_id") or "")
         if rep.get("status") != "OK":
             failure = _v575f_failure_item(rep)
             if _v575f_is_budget_skip(failure.get("error")):
                 budget_skipped.append(failure)
+                m = chosen_by_id.get(mid)
+                if m:
+                    _v575j_mark_deferred(rotation_queue, m, reason="DEFERRED_AFTER_RUNTIME_BUDGET_GUARD")
             else:
                 parser_failures.append(failure)
+                # It was actually attempted, so do not let rotation endlessly
+                # retry a parser/data failure as if it had never been analyzed.
+                rotation_queue.pop(mid, None)
             continue
 
-        mid = str(rep.get("match_id") or "")
+        rotation_queue.pop(mid, None)
         prev = previous_state.get(mid)
         momentum = _momentum_from_history(rep, prev)
         momentum_map[mid] = momentum
@@ -7591,6 +8104,9 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         new_state[mid] = snap
         _v55_append_history(scan_history, mid, snap)
         ok_reports.append(rep)
+
+    _v575j_save_rotation_queue(rotation_queue)
+    rotation_queue_after = len(rotation_queue)
 
     # Preserve recent history for matches not selected in this pass.
     now_ts = time.time()
@@ -8344,8 +8860,20 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
 
         "live_matches_found": len(matches),
         "stage1_pool_size": len(pool),
+        "SCAN_FOCUS": focus_mode,
+        "requested_for_deep_analysis": deep_budget_plan.get("requested_limit"),
         "selected_for_deep_analysis": len(chosen),
+        "effective_deep_analysis_limit": deep_budget_plan.get("effective_core_slots"),
         "successfully_analyzed": len(ok_reports),
+        "DEEP_BUDGET_PLAN": deep_budget_plan,
+        "DEEP_ROTATION_QUEUE": {
+            "path": DEEP_ROTATION_QUEUE_PATH,
+            "persistent_with_state": STATE_STORAGE_PERSISTENT,
+            "size_before": rotation_queue_before,
+            "size_after": rotation_queue_after,
+            "deferred_this_scan": len(budget_deferred),
+            "items": budget_deferred[:12],
+        },
 
         # Main human sections:
         "ENTER_NOW": enter_now,
@@ -8405,8 +8933,12 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "hard_freshness_blocked": hard_blocked,
         "quality_blocked": quality_blocked,
         "parser_failures": parser_failures,
+        "budget_deferred": budget_deferred,
+        "budget_deferred_count": len(budget_deferred),
         "budget_skipped": budget_skipped,
         "budget_skipped_count": len(budget_skipped),
+        "enrichment_budget_end": _v575j_enrichment_status(),
+        "core_reservation_end": _v575j_core_reservation_status(),
         "scan_memory_matches": len(new_state),
         "final_live_matches_found": len(final_matches),
         "FINAL_SNAPSHOT_STATUS": final_snapshot_status,
@@ -8449,7 +8981,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "message": (
             f"{VERSION}: ENTER {len(enter_now)}, 65–99% {len(candidates)}, "
             f"rising {len(rising_now)}, radar 55–64 {len(radar_rising)}, "
-            f"memory {len(new_state)}, final_snapshot {final_snapshot_status}, "
+            f"memory {len(new_state)}, deep {len(ok_reports)}/{len(chosen)} of requested {deep_budget_plan.get('requested_limit')}, "
+            f"deferred {len(budget_deferred)}, final_snapshot {final_snapshot_status}, "
             f"targeted_recovered {len(targeted_final_verify.get('recovered') or {})}."
         ),
 
@@ -8521,7 +9054,17 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "max_calls_per_scan": PROVIDER_MAX_CALLS_PER_SCAN,
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+        "tier2_enrichment_reserve": V575J_ENRICHMENT_RESERVE,
+        "first_half_deep_share": V575J_FIRST_HALF_DEEP_SHARE,
         "atomic_budget_guard": True,
+        "proactive_deep_budgeting": True,
+        "rotation_queue": {
+            "enabled": True,
+            "path": DEEP_ROTATION_QUEUE_PATH,
+            "size": len(_v575j_load_rotation_queue()),
+            "keep_seconds": V575J_ROTATION_KEEP_SECONDS,
+            "max_items": V575J_ROTATION_MAX,
+        },
         "adaptive_audit_log": {
             "enabled": True,
             "journal_path": DECISION_JOURNAL_PATH,
@@ -8537,10 +9080,13 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         },
         "priority_analysis": {
             "tier_1": "stats_only",
-            "tier_2_threshold": VISIBLE_SIGNAL_MIN,
-            "tier_2": "details+lineups+odds",
+            "tier_2_threshold_balanced": VISIBLE_SIGNAL_MIN,
+            "tier_2_threshold_first_half": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+            "tier_2": "details+lineups+odds_if_budget",
             "tier_3_threshold": 78.0,
-            "tier_3": "player_stats+h2h_if_budget",
+            "tier_3": "player_stats+h2h_if_budget_balanced_only",
+            "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
+            "focus_supported": ["balanced", "first_half"],
         },
         "cache_entries": len(_PROVIDER_CACHE),
         "persistence": {
@@ -8548,6 +9094,7 @@ async def get_provider_guard_status() -> Dict[str, Any]:
             "mode": STATE_STORAGE_MODE,
             "persistent": STATE_STORAGE_PERSISTENT,
             "warning": STATE_STORAGE_WARNING,
+            "health": _v575j_state_storage_health(),
         },
         "persistence_paths": {
             "signal_log": SIGNAL_LOG_PATH,
@@ -8557,10 +9104,13 @@ async def get_provider_guard_status() -> Dict[str, Any]:
             "learning_state": LEARNING_STATE_PATH,
             "feed_guard_state": FEED_GUARD_STATE_PATH,
             "rate_limit_state": RATE_LIMIT_STATE_PATH,
+            "deep_rotation_queue": DEEP_ROTATION_QUEUE_PATH,
         },
         "feed_guard_state": _v575a_load_feed_guard_state(),
         "scan_budget": _v573_scan_budget_status(),
-        "note": "Provider-side exhausted account quota cannot be bypassed; this layer removes duplicate/burst traffic.",
+        "enrichment_budget": _v575j_enrichment_status(),
+        "core_reservation": _v575j_core_reservation_status(),
+        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5k proactively plans against both the per-scan and rolling 60-second budgets, prioritizes first-half core stats in focus mode, protects final/targeted reserves, and rotates deferred matches instead of misclassifying quota blocks as parser failures.",
     }
 
 @mcp.tool()
