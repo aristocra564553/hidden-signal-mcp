@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5h-FIRST-HALF-V3.1.1-DIAGNOSTICS-PERSISTENT-STATE"
-MODEL_TYPE = "heuristic-v5.7.5h-first-half-v3.1.1-diagnostics-persistent-state-not-calibrated"
+VERSION = "V5.7.5i-FIRST-HALF-V3.1.2-DIAGNOSTICS-PERSISTENT-STATE"
+MODEL_TYPE = "heuristic-v5.7.5i-first-half-v3.1.2-diagnostics-persistent-state-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -4727,6 +4727,7 @@ FLOW_EMERGING_MIN = 55.0
 FLOW_VISIBLE_MIN = 65.0
 FLOW_ENTER_MIN = 75.0
 FLOW_HISTORY_KEEP = 12
+FIRST_HALF_DOMINANCE_DISPLAY_FLOOR = 60.0
 FLOW_TREND_KEEP = 4
 
 
@@ -4915,7 +4916,7 @@ def _v55_first_half_engine(
     history_seq: Optional[List[Dict[str, Any]]] = None,
     freshness: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """FIRST HALF ENGINE V3.1.1 integrated into Hidden Signal.
+    """FIRST HALF ENGINE V3.1.2 integrated into Hidden Signal.
 
     Safety/integration fixes over V3.1:
     - can rescue a first-half candidate even when the legacy HT board was <55%;
@@ -5133,6 +5134,15 @@ def _v55_first_half_engine(
     if not evidence:
         p = min(p, 59.0)
 
+    # V3.1.2 rescue floor. A verified static-dominance pattern (for example
+    # 6 shots + 3 SOT with a large pressure gap) must at least reach the
+    # dedicated 60% first-half radar even when the legacy HT model is <55%.
+    # This is display-only: DQ/freshness guards below can still cap/block it.
+    dominance_floor_applied = False
+    if evidence and dominance_override and p < FIRST_HALF_DOMINANCE_DISPLAY_FLOOR:
+        p = FIRST_HALF_DOMINANCE_DISPLAY_FLOOR
+        dominance_floor_applied = True
+
     # Re-apply data-quality safety AFTER all V3.1 boosts so dominance cannot
     # accidentally bypass the existing Data Quality Guard.
     dq_score = float(q.get("score") or 0)
@@ -5203,6 +5213,8 @@ def _v55_first_half_engine(
     ]
     if dominance_override:
         reasons.append("STATIC_DOMINANCE_OVERRIDE: сильное доминирование, trend_score не обязателен")
+    if dominance_floor_applied:
+        reasons.append(f"DOMINANCE_DISPLAY_FLOOR: минимум {FIRST_HALF_DOMINANCE_DISPLAY_FLOOR:.0f}% для 1Т-радара")
     if attack_chain_active:
         reasons.append(f"ATTACK_CHAIN {leader_name}: {round1(chain_score)}")
     if false_detected:
@@ -5214,7 +5226,7 @@ def _v55_first_half_engine(
 
     return {
         "active": True,
-        "engine_version": "FIRST_HALF_ENGINE_V3.1.1-INTEGRATED",
+        "engine_version": "FIRST_HALF_ENGINE_V3.1.2-INTEGRATED",
         "minute_window": window,
         "probability": p,
         "probability_goal_before_ht": p,
@@ -5228,6 +5240,7 @@ def _v55_first_half_engine(
         "trend_score": round1(trend_score),
         "trend_required": not dominance_override,
         "dominance_override": dominance_override,
+        "dominance_floor_applied": dominance_floor_applied,
         "pressure_team": leader_name,
         "pressure_home": round1(pressure_home),
         "pressure_away": round1(pressure_away),
@@ -5528,6 +5541,7 @@ def _v55_enrich_view(
             "probability_away_goal_before_ht": first_half.get("probability_away_goal_before_ht"),
             "goal_window": first_half.get("goal_window"),
             "dominance_override": first_half.get("dominance_override"),
+            "dominance_floor_applied": first_half.get("dominance_floor_applied"),
             "trend_required": first_half.get("trend_required"),
             "false_pressure": first_half.get("false_pressure"),
             "data_quality": first_half.get("data_quality"),
