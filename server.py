@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5k-FIRST-HALF-SMART-BUDGET-ROLLING-LIMIT-V3.1.2"
-MODEL_TYPE = "heuristic-v5.7.5k-first-half-smart-budget-rolling-limit-v3.1.2-not-calibrated"
+VERSION = "V5.7.5l1-FIRST-HALF-DEDICATED-5-43-FIXED-FINAL"
+MODEL_TYPE = "heuristic-v5.7.5l1-first-half-dedicated-5-43-fixed-final-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -420,16 +420,18 @@ PROVIDER_FINAL_SNAPSHOT_RESERVE = int(os.environ.get("PROVIDER_FINAL_SNAPSHOT_RE
 PROVIDER_TARGETED_VERIFY_RESERVE = int(os.environ.get("PROVIDER_TARGETED_VERIFY_RESERVE", "1"))
 
 # V5.7.5k: proactive budget planner. The balanced mode keeps the V5.7.5j
-# rotation logic, while focus="first_half" spends provider calls on 10'–40'
-# first halves first and uses a stats-first strategy.
+# rotation logic, while focus="first_half" spends every available normal
+# provider call on 5'–43' first halves first and uses a stats-first strategy.
 V575J_ENRICHMENT_RESERVE = max(0, int(os.environ.get("V575J_ENRICHMENT_RESERVE", "3")))
 V575J_FIRST_HALF_DEEP_SHARE = max(0.0, min(0.80, float(os.environ.get("V575J_FIRST_HALF_DEEP_SHARE", "0.55"))))
 V575J_ROTATION_KEEP_SECONDS = max(300, int(os.environ.get("V575J_ROTATION_KEEP_SECONDS", "1800")))
 V575J_ROTATION_MAX = max(20, int(os.environ.get("V575J_ROTATION_MAX", "100")))
 V575J_ROTATION_BOOST_PER_DEFER = max(1.0, float(os.environ.get("V575J_ROTATION_BOOST_PER_DEFER", "8")))
 V575J_ROTATION_BOOST_CAP = max(8.0, float(os.environ.get("V575J_ROTATION_BOOST_CAP", "32")))
-V575K_FIRST_HALF_START_MINUTE = max(1, int(os.environ.get("V575K_FIRST_HALF_START_MINUTE", "10")))
-V575K_FIRST_HALF_END_MINUTE = max(V575K_FIRST_HALF_START_MINUTE, int(os.environ.get("V575K_FIRST_HALF_END_MINUTE", "40")))
+# V5.7.5l1: dedicated first-half window is intentionally FIXED.
+# Do not let stale Render env vars from older 10-40 builds silently change it.
+V575K_FIRST_HALF_START_MINUTE = 5
+V575K_FIRST_HALF_END_MINUTE = 43
 V575K_FIRST_HALF_ENRICH_THRESHOLD = max(65.0, min(90.0, float(os.environ.get("V575K_FIRST_HALF_ENRICH_THRESHOLD", "70"))))
 V575K_FIRST_HALF_ENRICH_RESERVE = max(0, min(3, int(os.environ.get("V575K_FIRST_HALF_ENRICH_RESERVE", "0"))))
 V575K_ROLLING_MINUTE_FINAL_RESERVE = max(1, int(os.environ.get("V575K_ROLLING_MINUTE_FINAL_RESERVE", "1")))
@@ -2361,6 +2363,9 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "dynamic_deep_budget_planner",
             "rolling_60s_budget_planner",
             "first_half_focus_mode",
+            "dedicated_first_half_scan_endpoint",
+            "first_half_window_5_43",
+            "first_half_all_available_core_budget",
             "first_half_stats_first_pipeline",
             "deferred_match_rotation_queue",
             "first_half_deep_slot_reservation",
@@ -2391,6 +2396,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "first_half_focus_share": 1.0,
             "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
             "first_half_enrich_threshold": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+            "dedicated_first_half_endpoint": "scan_first_half_live",
+            "first_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_FIRST_HALF_CORE_STATS",
             "rolling_minute_aware": True,
             "rotation_queue_enabled": True,
         },
@@ -4370,9 +4377,31 @@ def _v575j_prune_rotation_queue(
 
 
 def _v575j_is_priority_first_half(m: Dict[str, Any]) -> bool:
+    """V5.7.5l: tolerant 1H detector for the dedicated 5'–43' scanner.
+
+    Minute is the primary gate. Explicit second-half/HT/finished stages are rejected.
+    Common first-half labels are accepted, and an in-progress fallback is allowed
+    when the provider omits a clean stage label.
+    """
     minute = int(m.get("minute") or 0)
-    stage = str(m.get("stage") or "").lower()
-    return V575K_FIRST_HALF_START_MINUTE <= minute <= V575K_FIRST_HALF_END_MINUTE and "1st half" in stage
+    if not (V575K_FIRST_HALF_START_MINUTE <= minute <= V575K_FIRST_HALF_END_MINUTE):
+        return False
+
+    stage = re.sub(r"\s+", " ", str(m.get("stage") or "").strip().lower())
+    explicit_block = (
+        "2nd half", "second half", "2h", "half time", "halftime", "ht",
+        "finished", "full time", "ft", "extra time", "penalties"
+    )
+    if any(token == stage or token in stage for token in explicit_block):
+        return False
+
+    explicit_first = ("1st half", "first half", "1h", "1. half", "1 half")
+    if any(token == stage or token in stage for token in explicit_first):
+        return True
+
+    # Provider occasionally supplies a generic live stage. The 5'–43' minute
+    # window plus in-progress status is a safe fallback for first-half focus.
+    return bool(m.get("is_in_progress", True))
 
 
 def _v575k_normalize_focus(focus: Optional[str]) -> str:
@@ -4471,7 +4500,7 @@ def _v575j_select_with_rotation(
         if tid:
             tournament_counts[tid] = tournament_counts.get(tid, 0) + 1
 
-    # Pass 1: reserve ~55% of safe deep slots for the 15'–40' first-half window.
+    # Pass 1: in dedicated first-half mode, 100% of safe deep slots are 5'–43'.
     for m in ranked:
         if len(selected) >= first_half_target:
             break
@@ -5577,7 +5606,11 @@ def _v55_first_half_engine(
 
     # Start from the already-guarded native HT market estimate whenever present.
     p = float(base_p)
-    if 10 <= minute <= 19:
+    if 5 <= minute <= 9:
+        # V5.7.5l: we now scan from 5', but keep a conservative early-sample
+        # penalty so a tiny sample cannot create an aggressive first-half entry.
+        window = "EARLY_FORMATION"; p -= 4
+    elif 10 <= minute <= 19:
         window = "FORMATION"; p -= 2
     elif 20 <= minute <= 34:
         window = "PRIME"; p += 2
@@ -9055,7 +9088,10 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "tier2_enrichment_reserve": V575J_ENRICHMENT_RESERVE,
-        "first_half_deep_share": V575J_FIRST_HALF_DEEP_SHARE,
+        "first_half_enrichment_pre_reserve": V575K_FIRST_HALF_ENRICH_RESERVE,
+        "first_half_deep_share_balanced": V575J_FIRST_HALF_DEEP_SHARE,
+        "first_half_deep_share_dedicated": 1.0,
+        "dedicated_first_half_endpoint": "scan_first_half_live",
         "atomic_budget_guard": True,
         "proactive_deep_budgeting": True,
         "rotation_queue": {
@@ -9110,7 +9146,7 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "scan_budget": _v573_scan_budget_status(),
         "enrichment_budget": _v575j_enrichment_status(),
         "core_reservation": _v575j_core_reservation_status(),
-        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5k proactively plans against both the per-scan and rolling 60-second budgets, prioritizes first-half core stats in focus mode, protects final/targeted reserves, and rotates deferred matches instead of misclassifying quota blocks as parser failures.",
+        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5l scan_first_half_live dedicates all currently available normal deep-analysis calls to 5'–43' first halves, while preserving only final-snapshot and targeted Score Sync safety reserves. Deferred 1H matches rotate to the next scan instead of becoming parser failures.",
     }
 
 @mcp.tool()
@@ -9458,6 +9494,42 @@ async def quick_screenshot_goal_hunter(
         "report": _goal_hunter_view(rep),
         "latency_ms": int((time.time() - started) * 1000),
     }
+
+
+@mcp.tool()
+async def scan_first_half_live() -> Dict[str, Any]:
+    """
+    V5.7.5l dedicated first-half scanner.
+
+    Fixed policy:
+      - only live matches from 5' through 43' are admitted to deep analysis;
+      - every currently available normal provider call is spent on 1H core stats;
+      - no second-half match can consume a deep-analysis slot;
+      - final live snapshot and targeted Score Sync keep their safety reserves;
+      - rolling 24/60s and per-scan 14-call guards are still respected.
+
+    This endpoint intentionally exposes no `focus` argument so MCP schema caching
+    cannot silently fall back to balanced mode.
+    """
+    result = await scan_final_live(
+        limit=20,
+        max_pool=120,
+        concurrency=2,
+        focus="first_half",
+    )
+    if isinstance(result, dict):
+        result["FIRST_HALF_ONLY_MODE"] = True
+        result["FIRST_HALF_WINDOW"] = [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE]
+        result["FIRST_HALF_BUDGET_POLICY"] = {
+            "deep_share": 1.0,
+            "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
+            "second_half_deep_slots": 0,
+            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+            "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+            "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
+            "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
+        }
+    return result
 
 
 @mcp.tool()
