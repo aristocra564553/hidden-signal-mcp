@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5n-QUALITY-BUILD-DUAL-HALF-FINAL"
-MODEL_TYPE = "heuristic-v5.7.5n-quality-build-dual-half-not-calibrated"
+VERSION = "V5.7.5o-ATOMIC-ROLLING-GUARD-DUAL-HALF-FINAL"
+MODEL_TYPE = "heuristic-v5.7.5o-atomic-rolling-guard-dual-half-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -458,6 +458,10 @@ _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
 _PROVIDER_CALL_TIMES: List[float] = []
 _PROVIDER_LAST_CALL_AT = 0.0
 _PROVIDER_LOCK = asyncio.Lock()
+# V5.7.5o: all full scans are serialized because scan budget/focus/history are
+# process-global state. Without this lock, concurrent 1H/2H scans can overwrite
+# each other's focus and budget counters.
+_SCAN_EXECUTION_LOCK = asyncio.Lock()
 _SCAN_BUDGET = {"active": False, "used": 0, "limit": PROVIDER_MAX_CALLS_PER_SCAN}
 _SCAN_ENRICHMENT_BUDGET = {"active": False, "used": 0, "limit": V575J_ENRICHMENT_RESERVE}
 _SCAN_CORE_RESERVATION = {"active": False, "remaining": 0, "initial": 0}
@@ -508,6 +512,20 @@ def _v573_scan_budget_start() -> None:
     _SCAN_CORE_RESERVATION["remaining"] = 0
     _SCAN_CORE_RESERVATION["initial"] = 0
 
+
+def _v575o_scan_budget_end() -> None:
+    """Release per-scan state after every success, early return, or exception."""
+    _SCAN_BUDGET["active"] = False
+    _SCAN_BUDGET["used"] = 0
+    _SCAN_BUDGET["limit"] = PROVIDER_MAX_CALLS_PER_SCAN
+    _SCAN_ENRICHMENT_BUDGET["active"] = False
+    _SCAN_ENRICHMENT_BUDGET["used"] = 0
+    _SCAN_ENRICHMENT_BUDGET["limit"] = V575J_ENRICHMENT_RESERVE
+    _SCAN_CORE_RESERVATION["active"] = False
+    _SCAN_CORE_RESERVATION["remaining"] = 0
+    _SCAN_CORE_RESERVATION["initial"] = 0
+    _SCAN_FOCUS["mode"] = "balanced"
+
 def _v575j_enrichment_status() -> Dict[str, Any]:
     used = int(_SCAN_ENRICHMENT_BUDGET.get("used") or 0)
     limit = int(_SCAN_ENRICHMENT_BUDGET.get("limit") or 0)
@@ -550,16 +568,26 @@ async def _v575j_reserve_enrichment(cost: int) -> bool:
         limit = int(_SCAN_ENRICHMENT_BUDGET.get("limit") or 0)
         if used + cost > limit:
             return False
-        # Also respect actual provider budget AND core-stat slots that were
-        # already admitted but have not yet reached the provider gate. This is
-        # the stats-first guarantee: enrichment starts only after those core
-        # reservations can no longer be stolen by a fast coroutine.
-        st = _v573_scan_budget_status()
-        normal_remaining = max(0, int(st.get("normal_call_ceiling") or 0) - int(st.get("used") or 0))
+
+        # V5.7.5o: enrichment must fit simultaneously inside BOTH budgets and
+        # must not steal slots from core calls already admitted by the planner.
+        scan_st = _v573_scan_budget_status()
+        scan_normal_remaining = max(
+            0,
+            int(scan_st.get("normal_call_ceiling") or 0) - int(scan_st.get("used") or 0),
+        )
+        rolling_st = _v575k_rolling_minute_status()
+        rolling_normal_remaining = max(0, int(rolling_st.get("normal_calls_available_now") or 0))
         core_remaining = int(_SCAN_CORE_RESERVATION.get("remaining") or 0)
-        optional_capacity = max(0, normal_remaining - core_remaining)
+
+        scan_optional_capacity = max(0, scan_normal_remaining - core_remaining)
+        rolling_optional_capacity = max(0, rolling_normal_remaining - core_remaining)
+        optional_capacity = min(scan_optional_capacity, rolling_optional_capacity)
         if optional_capacity < cost:
             return False
+
+        # This logical reservation is serialized, preventing another candidate
+        # from claiming the same optional headroom concurrently.
         _SCAN_ENRICHMENT_BUDGET["used"] = used + cost
         return True
 
@@ -597,14 +625,19 @@ async def _v573_provider_gate(
         now = _v572_epoch()
         _v573_trim_calls(now)
 
-        if len(_PROVIDER_CALL_TIMES) >= PROVIDER_MAX_CALLS_PER_MINUTE:
-            wait = max(1.0, 60.0 - (now - min(_PROVIDER_CALL_TIMES)))
+        # V5.7.5o: the rolling 24/60 window has the same hard purpose
+        # separation as the per-scan 14-call budget. Normal/core/enrichment
+        # cannot consume the final-snapshot or targeted-verification slots.
+        rolling_gate = _v575o_rolling_purpose_gate(purpose)
+        if not rolling_gate.get("allowed"):
             return {
                 "allowed": False,
-                "reason": "LOCAL_RATE_LIMIT",
-                "retry_after": round(wait, 1),
+                "reason": rolling_gate.get("reason"),
+                "retry_after": rolling_gate.get("retry_after"),
                 "calls_last_60s": len(_PROVIDER_CALL_TIMES),
                 "limit_per_minute": PROVIDER_MAX_CALLS_PER_MINUTE,
+                "rolling": rolling_gate.get("rolling"),
+                "purpose": purpose,
             }
 
         if _SCAN_BUDGET.get("active"):
@@ -2029,10 +2062,12 @@ def _v575b_real_call_count(*responses: Dict[str, Any]) -> int:
 
 
 def _v575b_normal_budget_remaining() -> int:
-    st = _v573_scan_budget_status()
-    used = int(st.get("used") or 0)
-    ceiling = int(st.get("normal_call_ceiling") or 0)
-    return max(0, ceiling - used)
+    scan_st = _v573_scan_budget_status()
+    used = int(scan_st.get("used") or 0)
+    ceiling = int(scan_st.get("normal_call_ceiling") or 0)
+    scan_remaining = max(0, ceiling - used)
+    rolling_remaining = max(0, int(_v575k_rolling_minute_status().get("normal_calls_available_now") or 0))
+    return min(scan_remaining, rolling_remaining)
 
 
 async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2098,6 +2133,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
             and stats_r.get("error") in {
                 "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
                 "SCAN_API_BUDGET_EXHAUSTED",
+                "ROLLING_BUDGET_RESERVED_FOR_FINAL_GUARDS",
                 "LOCAL_RATE_LIMIT",
                 "RATE_LIMIT_COOLDOWN",
             }
@@ -2429,6 +2465,11 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "diagnostics_budget_skip_separation",
             "proactive_deep_budget_guard",
             "rolling_minute_budget_guard",
+            "atomic_rolling_purpose_reserve_guard",
+            "serialized_full_scan_guard",
+            "scan_budget_lifecycle_guard",
+            "final_snapshot_rolling_reserve_guard",
+            "targeted_verify_rolling_reserve_guard",
             "first_half_stats_first_guard",
             "second_half_stats_first_guard",
             "dedicated_half_budget_isolation_guard",
@@ -2523,6 +2564,12 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "deferred_match_rotation_queue",
             "first_half_deep_slot_reservation",
             "atomic_tier2_enrichment_reserve",
+            "rolling_aware_tier2_enrichment_reserve",
+            "rolling_reserve_invariant_diagnostics",
+            "targeted_verify_counter_fix",
+            "full_scan_serialization",
+            "scan_budget_release_on_exit",
+            "standalone_call_budget_isolation",
             "persistent_rotation_queue",
             "tournament_diversity_prefilter",
             "goal_chain_board",
@@ -2563,6 +2610,9 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "first_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_FIRST_HALF_CORE_STATS",
             "second_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_SECOND_HALF_CORE_STATS",
             "rolling_minute_aware": True,
+            "rolling_purpose_reserves_hard": True,
+            "rolling_final_snapshot_reserve": V575K_ROLLING_MINUTE_FINAL_RESERVE,
+            "rolling_targeted_verify_reserve": V575K_ROLLING_MINUTE_TARGETED_RESERVE,
             "rotation_queue_enabled": True,
             "dq_zero_backoff_seconds": V575N_DQ_ZERO_BACKOFF_SECONDS,
             "coverage_priority_enabled": True,
@@ -4612,30 +4662,105 @@ def _v575k_focus_mode() -> str:
 
 
 def _v575k_rolling_minute_status() -> Dict[str, Any]:
+    """
+    V5.7.5o hard rolling-window budget.
+
+    The key difference from V5.7.5n is that final/targeted reserves are expressed
+    as absolute ceilings by PURPOSE, not merely subtracted in the planner.
+    Therefore a fast enrichment coroutine cannot consume the last rolling slots
+    after the deep planner has already run.
+    """
     now = _v572_epoch()
     _v573_trim_calls(now)
     used = len(_PROVIDER_CALL_TIMES)
     limit = max(1, int(PROVIDER_MAX_CALLS_PER_MINUTE))
     remaining = max(0, limit - used)
-    final_reserve = min(remaining, max(1, int(V575K_ROLLING_MINUTE_FINAL_RESERVE)))
-    after_final = max(0, remaining - final_reserve)
-    targeted_reserve = min(after_final, max(0, int(V575K_ROLLING_MINUTE_TARGETED_RESERVE)))
-    normal_remaining = max(0, remaining - final_reserve - targeted_reserve)
+
+    final_reserve_cfg = max(1, int(V575K_ROLLING_MINUTE_FINAL_RESERVE))
+    targeted_reserve_cfg = max(0, int(V575K_ROLLING_MINUTE_TARGETED_RESERVE))
+    # Never create impossible negative ceilings if someone misconfigures env vars.
+    targeted_reserve = min(limit, targeted_reserve_cfg)
+    final_reserve = min(max(0, limit - targeted_reserve), final_reserve_cfg)
+
+    normal_ceiling = max(0, limit - final_reserve - targeted_reserve)
+    final_ceiling = max(0, limit - targeted_reserve)
+    targeted_ceiling = limit
+    reserves_active = bool(_SCAN_BUDGET.get("active"))
+    effective_normal_ceiling = normal_ceiling if reserves_active else limit
+    effective_final_ceiling = final_ceiling if reserves_active else limit
+
+    normal_remaining = max(0, effective_normal_ceiling - used)
+    final_remaining = max(0, effective_final_ceiling - used)
+    targeted_remaining = max(0, targeted_ceiling - used)
+
     oldest_age = None
     seconds_until_one_slot = 0.0
     if used >= limit and _PROVIDER_CALL_TIMES:
         oldest = min(_PROVIDER_CALL_TIMES)
         oldest_age = max(0.0, now - oldest)
         seconds_until_one_slot = max(0.0, 60.0 - oldest_age)
+
     return {
         "used": used,
         "limit": limit,
         "remaining": remaining,
         "final_snapshot_reserve": final_reserve,
         "targeted_verify_reserve": targeted_reserve,
+        "reserves_active": reserves_active,
+        "normal_ceiling": normal_ceiling,
+        "final_snapshot_ceiling": final_ceiling,
+        "targeted_verify_ceiling": targeted_ceiling,
+        "effective_normal_ceiling": effective_normal_ceiling,
+        "effective_final_snapshot_ceiling": effective_final_ceiling,
         "normal_calls_available_now": normal_remaining,
+        "final_snapshot_calls_available_now": final_remaining,
+        "targeted_verify_calls_available_now": targeted_remaining,
+        "final_snapshot_slot_protected": (not reserves_active) or (used < final_ceiling),
+        "targeted_slot_protected": (not reserves_active) or (targeted_reserve <= 0) or (used < targeted_ceiling),
         "seconds_until_one_slot_if_full": round(seconds_until_one_slot, 1),
         "oldest_call_age_seconds": None if oldest_age is None else round(oldest_age, 1),
+    }
+
+
+def _v575o_rolling_purpose_gate(purpose: str) -> Dict[str, Any]:
+    """Synchronous decision helper; caller must serialize admission under _PROVIDER_LOCK."""
+    st = _v575k_rolling_minute_status()
+    used = int(st.get("used") or 0)
+    limit = int(st.get("limit") or PROVIDER_MAX_CALLS_PER_MINUTE)
+    normal_ceiling = int(st.get("effective_normal_ceiling") or st.get("normal_ceiling") or 0)
+    final_ceiling = int(st.get("effective_final_snapshot_ceiling") or st.get("final_snapshot_ceiling") or 0)
+    reserves_active = bool(st.get("reserves_active"))
+
+    if purpose in {"normal", "core_stats", "enrichment", "optional_context"}:
+        allowed = used < normal_ceiling
+        reason = None if allowed else (
+            "ROLLING_BUDGET_RESERVED_FOR_FINAL_GUARDS" if reserves_active else "LOCAL_RATE_LIMIT"
+        )
+    elif purpose == "final_snapshot":
+        allowed = used < final_ceiling
+        reason = None if allowed else (
+            "ROLLING_FINAL_SNAPSHOT_RESERVE_EXHAUSTED" if reserves_active else "LOCAL_RATE_LIMIT"
+        )
+    elif purpose == "targeted_verify":
+        allowed = used < limit
+        reason = None if allowed else "LOCAL_RATE_LIMIT"
+    else:
+        # Unknown purposes fail conservatively as normal calls.
+        allowed = used < normal_ceiling
+        reason = None if allowed else "ROLLING_BUDGET_RESERVED_FOR_FINAL_GUARDS"
+
+    wait = 0.0
+    if not allowed and _PROVIDER_CALL_TIMES:
+        now = _v572_epoch()
+        oldest = min(_PROVIDER_CALL_TIMES)
+        wait = max(0.0, 60.0 - (now - oldest))
+
+    return {
+        "allowed": allowed,
+        "reason": reason,
+        "retry_after": round(max(1.0, wait), 1) if not allowed else 0.0,
+        "rolling": st,
+        "purpose": purpose,
     }
 
 
@@ -8451,6 +8576,8 @@ V575F_BUDGET_SKIP_CODES = {
     "TARGETED_VERIFY_RESERVE_EXHAUSTED",
     "SCAN_API_BUDGET_EXHAUSTED",
     "DEEP_CORE_RESERVE_PROTECTED",
+    "ROLLING_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+    "ROLLING_FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
     "LOCAL_RATE_LIMIT",
     "RATE_LIMIT_COOLDOWN",
 }
@@ -8467,10 +8594,9 @@ def _v575f_failure_item(rep: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@mcp.tool()
-async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
+async def _scan_final_live_impl(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
     """
-    Hidden Signal V5.7.5n — main live scanner.
+    Hidden Signal V5.7.5o — main live scanner.
 
     focus modes: balanced / first_half / second_half.
 
@@ -8635,16 +8761,39 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     # reserve budget for this call and bypass the short live cache so the final
     # snapshot is a real provider refresh, not a blocked/old pseudo-snapshot.
     final_budget_before = _v573_scan_budget_status()
+    rolling_before_final = _v575k_rolling_minute_status()
+    final_snapshot_slot_guaranteed = bool(rolling_before_final.get("final_snapshot_slot_protected"))
     final_client = ZylaClient()
+    final_r: Dict[str, Any] = {
+        "ok": False,
+        "status": 0,
+        "data": None,
+        "error": "FINAL_SNAPSHOT_NOT_EXECUTED",
+    }
+    final_matches: List[Dict[str, Any]] = []
     try:
-        final_r = await final_client.live(
-            force_refresh=True,
-            purpose="final_snapshot",
-        )
-        final_matches = flatten_live(final_r.get("data"))
+        try:
+            final_r = await final_client.live(
+                force_refresh=True,
+                purpose="final_snapshot",
+            )
+            final_matches = flatten_live(final_r.get("data"))
+        except Exception as e:
+            final_r = {
+                "ok": False,
+                "status": 0,
+                "data": None,
+                "error": f"FINAL_SNAPSHOT_EXCEPTION:{type(e).__name__}:{str(e)[:180]}",
+            }
+            final_matches = []
     finally:
         await final_client.close()
     final_budget_after = _v573_scan_budget_status()
+    rolling_after_final = _v575k_rolling_minute_status()
+    targeted_slot_guaranteed_after_final = bool(
+        int(rolling_after_final.get("targeted_verify_reserve") or 0) <= 0
+        or int(rolling_after_final.get("used") or 0) < int(rolling_after_final.get("targeted_verify_ceiling") or PROVIDER_MAX_CALLS_PER_MINUTE)
+    )
 
     final_http_status = int(final_r.get("status") or 0)
     final_error = final_r.get("error")
@@ -8663,6 +8812,8 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
         "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
         "SCAN_API_BUDGET_EXHAUSTED",
+        "ROLLING_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+        "ROLLING_FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
     }:
         final_snapshot_status = "FINAL_SNAPSHOT_GUARD_BLOCKED"
     elif final_http_status == 429:
@@ -9466,15 +9617,30 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "FINAL_SNAPSHOT_STATUS": final_snapshot_status,
         "FINAL_SNAPSHOT_HTTP": final_http_status,
         "FINAL_SNAPSHOT_ERROR": final_error,
+        "FINAL_SNAPSHOT_RATE_LIMIT_SCOPE": (
+            "LOCAL_GUARD" if final_error in {
+                "LOCAL_RATE_LIMIT",
+                "ROLLING_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+                "ROLLING_FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
+                "SCAN_BUDGET_RESERVED_FOR_FINAL_GUARDS",
+                "FINAL_SNAPSHOT_RESERVE_EXHAUSTED",
+            } else ("PROVIDER" if final_http_status == 429 else None)
+        ),
         "FINAL_SNAPSHOT_CACHE_HIT": final_cache_hit,
         "FINAL_SNAPSHOT_PAYLOAD_IS_LIST": final_payload_is_list,
         "FINAL_SNAPSHOT_BUDGET_BEFORE": final_budget_before,
         "FINAL_SNAPSHOT_BUDGET_AFTER": final_budget_after,
+        "ROLLING_GUARD_BEFORE_FINAL": rolling_before_final,
+        "ROLLING_GUARD_AFTER_FINAL": rolling_after_final,
+        "FINAL_SNAPSHOT_SLOT_GUARANTEED_BEFORE_CALL": final_snapshot_slot_guaranteed,
+        "TARGETED_SLOT_GUARANTEED_AFTER_FINAL": targeted_slot_guaranteed_after_final,
         "FINAL_MATCH_VERIFY": targeted_final_verify,
         "TARGETED_MATCH_VERIFY": targeted_final_verify.get("checked") or [],
         "SCORE_SYNC_GUARD": score_sync_guard,
         "scan_budget_end": _v573_scan_budget_status(),
         "SCAN_BUDGET_INVARIANT_OK": int(_SCAN_BUDGET.get("used") or 0) <= int(_SCAN_BUDGET.get("limit") or PROVIDER_MAX_CALLS_PER_SCAN),
+        "ROLLING_LIMIT_INVARIANT_OK": len(_PROVIDER_CALL_TIMES) <= int(PROVIDER_MAX_CALLS_PER_MINUTE),
+        "ROLLING_RESERVE_INVARIANT_OK": bool(final_snapshot_slot_guaranteed),
         "calls_last_60s_end": len(_PROVIDER_CALL_TIMES),
 
         "stage1_top": [
@@ -9513,9 +9679,27 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
 
 
 @mcp.tool()
+async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
+    """
+    V5.7.5o serialized public scanner. Exactly one full scan owns the global
+    focus/budget state at a time; per-scan state is always released afterwards.
+    """
+    async with _SCAN_EXECUTION_LOCK:
+        try:
+            return await _scan_final_live_impl(
+                limit=limit,
+                max_pool=max_pool,
+                concurrency=concurrency,
+                focus=focus,
+            )
+        finally:
+            _v575o_scan_budget_end()
+
+
+@mcp.tool()
 async def scan_first_half_live() -> Dict[str, Any]:
     """
-    V5.7.5n dedicated first-half scanner.
+    V5.7.5o dedicated first-half scanner.
 
     Fixed policy:
       - only live matches from 5' through 43' are admitted to deep analysis;
@@ -9551,7 +9735,7 @@ async def scan_first_half_live() -> Dict[str, Any]:
 @mcp.tool()
 async def scan_second_half_live() -> Dict[str, Any]:
     """
-    V5.7.5n dedicated second-half scanner.
+    V5.7.5o dedicated second-half scanner.
 
     Fixed policy:
       - only regulation-time live matches from 46' through 90' are admitted;
@@ -9586,6 +9770,19 @@ async def scan_second_half_live() -> Dict[str, Any]:
 @mcp.tool()
 async def verify_live_match(match_id: str) -> Dict[str, Any]:
     """Targeted freshness check for one match_id using details/summary."""
+    if _SCAN_EXECUTION_LOCK.locked():
+        return {
+            "version": VERSION,
+            "match_id": match_id,
+            "TARGETED_VERIFY": {
+                "verified": False,
+                "status": "SCAN_BUSY",
+                "reason": "ACTIVE_FULL_SCAN_OWNS_TARGETED_RESERVE",
+                "attempts": [],
+            },
+            "rate_limit": _v572_rate_status(),
+            "scan_budget": _v573_scan_budget_status(),
+        }
     result = await _v574_verify_match_id(match_id)
     return {
         "version": VERSION,
@@ -9653,6 +9850,10 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "dedicated_first_half_endpoint": "scan_first_half_live",
         "dedicated_second_half_endpoint": "scan_second_half_live",
         "atomic_budget_guard": True,
+        "atomic_rolling_purpose_reserve_guard": True,
+        "scan_execution_locked": _SCAN_EXECUTION_LOCK.locked(),
+        "scan_budget_lifecycle_active": bool(_SCAN_BUDGET.get("active")),
+        "rolling_minute_budget": _v575k_rolling_minute_status(),
         "proactive_deep_budgeting": True,
         "data_coverage_priority": True,
         "dq_zero_backoff_seconds": V575N_DQ_ZERO_BACKOFF_SECONDS,
@@ -9718,7 +9919,7 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "scan_budget": _v573_scan_budget_status(),
         "enrichment_budget": _v575j_enrichment_status(),
         "core_reservation": _v575j_core_reservation_status(),
-        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5n dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
+        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5o dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
     }
 
 @mcp.tool()
