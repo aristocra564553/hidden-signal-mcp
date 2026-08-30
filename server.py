@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5m-DUAL-HALF-DEDICATED-BUDGET-FINAL"
-MODEL_TYPE = "heuristic-v5.7.5m-dual-half-dedicated-budget-not-calibrated"
+VERSION = "V5.7.5n-QUALITY-BUILD-DUAL-HALF-FINAL"
+MODEL_TYPE = "heuristic-v5.7.5n-quality-build-dual-half-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -200,6 +200,7 @@ DECISION_JOURNAL_PATH = _v575f_configured_path("DECISION_JOURNAL_PATH", "decisio
 LEARNING_STATE_PATH = _v575f_configured_path("LEARNING_STATE_PATH", "learning_state.json")
 FEED_GUARD_STATE_PATH = _v575f_configured_path("FEED_GUARD_STATE_PATH", "feed_guard_state.json")
 DEEP_ROTATION_QUEUE_PATH = _v575f_configured_path("DEEP_ROTATION_QUEUE_PATH", "deep_rotation_queue.json")
+DATA_COVERAGE_STATE_PATH = _v575f_configured_path("DATA_COVERAGE_STATE_PATH", "data_coverage_state.json")
 
 def _v575j_state_storage_health() -> Dict[str, Any]:
     """Atomic write/read probe. Persistent=True only means a non-/tmp state path is configured/detected."""
@@ -440,6 +441,15 @@ V575M_SECOND_HALF_START_MINUTE = 46
 V575M_SECOND_HALF_END_MINUTE = 90
 V575M_SECOND_HALF_ENRICH_THRESHOLD = max(65.0, min(90.0, float(os.environ.get("V575M_SECOND_HALF_ENRICH_THRESHOLD", "70"))))
 V575M_SECOND_HALF_ENRICH_RESERVE = max(0, min(3, int(os.environ.get("V575M_SECOND_HALF_ENRICH_RESERVE", "0"))))
+
+# V5.7.5n: data-coverage learning is local-only and consumes zero provider calls.
+# DQ=0 matches are temporarily backed off so repeated scans do not burn scarce
+# core-stat slots on the same provider coverage hole every few seconds.
+V575N_DQ_ZERO_BACKOFF_SECONDS = max(30, min(600, int(os.environ.get("V575N_DQ_ZERO_BACKOFF_SECONDS", "120"))))
+V575N_DQ_ZERO_BACKOFF_MAX_SECONDS = max(V575N_DQ_ZERO_BACKOFF_SECONDS, min(1800, int(os.environ.get("V575N_DQ_ZERO_BACKOFF_MAX_SECONDS", "600"))))
+V575N_COVERAGE_KEEP_SECONDS = max(1800, min(172800, int(os.environ.get("V575N_COVERAGE_KEEP_SECONDS", "43200"))))
+V575N_COVERAGE_MAX_TOURNAMENTS = max(50, min(1000, int(os.environ.get("V575N_COVERAGE_MAX_TOURNAMENTS", "300"))))
+V575N_COVERAGE_SAMPLE_CAP = max(4, min(50, int(os.environ.get("V575N_COVERAGE_SAMPLE_CAP", "20"))))
 V575K_ROLLING_MINUTE_FINAL_RESERVE = max(1, int(os.environ.get("V575K_ROLLING_MINUTE_FINAL_RESERVE", "1")))
 V575K_ROLLING_MINUTE_TARGETED_RESERVE = max(0, int(os.environ.get("V575K_ROLLING_MINUTE_TARGETED_RESERVE", "1")))
 _SCAN_FOCUS = {"mode": "balanced"}
@@ -901,10 +911,10 @@ def pick_live(live_matches: List[Dict[str, Any]], match_id: str) -> Optional[Dic
 
 STAT_ALIASES = {
     "xg": ["Expected goals (xG)", "Expected goals", "xG"],
-    "shots": ["Total shots", "Shots"],
-    "shots_on_target": ["Shots on target", "Shots on Target"],
-    "shots_in_box": ["Shots inside the box", "Shots in the box"],
-    "touches_in_box": ["Touches in opposition box", "Touches in the box", "Touches in penalty area"],
+    "shots": ["Total shots", "Shots", "Goal attempts", "Shots total", "Attempts"],
+    "shots_on_target": ["Shots on target", "Shots on Target", "Shots on goal", "On target", "Attempts on target"],
+    "shots_in_box": ["Shots inside the box", "Shots in the box", "Shots from inside box", "Shots inside box"],
+    "touches_in_box": ["Touches in opposition box", "Touches in the box", "Touches in penalty area", "Touches in opponent box", "Touches in penalty box", "Penalty area touches"],
     "corners": ["Corner kicks", "Corners"],
     "possession": ["Ball possession", "Possession"],
     "xa": ["Expected assists (xA)", "Expected assists", "xA"],
@@ -913,38 +923,119 @@ STAT_ALIASES = {
     "dangerous_attacks": ["Dangerous attacks", "Dangerous Attacks"],
 }
 
+def _v575n_stat_name(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    s = s.replace("expected goals (xg)", "xg").replace("expected assists (xa)", "xa")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _v575n_row_name(row: Dict[str, Any]) -> str:
+    for key in ("name", "stat", "label", "title", "type", "metric"):
+        if row.get(key) not in (None, ""):
+            return str(row.get(key))
+    return ""
+
+
+def _v575n_side_value(row: Dict[str, Any], side: str) -> Optional[float]:
+    keys = (
+        ("home_team", "home", "home_value", "value_home", "homeTeam", "homeValue")
+        if side == "home" else
+        ("away_team", "away", "away_value", "value_away", "awayTeam", "awayValue")
+    )
+    for key in keys:
+        if key in row:
+            v = safe_float(row.get(key))
+            if v is not None:
+                return v
+    values = row.get("values") or row.get("value")
+    if isinstance(values, dict):
+        for key in keys:
+            if key in values:
+                v = safe_float(values.get(key))
+                if v is not None:
+                    return v
+    return None
+
+
 def stats_rows(data: Any) -> List[Dict[str, Any]]:
-    if isinstance(data, dict):
-        for key in ("match", "stats", "statistics"):
-            rows = data.get(key)
-            if isinstance(rows, list):
-                return [r for r in rows if isinstance(r, dict)]
-        # sometimes nested
-        for v in data.values():
-            if isinstance(v, dict):
-                rows = v.get("match")
-                if isinstance(rows, list):
-                    return [r for r in rows if isinstance(r, dict)]
-    if isinstance(data, list):
-        # direct stat rows
-        if all(isinstance(x, dict) and "name" in x for x in data):
-            return data
-    return []
+    """Best-effort recursive stat-row extractor with a strict depth/size bound.
+
+    Zyla/Flashscore payload shape differs between leagues. Older builds only
+    accepted one exact nesting shape, which could turn valid stats into DQ=0.
+    This collector accepts common nested containers without guessing values.
+    """
+    best: List[Dict[str, Any]] = []
+    seen = 0
+
+    def walk(node: Any, depth: int = 0) -> None:
+        nonlocal best, seen
+        if depth > 5 or seen > 1200:
+            return
+        seen += 1
+        if isinstance(node, list):
+            rows = [x for x in node if isinstance(x, dict)]
+            named = [x for x in rows if _v575n_row_name(x)]
+            if len(named) > len(best):
+                best = named
+            for x in node[:80]:
+                if isinstance(x, (dict, list)):
+                    walk(x, depth + 1)
+            return
+        if isinstance(node, dict):
+            # Prefer likely statistics containers first.
+            for key in ("match", "stats", "statistics", "match_stats", "matchStats", "data", "items", "groups"):
+                if key in node and isinstance(node.get(key), (dict, list)):
+                    walk(node.get(key), depth + 1)
+            for key, value in list(node.items())[:100]:
+                if key in {"match", "stats", "statistics", "match_stats", "matchStats", "data", "items", "groups"}:
+                    continue
+                if isinstance(value, (dict, list)):
+                    walk(value, depth + 1)
+
+    walk(data)
+    return best
+
 
 def find_stat(rows: List[Dict[str, Any]], aliases: List[str]) -> Dict[str, Any]:
-    alias_norm = {a.strip().lower() for a in aliases}
+    alias_norm = {_v575n_stat_name(a) for a in aliases}
+    # Conservative schema synonyms. They improve parsing only; no probability
+    # or signal threshold is changed by this map.
+    synonym_map = {
+        "goal attempts": "total shots",
+        "shots total": "total shots",
+        "attempts": "total shots",
+        "shots on goal": "shots on target",
+        "on target": "shots on target",
+        "attempts on target": "shots on target",
+        "shots from inside box": "shots inside the box",
+        "shots inside box": "shots inside the box",
+        "touches in opponent box": "touches in opposition box",
+        "touches in penalty box": "touches in opposition box",
+        "penalty area touches": "touches in opposition box",
+        "corner": "corners",
+        "corner kicks": "corners",
+        "ball possession": "possession",
+        "expected goals": "xg",
+        "expected assists": "xa",
+    }
+    alias_norm |= {synonym_map.get(x, x) for x in list(alias_norm)}
+
     for r in rows:
-        n = str(r.get("name") or "").strip().lower()
-        if n in alias_norm:
-            h = safe_float(r.get("home_team"))
-            a = safe_float(r.get("away_team"))
+        raw_name = _v575n_row_name(r)
+        n = _v575n_stat_name(raw_name)
+        canonical = synonym_map.get(n, n)
+        if n in alias_norm or canonical in alias_norm:
+            h = _v575n_side_value(r, "home")
+            a = _v575n_side_value(r, "away")
             return {
                 "home": h,
                 "away": a,
                 "total": (h + a) if h is not None and a is not None else None,
                 "present": h is not None and a is not None,
+                "matched_name": raw_name or None,
             }
-    return {"home": None, "away": None, "total": None, "present": False}
+    return {"home": None, "away": None, "total": None, "present": False, "matched_name": None}
 
 def parse_metrics(stats_data: Any, live: Dict[str, Any]) -> Dict[str, Any]:
     rows = stats_rows(stats_data)
@@ -996,15 +1087,31 @@ def quality_guard(metrics: Dict[str, Any]) -> Dict[str, Any]:
     # 1) advanced attacking metric is present, or
     # 2) basic shot sample is already large enough to be informative.
     strong_eligible = basic_ok and score >= 45 and (advanced_count >= 1 or robust_basic_sample)
+    # This flag is display/analysis only. It must never create ENTER by itself.
+    # Useful when one basic field is missing but multiple independent attacking
+    # metrics are present (e.g. xG + box touches + corners).
+    analysis_only_eligible = (not basic_ok) and score >= 30 and advanced_count >= 2
     level = "HIGH" if strong_eligible and score >= 75 else ("MEDIUM" if basic_ok and score >= 45 else "LOW")
+    if strong_eligible:
+        quality_reason = "STRONG_ELIGIBLE"
+    elif analysis_only_eligible:
+        quality_reason = "ANALYSIS_ONLY_PARTIAL_STATS"
+    elif score <= 0:
+        quality_reason = "NO_USABLE_STATS"
+    elif not basic_ok:
+        quality_reason = "MISSING_BASIC_SHOTS_OR_SOT"
+    else:
+        quality_reason = "INSUFFICIENT_ADVANCED_OR_SAMPLE"
     return {
         "score": score,
         "level": level,
         "basic_ok": basic_ok,
         "advanced_count": advanced_count,
         "robust_basic_sample": robust_basic_sample,
-        "eligibility_path": "advanced" if (basic_ok and advanced_count >= 1 and score >= 45) else ("robust_basic" if robust_basic_sample and score >= 45 else "blocked"),
+        "analysis_only_eligible": analysis_only_eligible,
+        "eligibility_path": "advanced" if (basic_ok and advanced_count >= 1 and score >= 45) else ("robust_basic" if robust_basic_sample and score >= 45 else ("analysis_only" if analysis_only_eligible else "blocked")),
         "strong_eligible": strong_eligible,
+        "quality_reason": quality_reason,
         "missing": missing,
     }
 
@@ -2016,6 +2123,31 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                 },
             }
 
+        # A genuine provider/HTTP failure is not a valid deep report. Previous
+        # builds could silently turn it into DQ=0 and count it as analyzed.
+        if not stats_r.get("ok"):
+            return {
+                "source": "football-reactor-v5",
+                "version": VERSION,
+                "model_type": MODEL_TYPE,
+                "match_id": match_id,
+                "status": "CORE_STATS_REQUEST_FAILED",
+                "error": stats_r.get("error") or f"HTTP_{int(stats_r.get('status') or 0)}",
+                "match": {
+                    "home": live.get("home"),
+                    "away": live.get("away"),
+                    "tournament": live.get("tournament"),
+                    "minute": live.get("minute"),
+                    "score": live.get("score"),
+                },
+                "diagnostic": {
+                    "stats_http": stats_r.get("status"),
+                    "scan_budget": _v573_scan_budget_status(),
+                    "analysis_tier": "CORE_STATS_FAILED",
+                    "estimated_api_calls": api_calls,
+                },
+            }
+
         parsed = parse_metrics(stats_r.get("data"), live)
         metrics = parsed["metrics"]
         q = quality_guard(metrics)
@@ -2226,6 +2358,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
                 "summary_http": summary_r.get("status"),
                 "stats_http": stats_r.get("status"),
                 "stats_rows_count": len(parsed["rows"]),
+                "stats_payload_status": "OK" if len(parsed["rows"]) > 0 else "EMPTY_STATS",
                 "lineups_http": lineups_r.get("status"),
                 "player_stats_http": player_r.get("status"),
                 "odds_http": odds_r.get("status"),
@@ -2304,6 +2437,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "rotation_queue_guard",
             "persistent_state_health_guard",
             "data_quality_guard",
+            "data_coverage_backoff_guard",
+            "stats_schema_tolerance_guard",
             "early_match_guard",
             "small_sample_guard",
             "red_card_uncertainty_guard",
@@ -2395,6 +2530,10 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "final_freshness_after_deep_scan",
             "screenshot_quick_bridge",
             "phase_balanced_live_collector",
+            "provider_stats_schema_tolerant_parser",
+            "dq_zero_backoff",
+            "tournament_data_coverage_priority",
+            "early_mcp_dedicated_endpoint_registration",
         ],
         "state_storage": {
             "directory": STATE_STORAGE_DIR,
@@ -2403,6 +2542,7 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "warning": STATE_STORAGE_WARNING,
             "health": _v575j_state_storage_health(),
             "rotation_queue_path": DEEP_ROTATION_QUEUE_PATH,
+            "data_coverage_state_path": DATA_COVERAGE_STATE_PATH,
         },
         "deep_budget_policy": {
             "max_calls_per_scan": PROVIDER_MAX_CALLS_PER_SCAN,
@@ -2424,6 +2564,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "second_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_SECOND_HALF_CORE_STATS",
             "rolling_minute_aware": True,
             "rotation_queue_enabled": True,
+            "dq_zero_backoff_seconds": V575N_DQ_ZERO_BACKOFF_SECONDS,
+            "coverage_priority_enabled": True,
         },
         "notes": [
             "Probabilities are heuristic ranking estimates, not calibrated true probabilities.",
@@ -4497,15 +4639,164 @@ def _v575k_rolling_minute_status() -> Dict[str, Any]:
     }
 
 
+def _v575n_load_coverage_state() -> Dict[str, Any]:
+    try:
+        with open(DATA_COVERAGE_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"matches": {}, "tournaments": {}}
+        return {
+            "matches": data.get("matches") if isinstance(data.get("matches"), dict) else {},
+            "tournaments": data.get("tournaments") if isinstance(data.get("tournaments"), dict) else {},
+        }
+    except Exception:
+        return {"matches": {}, "tournaments": {}}
+
+
+def _v575n_save_coverage_state(state: Dict[str, Any]) -> None:
+    try:
+        now = time.time()
+        matches = {}
+        for mid, row in (state.get("matches") or {}).items():
+            if not isinstance(row, dict):
+                continue
+            if now - float(row.get("updated_at") or now) <= V575N_COVERAGE_KEEP_SECONDS:
+                matches[str(mid)] = row
+
+        tournaments_rows = []
+        for key, row in (state.get("tournaments") or {}).items():
+            if not isinstance(row, dict):
+                continue
+            if now - float(row.get("updated_at") or now) <= V575N_COVERAGE_KEEP_SECONDS:
+                tournaments_rows.append((str(key), row))
+        tournaments_rows.sort(key=lambda kv: float((kv[1] or {}).get("updated_at") or 0), reverse=True)
+        tournaments = dict(tournaments_rows[:V575N_COVERAGE_MAX_TOURNAMENTS])
+
+        payload = {"matches": matches, "tournaments": tournaments, "updated_at": now}
+        tmp = DATA_COVERAGE_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, DATA_COVERAGE_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _v575n_tournament_key(m: Dict[str, Any]) -> str:
+    return str(m.get("tournament_id") or m.get("tournament") or "").strip()
+
+
+def _v575n_backoff_status(m: Dict[str, Any], coverage_state: Dict[str, Any]) -> Dict[str, Any]:
+    mid = str(m.get("match_id") or "")
+    row = ((coverage_state or {}).get("matches") or {}).get(mid) or {}
+    until = float(row.get("backoff_until") or 0)
+    remaining = max(0.0, until - time.time())
+    return {
+        "active": remaining > 0,
+        "remaining_seconds": round(remaining, 1),
+        "dq_zero_streak": int(row.get("dq_zero_streak") or 0),
+        "last_quality": row.get("last_quality"),
+    }
+
+
+def _v575n_coverage_rank_adjustment(m: Dict[str, Any], coverage_state: Dict[str, Any]) -> float:
+    key = _v575n_tournament_key(m)
+    row = ((coverage_state or {}).get("tournaments") or {}).get(key) or {}
+    samples = int(row.get("samples") or 0)
+    if samples < 2:
+        return 0.0
+    success = float(row.get("basic_ok_rate") or 0.0)
+    avg_q = float(row.get("avg_quality") or 0.0)
+    if success >= 0.80:
+        adj = 8.0
+    elif success >= 0.55:
+        adj = 4.0
+    elif success <= 0.20:
+        adj = -14.0
+    elif success <= 0.40:
+        adj = -7.0
+    else:
+        adj = 0.0
+    if avg_q >= 75:
+        adj += 2.0
+    elif avg_q <= 10:
+        adj -= 2.0
+    return adj
+
+
+def _v575n_update_coverage_from_report(state: Dict[str, Any], rep: Dict[str, Any]) -> None:
+    if not isinstance(rep, dict) or rep.get("status") != "OK":
+        return
+    match = rep.get("match") or {}
+    mid = str(rep.get("match_id") or "")
+    q = rep.get("data_quality") or {}
+    diag = rep.get("diagnostic") or {}
+    now = time.time()
+    q_score = float(q.get("score") or 0)
+    basic_ok = bool(q.get("basic_ok"))
+    rows_count = int(diag.get("stats_rows_count") or 0)
+
+    if mid:
+        matches = state.setdefault("matches", {})
+        old = matches.get(mid) or {}
+        streak = int(old.get("dq_zero_streak") or 0)
+        # Only empty/zero stats trigger hard temporary backoff. Partial data is
+        # allowed to be rescanned because it may still improve naturally.
+        if rows_count <= 0 or q_score <= 0:
+            streak += 1
+            backoff = min(
+                V575N_DQ_ZERO_BACKOFF_MAX_SECONDS,
+                V575N_DQ_ZERO_BACKOFF_SECONDS * max(1, streak),
+            )
+            backoff_until = now + backoff
+        else:
+            streak = 0
+            backoff_until = 0.0
+        matches[mid] = {
+            "updated_at": now,
+            "last_quality": round(q_score, 1),
+            "last_rows_count": rows_count,
+            "basic_ok": basic_ok,
+            "dq_zero_streak": streak,
+            "backoff_until": backoff_until,
+        }
+
+    key = _v575n_tournament_key(match)
+    if key:
+        tournaments = state.setdefault("tournaments", {})
+        old = tournaments.get(key) or {}
+        prev_samples = int(old.get("samples") or 0)
+        weight = min(prev_samples, V575N_COVERAGE_SAMPLE_CAP - 1)
+        denom = weight + 1
+        prev_success = float(old.get("basic_ok_rate") or 0.0)
+        prev_q = float(old.get("avg_quality") or 0.0)
+        tournaments[key] = {
+            "updated_at": now,
+            "samples": min(V575N_COVERAGE_SAMPLE_CAP, prev_samples + 1),
+            "basic_ok_rate": round((prev_success * weight + (1.0 if basic_ok else 0.0)) / denom, 4),
+            "avg_quality": round((prev_q * weight + q_score) / denom, 2),
+            "last_quality": round(q_score, 1),
+        }
+
+
 def _v575j_rotation_boost(m: Dict[str, Any], queue: Dict[str, Dict[str, Any]]) -> float:
     row = queue.get(str(m.get("match_id") or "")) or {}
     deferred = max(0, int(row.get("deferred_scans") or 0))
     return min(V575J_ROTATION_BOOST_CAP, deferred * V575J_ROTATION_BOOST_PER_DEFER)
 
 
-def _v575j_budgeted_rank(m: Dict[str, Any], queue: Dict[str, Dict[str, Any]]) -> float:
+def _v575j_budgeted_rank(
+    m: Dict[str, Any],
+    queue: Dict[str, Dict[str, Any]],
+    coverage_state: Optional[Dict[str, Any]] = None,
+) -> float:
     score = float(smart_scout_rank(m) or 0)
     score += _v575j_rotation_boost(m, queue)
+    score += _v575n_coverage_rank_adjustment(m, coverage_state or {})
     # First-half windows decay quickly, so a small urgency bonus is justified.
     if _v575j_is_priority_first_half(m):
         score += 6.0
@@ -4517,6 +4808,7 @@ def _v575j_select_with_rotation(
     limit: int,
     queue: Dict[str, Dict[str, Any]],
     focus: str = "balanced",
+    coverage_state: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     target = max(0, min(int(limit), 20))
     if target <= 0:
@@ -4529,7 +4821,12 @@ def _v575j_select_with_rotation(
     elif focus_mode == "second_half":
         eligible_pool = [m for m in pool if _v575m_is_priority_second_half(m)]
 
-    ranked = sorted(eligible_pool, key=lambda m: _v575j_budgeted_rank(m, queue), reverse=True)
+    # Do not immediately retry a match whose stats endpoint just returned
+    # zero usable rows. This is local backoff only and never suppresses a match
+    # permanently; it expires automatically.
+    coverage_state = coverage_state or {"matches": {}, "tournaments": {}}
+    eligible_pool = [m for m in eligible_pool if not _v575n_backoff_status(m, coverage_state).get("active")]
+    ranked = sorted(eligible_pool, key=lambda m: _v575j_budgeted_rank(m, queue, coverage_state), reverse=True)
     first_half_target = target if focus_mode == "first_half" else min(
         target,
         max(1, int(math.ceil(target * V575J_FIRST_HALF_DEEP_SHARE))),
@@ -8173,7 +8470,7 @@ def _v575f_failure_item(rep: Dict[str, Any]) -> Dict[str, Any]:
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
     """
-    Hidden Signal V5.7.5m — main live scanner.
+    Hidden Signal V5.7.5n — main live scanner.
 
     focus modes: balanced / first_half / second_half.
 
@@ -8225,9 +8522,27 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     # guarantee ~8 core-stat calls after final/targeted/enrichment reserves.
     rotation_queue = _v575j_prune_rotation_queue(_v575j_load_rotation_queue(), matches)
     rotation_queue_before = len(rotation_queue)
+    coverage_state = _v575n_load_coverage_state()
+    # Count currently filtered matches for transparent diagnostics.
+    if focus_mode == "first_half":
+        _focus_pool_for_backoff = [m for m in pool if _v575j_is_priority_first_half(m)]
+    elif focus_mode == "second_half":
+        _focus_pool_for_backoff = [m for m in pool if _v575m_is_priority_second_half(m)]
+    else:
+        _focus_pool_for_backoff = list(pool)
+    coverage_backoff_filtered = [
+        {
+            "match_id": m.get("match_id"),
+            "match": f"{m.get('home')} — {m.get('away')}",
+            "minute": m.get("minute"),
+            **_v575n_backoff_status(m, coverage_state),
+        }
+        for m in _focus_pool_for_backoff
+        if _v575n_backoff_status(m, coverage_state).get("active")
+    ]
     deep_budget_plan = _v575j_deep_budget_plan(limit, focus=focus_mode)
-    requested_candidates = _v575j_select_with_rotation(pool, deep_budget_plan["requested_limit"], rotation_queue, focus=focus_mode)
-    chosen = _v575j_select_with_rotation(pool, deep_budget_plan["effective_core_slots"], rotation_queue, focus=focus_mode)
+    requested_candidates = _v575j_select_with_rotation(pool, deep_budget_plan["requested_limit"], rotation_queue, focus=focus_mode, coverage_state=coverage_state)
+    chosen = _v575j_select_with_rotation(pool, deep_budget_plan["effective_core_slots"], rotation_queue, focus=focus_mode, coverage_state=coverage_state)
     _v575j_set_core_reservation(len(chosen))
     chosen_ids = {str(m.get("match_id") or "") for m in chosen}
 
@@ -8286,6 +8601,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
             continue
 
         rotation_queue.pop(mid, None)
+        _v575n_update_coverage_from_report(coverage_state, rep)
         prev = previous_state.get(mid)
         momentum = _momentum_from_history(rep, prev)
         momentum_map[mid] = momentum
@@ -8297,6 +8613,7 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         ok_reports.append(rep)
 
     _v575j_save_rotation_queue(rotation_queue)
+    _v575n_save_coverage_state(coverage_state)
     rotation_queue_after = len(rotation_queue)
 
     # Preserve recent history for matches not selected in this pass.
@@ -8389,8 +8706,12 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
                 "match": f"{match.get('home')} — {match.get('away')}",
                 "data_quality": q.get("score"),
                 "missing": q.get("missing"),
+                "quality_reason": q.get("quality_reason"),
+                "analysis_only_eligible": bool(q.get("analysis_only_eligible")),
+                "stats_rows_count": int((rep.get("diagnostic") or {}).get("stats_rows_count") or 0),
             })
-            continue
+            if not q.get("analysis_only_eligible"):
+                continue
 
         resolved = _v53_find_final_match(match, mid, final_matches)
         freshness = _v53_freshness_check(
@@ -9057,6 +9378,16 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
         "effective_deep_analysis_limit": deep_budget_plan.get("effective_core_slots"),
         "successfully_analyzed": len(ok_reports),
         "DEEP_BUDGET_PLAN": deep_budget_plan,
+        "DATA_COVERAGE_GUARD": {
+            "enabled": True,
+            "state_path": DATA_COVERAGE_STATE_PATH,
+            "backoff_seconds_base": V575N_DQ_ZERO_BACKOFF_SECONDS,
+            "backoff_seconds_max": V575N_DQ_ZERO_BACKOFF_MAX_SECONDS,
+            "filtered_this_scan": len(coverage_backoff_filtered),
+            "filtered_matches": coverage_backoff_filtered[:12],
+            "tournaments_tracked": len((coverage_state or {}).get("tournaments") or {}),
+            "matches_tracked": len((coverage_state or {}).get("matches") or {}),
+        },
         "DEEP_ROTATION_QUEUE": {
             "path": DEEP_ROTATION_QUEUE_PATH,
             "persistent_with_state": STATE_STORAGE_PERSISTENT,
@@ -9181,6 +9512,74 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
     }
 
 
+@mcp.tool()
+async def scan_first_half_live() -> Dict[str, Any]:
+    """
+    V5.7.5n dedicated first-half scanner.
+
+    Fixed policy:
+      - only live matches from 5' through 43' are admitted to deep analysis;
+      - every currently available normal provider call is spent on 1H core stats;
+      - no second-half match can consume a deep-analysis slot;
+      - final live snapshot and targeted Score Sync keep their safety reserves;
+      - rolling 24/60s and per-scan 14-call guards are still respected.
+
+    This endpoint intentionally exposes no `focus` argument so MCP schema caching
+    cannot silently fall back to balanced mode.
+    """
+    result = await scan_final_live(
+        limit=20,
+        max_pool=120,
+        concurrency=2,
+        focus="first_half",
+    )
+    if isinstance(result, dict):
+        result["FIRST_HALF_ONLY_MODE"] = True
+        result["FIRST_HALF_WINDOW"] = [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE]
+        result["FIRST_HALF_BUDGET_POLICY"] = {
+            "deep_share": 1.0,
+            "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
+            "second_half_deep_slots": 0,
+            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+            "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+            "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
+            "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
+        }
+    return result
+
+
+@mcp.tool()
+async def scan_second_half_live() -> Dict[str, Any]:
+    """
+    V5.7.5n dedicated second-half scanner.
+
+    Fixed policy:
+      - only regulation-time live matches from 46' through 90' are admitted;
+      - every currently available normal provider call is spent on 2H core stats;
+      - no first-half match can consume a deep-analysis slot;
+      - final live snapshot and targeted Score Sync keep their safety reserves;
+      - rolling 24/60s and per-scan 14-call guards are still respected.
+    """
+    result = await scan_final_live(
+        limit=20,
+        max_pool=120,
+        concurrency=2,
+        focus="second_half",
+    )
+    if isinstance(result, dict):
+        result["SECOND_HALF_ONLY_MODE"] = True
+        result["SECOND_HALF_WINDOW"] = [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE]
+        result["SECOND_HALF_BUDGET_POLICY"] = {
+            "deep_share": 1.0,
+            "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
+            "first_half_deep_slots": 0,
+            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+            "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+            "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
+            "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
+        }
+    return result
+
 
 
 
@@ -9255,6 +9654,8 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "dedicated_second_half_endpoint": "scan_second_half_live",
         "atomic_budget_guard": True,
         "proactive_deep_budgeting": True,
+        "data_coverage_priority": True,
+        "dq_zero_backoff_seconds": V575N_DQ_ZERO_BACKOFF_SECONDS,
         "rotation_queue": {
             "enabled": True,
             "path": DEEP_ROTATION_QUEUE_PATH,
@@ -9304,12 +9705,20 @@ async def get_provider_guard_status() -> Dict[str, Any]:
             "feed_guard_state": FEED_GUARD_STATE_PATH,
             "rate_limit_state": RATE_LIMIT_STATE_PATH,
             "deep_rotation_queue": DEEP_ROTATION_QUEUE_PATH,
+            "data_coverage_state": DATA_COVERAGE_STATE_PATH,
+        },
+        "data_coverage_guard": {
+            "state_path": DATA_COVERAGE_STATE_PATH,
+            "tournaments_tracked": len((_v575n_load_coverage_state().get("tournaments") or {})),
+            "matches_tracked": len((_v575n_load_coverage_state().get("matches") or {})),
+            "backoff_seconds_base": V575N_DQ_ZERO_BACKOFF_SECONDS,
+            "backoff_seconds_max": V575N_DQ_ZERO_BACKOFF_MAX_SECONDS,
         },
         "feed_guard_state": _v575a_load_feed_guard_state(),
         "scan_budget": _v573_scan_budget_status(),
         "enrichment_budget": _v575j_enrichment_status(),
         "core_reservation": _v575j_core_reservation_status(),
-        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5m dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
+        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5n dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
     }
 
 @mcp.tool()
@@ -9659,73 +10068,6 @@ async def quick_screenshot_goal_hunter(
     }
 
 
-@mcp.tool()
-async def scan_first_half_live() -> Dict[str, Any]:
-    """
-    V5.7.5m dedicated first-half scanner.
-
-    Fixed policy:
-      - only live matches from 5' through 43' are admitted to deep analysis;
-      - every currently available normal provider call is spent on 1H core stats;
-      - no second-half match can consume a deep-analysis slot;
-      - final live snapshot and targeted Score Sync keep their safety reserves;
-      - rolling 24/60s and per-scan 14-call guards are still respected.
-
-    This endpoint intentionally exposes no `focus` argument so MCP schema caching
-    cannot silently fall back to balanced mode.
-    """
-    result = await scan_final_live(
-        limit=20,
-        max_pool=120,
-        concurrency=2,
-        focus="first_half",
-    )
-    if isinstance(result, dict):
-        result["FIRST_HALF_ONLY_MODE"] = True
-        result["FIRST_HALF_WINDOW"] = [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE]
-        result["FIRST_HALF_BUDGET_POLICY"] = {
-            "deep_share": 1.0,
-            "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
-            "second_half_deep_slots": 0,
-            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
-            "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
-            "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
-            "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
-        }
-    return result
-
-
-@mcp.tool()
-async def scan_second_half_live() -> Dict[str, Any]:
-    """
-    V5.7.5m dedicated second-half scanner.
-
-    Fixed policy:
-      - only regulation-time live matches from 46' through 90' are admitted;
-      - every currently available normal provider call is spent on 2H core stats;
-      - no first-half match can consume a deep-analysis slot;
-      - final live snapshot and targeted Score Sync keep their safety reserves;
-      - rolling 24/60s and per-scan 14-call guards are still respected.
-    """
-    result = await scan_final_live(
-        limit=20,
-        max_pool=120,
-        concurrency=2,
-        focus="second_half",
-    )
-    if isinstance(result, dict):
-        result["SECOND_HALF_ONLY_MODE"] = True
-        result["SECOND_HALF_WINDOW"] = [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE]
-        result["SECOND_HALF_BUDGET_POLICY"] = {
-            "deep_share": 1.0,
-            "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
-            "first_half_deep_slots": 0,
-            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
-            "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
-            "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
-            "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
-        }
-    return result
 
 
 @mcp.tool()
@@ -9763,6 +10105,14 @@ async def health_root(request: Request) -> Response:
         "service": "Hidden Signal Live",
         "version": VERSION,
         "model_type": MODEL_TYPE,
+        "capabilities": {
+            "scan_final_live": True,
+            "scan_first_half_live": True,
+            "scan_second_half_live": True,
+            "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
+            "second_half_window": [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE],
+            "data_coverage_priority": True,
+        },
     })
 
 if __name__ == "__main__":
