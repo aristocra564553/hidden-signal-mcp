@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5l1-FIRST-HALF-DEDICATED-5-43-FIXED-FINAL"
-MODEL_TYPE = "heuristic-v5.7.5l1-first-half-dedicated-5-43-fixed-final-not-calibrated"
+VERSION = "V5.7.5m-DUAL-HALF-DEDICATED-BUDGET-FINAL"
+MODEL_TYPE = "heuristic-v5.7.5m-dual-half-dedicated-budget-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -434,6 +434,12 @@ V575K_FIRST_HALF_START_MINUTE = 5
 V575K_FIRST_HALF_END_MINUTE = 43
 V575K_FIRST_HALF_ENRICH_THRESHOLD = max(65.0, min(90.0, float(os.environ.get("V575K_FIRST_HALF_ENRICH_THRESHOLD", "70"))))
 V575K_FIRST_HALF_ENRICH_RESERVE = max(0, min(3, int(os.environ.get("V575K_FIRST_HALF_ENRICH_RESERVE", "0"))))
+# V5.7.5m: fixed dedicated second-half window. 90 includes normal late regulation;
+# explicit extra-time/penalty stages are rejected by the phase detector.
+V575M_SECOND_HALF_START_MINUTE = 46
+V575M_SECOND_HALF_END_MINUTE = 90
+V575M_SECOND_HALF_ENRICH_THRESHOLD = max(65.0, min(90.0, float(os.environ.get("V575M_SECOND_HALF_ENRICH_THRESHOLD", "70"))))
+V575M_SECOND_HALF_ENRICH_RESERVE = max(0, min(3, int(os.environ.get("V575M_SECOND_HALF_ENRICH_RESERVE", "0"))))
 V575K_ROLLING_MINUTE_FINAL_RESERVE = max(1, int(os.environ.get("V575K_ROLLING_MINUTE_FINAL_RESERVE", "1")))
 V575K_ROLLING_MINUTE_TARGETED_RESERVE = max(0, int(os.environ.get("V575K_ROLLING_MINUTE_TARGETED_RESERVE", "1")))
 _SCAN_FOCUS = {"mode": "balanced"}
@@ -2038,11 +2044,13 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         # Tier 2: only a visible 65%+ candidate gets freshness/lineup/market
         # context. These endpoints may run concurrently, but the atomic budget
         # gate guarantees they cannot consume the final reserves.
-        enrichment_threshold = (
-            V575K_FIRST_HALF_ENRICH_THRESHOLD
-            if _v575k_focus_mode() == "first_half"
-            else VISIBLE_SIGNAL_MIN
-        )
+        current_focus = _v575k_focus_mode()
+        if current_focus == "first_half":
+            enrichment_threshold = V575K_FIRST_HALF_ENRICH_THRESHOLD
+        elif current_focus == "second_half":
+            enrichment_threshold = V575M_SECOND_HALF_ENRICH_THRESHOLD
+        else:
+            enrichment_threshold = VISIBLE_SIGNAL_MIN
         if preliminary_best >= enrichment_threshold:
             # V5.7.5j: reserve all three Tier-2 calls atomically before starting
             # them. This prevents two concurrent visible candidates from eating
@@ -2079,7 +2087,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         # the signal. Spend it only on a very strong candidate and only if
         # at least two normal-budget slots remain.
         if (
-            _v575k_focus_mode() != "first_half"
+            not _v575m_is_dedicated_half_focus()
             and enriched_best >= 78.0
             and _v575b_normal_budget_remaining() >= 2
         ):
@@ -2100,7 +2108,7 @@ async def analyze_match_internal(match_id: str, exact_live: Optional[Dict[str, A
         history_context = {"available": False, "reason": "not_requested_by_priority_budget"}
         history_http = {"home": None, "away": None}
         if (
-            _v575k_focus_mode() != "first_half"
+            not _v575m_is_dedicated_half_focus()
             and top_pre_context
             and max(
                 float(top_pre_context.get("probability") or 0),
@@ -2289,6 +2297,10 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "proactive_deep_budget_guard",
             "rolling_minute_budget_guard",
             "first_half_stats_first_guard",
+            "second_half_stats_first_guard",
+            "dedicated_half_budget_isolation_guard",
+            "first_half_unilateral_pressure_guard",
+            "first_half_low_dq_analysis_only_guard",
             "rotation_queue_guard",
             "persistent_state_health_guard",
             "data_quality_guard",
@@ -2339,6 +2351,8 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "timed_entry_guidance",
             "emerging_goal_detector",
             "dedicated_first_half_engine",
+            "first_half_pressure_fallback_seed",
+            "first_half_unilateral_pressure_engine",
             "multi_scan_pressure_trend",
             "false_pressure_detector",
             "market_comparison_engine",
@@ -2364,9 +2378,13 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "rolling_60s_budget_planner",
             "first_half_focus_mode",
             "dedicated_first_half_scan_endpoint",
+            "dedicated_second_half_scan_endpoint",
             "first_half_window_5_43",
+            "second_half_window_46_90",
             "first_half_all_available_core_budget",
+            "second_half_all_available_core_budget",
             "first_half_stats_first_pipeline",
+            "second_half_stats_first_pipeline",
             "deferred_match_rotation_queue",
             "first_half_deep_slot_reservation",
             "atomic_tier2_enrichment_reserve",
@@ -2392,12 +2410,18 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
             "tier2_enrichment_reserve_balanced": V575J_ENRICHMENT_RESERVE,
             "tier2_enrichment_reserve_first_half": V575K_FIRST_HALF_ENRICH_RESERVE,
+            "tier2_enrichment_reserve_second_half": V575M_SECOND_HALF_ENRICH_RESERVE,
             "first_half_deep_share_balanced": V575J_FIRST_HALF_DEEP_SHARE,
             "first_half_focus_share": 1.0,
+            "second_half_focus_share": 1.0,
             "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
+            "second_half_window": [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE],
             "first_half_enrich_threshold": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+            "second_half_enrich_threshold": V575M_SECOND_HALF_ENRICH_THRESHOLD,
             "dedicated_first_half_endpoint": "scan_first_half_live",
+            "dedicated_second_half_endpoint": "scan_second_half_live",
             "first_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_FIRST_HALF_CORE_STATS",
+            "second_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_SECOND_HALF_CORE_STATS",
             "rolling_minute_aware": True,
             "rotation_queue_enabled": True,
         },
@@ -4404,11 +4428,41 @@ def _v575j_is_priority_first_half(m: Dict[str, Any]) -> bool:
     return bool(m.get("is_in_progress", True))
 
 
+def _v575m_is_priority_second_half(m: Dict[str, Any]) -> bool:
+    """V5.7.5m: tolerant regulation-time 2H detector for the dedicated scanner."""
+    minute = int(m.get("minute") or 0)
+    if not (V575M_SECOND_HALF_START_MINUTE <= minute <= V575M_SECOND_HALF_END_MINUTE):
+        return False
+
+    stage = re.sub(r"\s+", " ", str(m.get("stage") or "").strip().lower())
+    explicit_block = (
+        "1st half", "first half", "1h", "1. half", "1 half",
+        "half time", "halftime", "ht", "finished", "full time", "ft",
+        "extra time", "penalties"
+    )
+    if any(token == stage or token in stage for token in explicit_block):
+        return False
+
+    explicit_second = ("2nd half", "second half", "2h", "2. half", "2 half")
+    if any(token == stage or token in stage for token in explicit_second):
+        return True
+
+    # Generic LIVE fallback is accepted only inside the fixed 46'–90' window.
+    return bool(m.get("is_in_progress", True))
+
+
 def _v575k_normalize_focus(focus: Optional[str]) -> str:
     raw = str(focus or "balanced").strip().lower().replace("-", "_")
-    if raw in {"1h", "firsthalf", "first_half", "fh", "first"}:
+    if raw in {"1h", "firsthalf", "first_half", "fh", "first", "1"}:
         return "first_half"
+    if raw in {"2h", "secondhalf", "second_half", "sh", "second", "2"}:
+        return "second_half"
     return "balanced"
+
+
+def _v575m_is_dedicated_half_focus(focus: Optional[str] = None) -> bool:
+    mode = _v575k_normalize_focus(focus if focus is not None else (_SCAN_FOCUS or {}).get("mode"))
+    return mode in {"first_half", "second_half"}
 
 
 def _v575k_focus_mode() -> str:
@@ -4472,12 +4526,15 @@ def _v575j_select_with_rotation(
     eligible_pool = list(pool)
     if focus_mode == "first_half":
         eligible_pool = [m for m in pool if _v575j_is_priority_first_half(m)]
+    elif focus_mode == "second_half":
+        eligible_pool = [m for m in pool if _v575m_is_priority_second_half(m)]
 
     ranked = sorted(eligible_pool, key=lambda m: _v575j_budgeted_rank(m, queue), reverse=True)
     first_half_target = target if focus_mode == "first_half" else min(
         target,
         max(1, int(math.ceil(target * V575J_FIRST_HALF_DEEP_SHARE))),
     )
+    second_half_target = target if focus_mode == "second_half" else 0
 
     selected: List[Dict[str, Any]] = []
     ids = set()
@@ -4500,15 +4557,25 @@ def _v575j_select_with_rotation(
         if tid:
             tournament_counts[tid] = tournament_counts.get(tid, 0) + 1
 
-    # Pass 1: in dedicated first-half mode, 100% of safe deep slots are 5'–43'.
-    for m in ranked:
-        if len(selected) >= first_half_target:
-            break
-        if not _v575j_is_priority_first_half(m) or not can_add(m):
-            continue
-        add(m)
+    # Pass 1A: preserve balanced 1H quota; dedicated first-half mode makes it 100%.
+    if focus_mode in {"balanced", "first_half"}:
+        for m in ranked:
+            if len(selected) >= first_half_target:
+                break
+            if not _v575j_is_priority_first_half(m) or not can_add(m):
+                continue
+            add(m)
 
-    # Pass 2: highest priority overall, with rotation boost and league diversity.
+    # Pass 1B: dedicated second-half mode -> 100% of safe deep slots are 46'–90'.
+    if focus_mode == "second_half":
+        for m in ranked:
+            if len(selected) >= second_half_target:
+                break
+            if not _v575m_is_priority_second_half(m) or not can_add(m):
+                continue
+            add(m)
+
+    # Pass 2: highest priority within the already focus-filtered pool.
     for m in ranked:
         if len(selected) >= target:
             break
@@ -4547,7 +4614,12 @@ def _v575j_deep_budget_plan(requested_limit: int, focus: str = "balanced") -> Di
     # details/lineups/odds are not pre-reserved; they may use only genuine
     # leftover capacity after admitted core calls. Balanced mode preserves j's
     # one-candidate Tier-2 reserve.
-    desired_reserve = V575K_FIRST_HALF_ENRICH_RESERVE if focus_mode == "first_half" else V575J_ENRICHMENT_RESERVE
+    if focus_mode == "first_half":
+        desired_reserve = V575K_FIRST_HALF_ENRICH_RESERVE
+    elif focus_mode == "second_half":
+        desired_reserve = V575M_SECOND_HALF_ENRICH_RESERVE
+    else:
+        desired_reserve = V575J_ENRICHMENT_RESERVE
     reserve = min(desired_reserve, max(0, normal_remaining - 1))
     effective = min(requested, max(0, normal_remaining - reserve))
     if requested > 0 and normal_remaining > 0 and effective <= 0:
@@ -4561,7 +4633,8 @@ def _v575j_deep_budget_plan(requested_limit: int, focus: str = "balanced") -> Di
     else:
         binding = "BOTH_OR_EQUAL"
 
-    first_half_share = 1.0 if focus_mode == "first_half" else V575J_FIRST_HALF_DEEP_SHARE
+    first_half_share = 1.0 if focus_mode == "first_half" else (0.0 if focus_mode == "second_half" else V575J_FIRST_HALF_DEEP_SHARE)
+    second_half_share = 1.0 if focus_mode == "second_half" else 0.0
     return {
         "focus": focus_mode,
         "requested_limit": requested,
@@ -4581,12 +4654,16 @@ def _v575j_deep_budget_plan(requested_limit: int, focus: str = "balanced") -> Di
             int(math.ceil(effective * first_half_share)) if effective else 0,
         ),
         "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
+        "second_half_share_target": second_half_share,
+        "second_half_slots_target": effective if focus_mode == "second_half" else 0,
+        "second_half_window": [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE],
         "first_half_enrich_threshold": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+        "second_half_enrich_threshold": V575M_SECOND_HALF_ENRICH_THRESHOLD,
         "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "proactive_budgeting": True,
         "rolling_minute_budgeting": True,
-        "stats_first": focus_mode == "first_half",
+        "stats_first": focus_mode in {"first_half", "second_half"},
     }
 
 
@@ -5234,6 +5311,8 @@ FLOW_VISIBLE_MIN = 65.0
 FLOW_ENTER_MIN = 75.0
 FLOW_HISTORY_KEEP = 12
 FIRST_HALF_DOMINANCE_DISPLAY_FLOOR = 60.0
+FIRST_HALF_UNILATERAL_DISPLAY_FLOOR = 62.0
+FIRST_HALF_LOW_DQ_ANALYSIS_CAP = 62.0
 FLOW_TREND_KEEP = 4
 
 
@@ -5438,7 +5517,9 @@ def _v55_first_half_engine(
     minute = int(match.get("minute") or 0)
     stage = str(match.get("stage") or "").lower()
 
-    if minute <= 0 or minute > 45 or "half time" in stage or "halftime" in stage:
+    # V5.7.5l2 keeps the dedicated first-half engine aligned with the scanner:
+    # only 5'–43' are eligible. 44'+ is too late for a stable new entry.
+    if minute < 5 or minute > 43 or "half time" in stage or "halftime" in stage:
         return {"active": False}
 
     def pair(key: str) -> Tuple[float, float]:
@@ -5572,11 +5653,27 @@ def _v55_first_half_engine(
     pressure_gap = round1(leader_p - opp_p)
     trend_score = float(trend.get("score") or 0)
 
+    # Snapshot-only dominance: catches a real one-sided attack even before
+    # multi-scan trend history has had time to build. This is especially
+    # important at 10'–30' when one team already owns the shots/SOT profile.
+    opp_shots = sh_a if leader_side == "home" else sh_h
+    opp_sot = sot_a if leader_side == "home" else sot_h
+    total_shots = max(0.0, lshots + opp_shots)
+    total_sot = max(0.0, lsot + opp_sot)
+    shot_share = 0.5 if total_shots <= 0 else lshots / total_shots
+    sot_share = 0.5 if total_sot <= 0 else lsot / total_sot
+    unilateral_pressure_override = bool(
+        (lsot >= 3 and lshots >= 4 and opp_sot <= 1 and pressure_gap >= 12)
+        or (lsot >= 2 and lshots >= 5 and shot_share >= 0.72 and sot_share >= 0.72 and pressure_gap >= 10)
+        or (minute <= 24 and lsot >= 3 and opp_sot == 0 and pressure_gap >= 10)
+    )
+
     dominance_override = bool(
         (leader_p >= 30 and lsot >= 3 and pressure_gap >= 10)
         or (leader_p >= 25 and lsot >= 2 and lshots >= 6 and pressure_gap >= 10)
         or (lbig >= 2 and lsot >= 2 and pressure_gap >= 8)
         or (lp5 >= 14 and lacc >= 5 and pressure_gap >= 6)
+        or unilateral_pressure_override
     )
 
     false_static = bool(
@@ -5605,7 +5702,27 @@ def _v55_first_half_engine(
     attack_chain_active = chain_score >= 5.0
 
     # Start from the already-guarded native HT market estimate whenever present.
-    p = float(base_p)
+    # V5.7.5l2 no longer turns the engine off when the legacy HT signal is
+    # missing. In that case it builds a conservative snapshot seed from the
+    # remaining first-half time + live attacking evidence.
+    seed_source = "LEGACY_HT" if float(base_p or 0) > 0 else "LIVE_PRESSURE_FALLBACK"
+    if float(base_p or 0) > 0:
+        p = float(base_p)
+    else:
+        remaining_seed = max(2, 45 - minute)
+        total_xg = max(0.0, xg_h + xg_a)
+        total_box = max(0.0, box_h + box_a)
+        fallback_seed = (
+            38.0
+            + remaining_seed * 0.35
+            + min(10.0, (sot_h + sot_a) * 3.0)
+            + min(6.0, (sh_h + sh_a) * 0.50)
+            + min(6.0, total_xg * 4.0)
+            + min(4.0, total_box * 0.20)
+            + min(6.0, leader_p * 0.10)
+            + min(5.0, max(0.0, pressure_gap) * 0.12)
+        )
+        p = round1(clamp(fallback_seed, 30, 72))
     if 5 <= minute <= 9:
         # V5.7.5l: we now scan from 5', but keep a conservative early-sample
         # penalty so a tiny sample cannot create an aggressive first-half entry.
@@ -5631,6 +5748,10 @@ def _v55_first_half_engine(
     p += min(3.0, max(0.0, lacc) * 0.15)
     if dominance_override:
         p += 4.0
+    if unilateral_pressure_override:
+        # Extra bounded boost for a one-sided SOT/shots profile. This is not
+        # enough by itself to bypass DQ or freshness action guards.
+        p += 3.0
     p -= false_penalty
     p = round1(clamp(p, 0, 90))
 
@@ -5649,7 +5770,12 @@ def _v55_first_half_engine(
     # dedicated 60% first-half radar even when the legacy HT model is <55%.
     # This is display-only: DQ/freshness guards below can still cap/block it.
     dominance_floor_applied = False
-    if evidence and dominance_override and p < FIRST_HALF_DOMINANCE_DISPLAY_FLOOR:
+    unilateral_floor_applied = False
+    if evidence and unilateral_pressure_override and p < FIRST_HALF_UNILATERAL_DISPLAY_FLOOR:
+        p = FIRST_HALF_UNILATERAL_DISPLAY_FLOOR
+        dominance_floor_applied = True
+        unilateral_floor_applied = True
+    elif evidence and dominance_override and p < FIRST_HALF_DOMINANCE_DISPLAY_FLOOR:
         p = FIRST_HALF_DOMINANCE_DISPLAY_FLOOR
         dominance_floor_applied = True
 
@@ -5659,8 +5785,16 @@ def _v55_first_half_engine(
     strong_eligible = bool(q.get("strong_eligible"))
     basic_ok = bool(q.get("basic_ok", True))
     dq_block_reason = None
+    dq_analysis_override = False
     if not basic_ok or dq_score < 45:
-        p = min(p, 59.0)
+        # Never make a low-DQ snapshot actionable. But if the basic scoreboard
+        # still contains a very strong one-sided shots/SOT pattern, keep it
+        # visible as analysis-only instead of silently dropping below radar.
+        if unilateral_pressure_override and lshots >= 4 and lsot >= 3:
+            p = min(max(p, FIRST_HALF_DOMINANCE_DISPLAY_FLOOR), FIRST_HALF_LOW_DQ_ANALYSIS_CAP)
+            dq_analysis_override = True
+        else:
+            p = min(p, 59.0)
         dq_block_reason = "DATA_QUALITY_TOO_LOW"
     elif dq_score < 65:
         p = min(p, 69.0)
@@ -5723,8 +5857,16 @@ def _v55_first_half_engine(
     ]
     if dominance_override:
         reasons.append("STATIC_DOMINANCE_OVERRIDE: сильное доминирование, trend_score не обязателен")
+    if unilateral_pressure_override:
+        reasons.append(
+            f"UNILATERAL_PRESSURE: shots share {round1(shot_share*100)}%, "
+            f"SOT share {round1(sot_share*100)}%, opponent SOT {round1(opp_sot)}"
+        )
     if dominance_floor_applied:
-        reasons.append(f"DOMINANCE_DISPLAY_FLOOR: минимум {FIRST_HALF_DOMINANCE_DISPLAY_FLOOR:.0f}% для 1Т-радара")
+        floor_value = FIRST_HALF_UNILATERAL_DISPLAY_FLOOR if unilateral_floor_applied else FIRST_HALF_DOMINANCE_DISPLAY_FLOOR
+        reasons.append(f"DOMINANCE_DISPLAY_FLOOR: минимум {floor_value:.0f}% для 1Т-радара")
+    if dq_analysis_override:
+        reasons.append("LOW_DQ_ANALYSIS_ONLY: давление видно, но вход заблокирован Data Quality Guard")
     if attack_chain_active:
         reasons.append(f"ATTACK_CHAIN {leader_name}: {round1(chain_score)}")
     if false_detected:
@@ -5736,7 +5878,7 @@ def _v55_first_half_engine(
 
     return {
         "active": True,
-        "engine_version": "FIRST_HALF_ENGINE_V3.1.2-INTEGRATED",
+        "engine_version": "FIRST_HALF_ENGINE_V3.2-UNILATERAL-PRESSURE",
         "minute_window": window,
         "probability": p,
         "probability_goal_before_ht": p,
@@ -5750,7 +5892,12 @@ def _v55_first_half_engine(
         "trend_score": round1(trend_score),
         "trend_required": not dominance_override,
         "dominance_override": dominance_override,
+        "unilateral_pressure_override": unilateral_pressure_override,
+        "shot_share": round1(shot_share * 100),
+        "sot_share": round1(sot_share * 100),
+        "seed_source": seed_source,
         "dominance_floor_applied": dominance_floor_applied,
+        "unilateral_floor_applied": unilateral_floor_applied,
         "pressure_team": leader_name,
         "pressure_home": round1(pressure_home),
         "pressure_away": round1(pressure_away),
@@ -5780,6 +5927,7 @@ def _v55_first_half_engine(
             "score": round1(dq_score),
             "strong_eligible": strong_eligible,
             "block_reason": dq_block_reason,
+            "analysis_only_override": dq_analysis_override,
         },
         "freshness": {
             "status": freshness_status,
@@ -6004,6 +6152,9 @@ def _v55_enrich_view(
         if ht_item
         else float(_effective_probability(raw_ht_signal) or 0)
     )
+    # V5.7.5l2: run the dedicated 1H engine for every live first-half match in
+    # the 5'–43' window. If the legacy GOAL_BEFORE_HALFTIME market is missing,
+    # the engine uses its conservative LIVE_PRESSURE_FALLBACK seed.
     first_half = _v55_first_half_engine(
         rep,
         ht_base_probability,
@@ -6011,7 +6162,7 @@ def _v55_enrich_view(
         false_pressure,
         history_seq,
         freshness,
-    ) if raw_ht_signal or ht_item else {"active": False}
+    )
 
     emerging = [
         x for x in all_items
@@ -6051,7 +6202,12 @@ def _v55_enrich_view(
             "probability_away_goal_before_ht": first_half.get("probability_away_goal_before_ht"),
             "goal_window": first_half.get("goal_window"),
             "dominance_override": first_half.get("dominance_override"),
+            "unilateral_pressure_override": first_half.get("unilateral_pressure_override"),
+            "shot_share": first_half.get("shot_share"),
+            "sot_share": first_half.get("sot_share"),
+            "seed_source": first_half.get("seed_source"),
             "dominance_floor_applied": first_half.get("dominance_floor_applied"),
+            "unilateral_floor_applied": first_half.get("unilateral_floor_applied"),
             "trend_required": first_half.get("trend_required"),
             "false_pressure": first_half.get("false_pressure"),
             "data_quality": first_half.get("data_quality"),
@@ -8017,7 +8173,9 @@ def _v575f_failure_item(rep: Dict[str, Any]) -> Dict[str, Any]:
 @mcp.tool()
 async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
     """
-    Hidden Signal V5.3 — main live scanner.
+    Hidden Signal V5.7.5m — main live scanner.
+
+    focus modes: balanced / first_half / second_half.
 
     Flow:
       1) broad live snapshot
@@ -9089,9 +9247,12 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "targeted_verify_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
         "tier2_enrichment_reserve": V575J_ENRICHMENT_RESERVE,
         "first_half_enrichment_pre_reserve": V575K_FIRST_HALF_ENRICH_RESERVE,
+        "second_half_enrichment_pre_reserve": V575M_SECOND_HALF_ENRICH_RESERVE,
         "first_half_deep_share_balanced": V575J_FIRST_HALF_DEEP_SHARE,
         "first_half_deep_share_dedicated": 1.0,
+        "second_half_deep_share_dedicated": 1.0,
         "dedicated_first_half_endpoint": "scan_first_half_live",
+        "dedicated_second_half_endpoint": "scan_second_half_live",
         "atomic_budget_guard": True,
         "proactive_deep_budgeting": True,
         "rotation_queue": {
@@ -9118,11 +9279,13 @@ async def get_provider_guard_status() -> Dict[str, Any]:
             "tier_1": "stats_only",
             "tier_2_threshold_balanced": VISIBLE_SIGNAL_MIN,
             "tier_2_threshold_first_half": V575K_FIRST_HALF_ENRICH_THRESHOLD,
+            "tier_2_threshold_second_half": V575M_SECOND_HALF_ENRICH_THRESHOLD,
             "tier_2": "details+lineups+odds_if_budget",
             "tier_3_threshold": 78.0,
             "tier_3": "player_stats+h2h_if_budget_balanced_only",
             "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
-            "focus_supported": ["balanced", "first_half"],
+            "second_half_window": [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE],
+            "focus_supported": ["balanced", "first_half", "second_half"],
         },
         "cache_entries": len(_PROVIDER_CACHE),
         "persistence": {
@@ -9146,7 +9309,7 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "scan_budget": _v573_scan_budget_status(),
         "enrichment_budget": _v575j_enrichment_status(),
         "core_reservation": _v575j_core_reservation_status(),
-        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5l scan_first_half_live dedicates all currently available normal deep-analysis calls to 5'–43' first halves, while preserving only final-snapshot and targeted Score Sync safety reserves. Deferred 1H matches rotate to the next scan instead of becoming parser failures.",
+        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5m dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
     }
 
 @mcp.tool()
@@ -9499,7 +9662,7 @@ async def quick_screenshot_goal_hunter(
 @mcp.tool()
 async def scan_first_half_live() -> Dict[str, Any]:
     """
-    V5.7.5l dedicated first-half scanner.
+    V5.7.5m dedicated first-half scanner.
 
     Fixed policy:
       - only live matches from 5' through 43' are admitted to deep analysis;
@@ -9524,6 +9687,39 @@ async def scan_first_half_live() -> Dict[str, Any]:
             "deep_share": 1.0,
             "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
             "second_half_deep_slots": 0,
+            "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
+            "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
+            "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
+            "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
+        }
+    return result
+
+
+@mcp.tool()
+async def scan_second_half_live() -> Dict[str, Any]:
+    """
+    V5.7.5m dedicated second-half scanner.
+
+    Fixed policy:
+      - only regulation-time live matches from 46' through 90' are admitted;
+      - every currently available normal provider call is spent on 2H core stats;
+      - no first-half match can consume a deep-analysis slot;
+      - final live snapshot and targeted Score Sync keep their safety reserves;
+      - rolling 24/60s and per-scan 14-call guards are still respected.
+    """
+    result = await scan_final_live(
+        limit=20,
+        max_pool=120,
+        concurrency=2,
+        focus="second_half",
+    )
+    if isinstance(result, dict):
+        result["SECOND_HALF_ONLY_MODE"] = True
+        result["SECOND_HALF_WINDOW"] = [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE]
+        result["SECOND_HALF_BUDGET_POLICY"] = {
+            "deep_share": 1.0,
+            "core_stats_priority": "ALL_AVAILABLE_NORMAL_CALLS",
+            "first_half_deep_slots": 0,
             "final_snapshot_reserve": PROVIDER_FINAL_SNAPSHOT_RESERVE,
             "targeted_score_sync_reserve": PROVIDER_TARGETED_VERIFY_RESERVE,
             "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
