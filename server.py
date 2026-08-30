@@ -16,8 +16,14 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5o-ATOMIC-ROLLING-GUARD-DUAL-HALF-FINAL"
-MODEL_TYPE = "heuristic-v5.7.5o-atomic-rolling-guard-dual-half-not-calibrated"
+VERSION = "V5.7.5p-STABLE-DEDICATED-ENDPOINTS-ATOMIC-GUARD-FINAL"
+MODEL_TYPE = "heuristic-v5.7.5p-stable-dedicated-endpoints-atomic-guard-not-calibrated"
+PUBLIC_SCAN_SCHEMA_REVISION = "v575p-dedicated-half-contract-1"
+PUBLIC_SCAN_ENDPOINTS = {
+    "balanced": "scan_final_live",
+    "first_half": "scan_first_half_live",
+    "second_half": "scan_second_half_live",
+}
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -2581,6 +2587,9 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "dq_zero_backoff",
             "tournament_data_coverage_priority",
             "early_mcp_dedicated_endpoint_registration",
+            "stable_parameterless_half_endpoint_contract",
+            "direct_internal_half_scan_runner",
+            "public_scan_schema_revision_diagnostics",
         ],
         "state_storage": {
             "directory": STATE_STORAGE_DIR,
@@ -2607,6 +2616,10 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "second_half_enrich_threshold": V575M_SECOND_HALF_ENRICH_THRESHOLD,
             "dedicated_first_half_endpoint": "scan_first_half_live",
             "dedicated_second_half_endpoint": "scan_second_half_live",
+            "public_scan_schema_revision": PUBLIC_SCAN_SCHEMA_REVISION,
+            "public_scan_endpoints": dict(PUBLIC_SCAN_ENDPOINTS),
+            "dedicated_endpoints_parameterless": True,
+            "dedicated_endpoints_direct_internal_runner": True,
             "first_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_FIRST_HALF_CORE_STATS",
             "second_half_budget_mode": "ALL_AVAILABLE_NORMAL_CALLS_TO_SECOND_HALF_CORE_STATS",
             "rolling_minute_aware": True,
@@ -9678,12 +9691,14 @@ async def _scan_final_live_impl(limit: int = 18, max_pool: int = 80, concurrency
     }
 
 
-@mcp.tool()
-async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
-    """
-    V5.7.5o serialized public scanner. Exactly one full scan owns the global
-    focus/budget state at a time; per-scan state is always released afterwards.
-    """
+async def _v575p_run_serialized_scan(
+    *,
+    limit: int,
+    max_pool: int,
+    concurrency: int,
+    focus: str,
+) -> Dict[str, Any]:
+    """Single owner for global full-scan state used by every public scan endpoint."""
     async with _SCAN_EXECUTION_LOCK:
         try:
             return await _scan_final_live_impl(
@@ -9693,31 +9708,21 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
                 focus=focus,
             )
         finally:
+            # Hard lifecycle guarantee: success, early return and exception all
+            # release per-scan budgets/reservations and restore balanced focus.
             _v575o_scan_budget_end()
 
 
-@mcp.tool()
-async def scan_first_half_live() -> Dict[str, Any]:
-    """
-    V5.7.5o dedicated first-half scanner.
+def _v575p_mark_half_result(result: Dict[str, Any], focus: str) -> Dict[str, Any]:
+    """Attach a stable, machine-readable contract to dedicated half scan results."""
+    if not isinstance(result, dict):
+        return result
 
-    Fixed policy:
-      - only live matches from 5' through 43' are admitted to deep analysis;
-      - every currently available normal provider call is spent on 1H core stats;
-      - no second-half match can consume a deep-analysis slot;
-      - final live snapshot and targeted Score Sync keep their safety reserves;
-      - rolling 24/60s and per-scan 14-call guards are still respected.
+    result["PUBLIC_SCAN_SCHEMA_REVISION"] = PUBLIC_SCAN_SCHEMA_REVISION
+    result["PUBLIC_SCAN_ENDPOINT"] = PUBLIC_SCAN_ENDPOINTS.get(focus, "scan_final_live")
+    result["DEDICATED_HALF_FOCUS"] = focus
 
-    This endpoint intentionally exposes no `focus` argument so MCP schema caching
-    cannot silently fall back to balanced mode.
-    """
-    result = await scan_final_live(
-        limit=20,
-        max_pool=120,
-        concurrency=2,
-        focus="first_half",
-    )
-    if isinstance(result, dict):
+    if focus == "first_half":
         result["FIRST_HALF_ONLY_MODE"] = True
         result["FIRST_HALF_WINDOW"] = [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE]
         result["FIRST_HALF_BUDGET_POLICY"] = {
@@ -9729,28 +9734,7 @@ async def scan_first_half_live() -> Dict[str, Any]:
             "rolling_minute_limit": PROVIDER_MAX_CALLS_PER_MINUTE,
             "per_scan_limit": PROVIDER_MAX_CALLS_PER_SCAN,
         }
-    return result
-
-
-@mcp.tool()
-async def scan_second_half_live() -> Dict[str, Any]:
-    """
-    V5.7.5o dedicated second-half scanner.
-
-    Fixed policy:
-      - only regulation-time live matches from 46' through 90' are admitted;
-      - every currently available normal provider call is spent on 2H core stats;
-      - no first-half match can consume a deep-analysis slot;
-      - final live snapshot and targeted Score Sync keep their safety reserves;
-      - rolling 24/60s and per-scan 14-call guards are still respected.
-    """
-    result = await scan_final_live(
-        limit=20,
-        max_pool=120,
-        concurrency=2,
-        focus="second_half",
-    )
-    if isinstance(result, dict):
+    elif focus == "second_half":
         result["SECOND_HALF_ONLY_MODE"] = True
         result["SECOND_HALF_WINDOW"] = [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE]
         result["SECOND_HALF_BUDGET_POLICY"] = {
@@ -9765,6 +9749,72 @@ async def scan_second_half_live() -> Dict[str, Any]:
     return result
 
 
+@mcp.tool()
+async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int = 2, focus: str = "balanced") -> Dict[str, Any]:
+    """
+    V5.7.5p serialized public scanner. Exactly one full scan owns the global
+    focus/budget state at a time; per-scan state is always released afterwards.
+    """
+    result = await _v575p_run_serialized_scan(
+        limit=limit,
+        max_pool=max_pool,
+        concurrency=concurrency,
+        focus=_v575k_normalize_focus(focus),
+    )
+    if isinstance(result, dict):
+        result["PUBLIC_SCAN_SCHEMA_REVISION"] = PUBLIC_SCAN_SCHEMA_REVISION
+        result["PUBLIC_SCAN_ENDPOINT"] = "scan_final_live"
+    return result
+
+
+@mcp.tool()
+async def scan_first_half_live() -> Dict[str, Any]:
+    """
+    V5.7.5p dedicated first-half scanner (stable parameterless public endpoint).
+
+    Contract:
+      - only live matches from 5' through 43' are admitted to deep analysis;
+      - every currently available normal provider call is spent on 1H core stats;
+      - no second-half match can consume a deep-analysis slot;
+      - final live snapshot and targeted Score Sync keep their safety reserves;
+      - rolling 24/60s and per-scan 14-call guards remain hard limits.
+
+    This endpoint does NOT call the decorated public scan_final_live wrapper.
+    It owns the serialized internal runner directly, so MCP schema caching cannot
+    alter or drop the dedicated first-half focus.
+    """
+    result = await _v575p_run_serialized_scan(
+        limit=20,
+        max_pool=120,
+        concurrency=2,
+        focus="first_half",
+    )
+    return _v575p_mark_half_result(result, "first_half")
+
+
+@mcp.tool()
+async def scan_second_half_live() -> Dict[str, Any]:
+    """
+    V5.7.5p dedicated second-half scanner (stable parameterless public endpoint).
+
+    Contract:
+      - only regulation-time live matches from 46' through 90' are admitted;
+      - every currently available normal provider call is spent on 2H core stats;
+      - no first-half match can consume a deep-analysis slot;
+      - final live snapshot and targeted Score Sync keep their safety reserves;
+      - rolling 24/60s and per-scan 14-call guards remain hard limits.
+
+    This endpoint does NOT call the decorated public scan_final_live wrapper.
+    It owns the serialized internal runner directly, so MCP schema caching cannot
+    alter or drop the dedicated second-half focus.
+    """
+    result = await _v575p_run_serialized_scan(
+        limit=20,
+        max_pool=120,
+        concurrency=2,
+        focus="second_half",
+    )
+    return _v575p_mark_half_result(result, "second_half")
 
 
 @mcp.tool()
@@ -9849,6 +9899,10 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "second_half_deep_share_dedicated": 1.0,
         "dedicated_first_half_endpoint": "scan_first_half_live",
         "dedicated_second_half_endpoint": "scan_second_half_live",
+        "public_scan_schema_revision": PUBLIC_SCAN_SCHEMA_REVISION,
+        "public_scan_endpoints": dict(PUBLIC_SCAN_ENDPOINTS),
+        "dedicated_endpoints_parameterless": True,
+        "dedicated_endpoints_direct_internal_runner": True,
         "atomic_budget_guard": True,
         "atomic_rolling_purpose_reserve_guard": True,
         "scan_execution_locked": _SCAN_EXECUTION_LOCK.locked(),
@@ -9919,7 +9973,7 @@ async def get_provider_guard_status() -> Dict[str, Any]:
         "scan_budget": _v573_scan_budget_status(),
         "enrichment_budget": _v575j_enrichment_status(),
         "core_reservation": _v575j_core_reservation_status(),
-        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5o dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
+        "note": "Provider-side exhausted account quota cannot be bypassed; V5.7.5p dedicated half scanners spend all currently available normal deep-analysis calls only on the requested half (1H 5'–43' or 2H 46'–90'), while preserving final-snapshot and targeted Score Sync safety reserves. Deferred matches rotate instead of becoming parser failures.",
     }
 
 @mcp.tool()
@@ -10310,6 +10364,9 @@ async def health_root(request: Request) -> Response:
             "scan_final_live": True,
             "scan_first_half_live": True,
             "scan_second_half_live": True,
+            "public_scan_schema_revision": PUBLIC_SCAN_SCHEMA_REVISION,
+            "dedicated_endpoints_parameterless": True,
+            "dedicated_endpoints_direct_internal_runner": True,
             "first_half_window": [V575K_FIRST_HALF_START_MINUTE, V575K_FIRST_HALF_END_MINUTE],
             "second_half_window": [V575M_SECOND_HALF_START_MINUTE, V575M_SECOND_HALF_END_MINUTE],
             "data_coverage_priority": True,
