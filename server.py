@@ -16,8 +16,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-VERSION = "V5.7.5d-SCORE-SYNC-GUARD"
-MODEL_TYPE = "heuristic-v5.7.5d-score-sync-guard-not-calibrated"
+VERSION = "V5.7.5e-ADAPTIVE-NOW-STABILITY-FIX"
+MODEL_TYPE = "heuristic-v5.7.5e-adaptive-now-stability-fix-not-calibrated"
 
 ZYLA_API_KEY = os.getenv("ZYLA_API_KEY", "").strip()
 ZYLA_BASE = "https://zylalabs.com/api/12518/flashscore+-+live+api"
@@ -2046,6 +2046,7 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "score_sync_guard",
             "targeted_score_minute_sync_guard",
             "score_conflict_recalculation",
+            "adaptive_now_stability_guard",
             "data_quality_guard",
             "early_match_guard",
             "small_sample_guard",
@@ -2111,6 +2112,7 @@ async def hidden_signal_status() -> Dict[str, Any]:
             "sample_gated_tuning",
             "automatic_rollback",
             "adaptive_take_now",
+            "adaptive_final_state_persistence",
             "phase_quota_selection",
             "tournament_diversity_prefilter",
             "goal_chain_board",
@@ -5277,6 +5279,43 @@ def _v575c2_compact_candidate(c: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _v575e_commit_adaptive_state(
+    journal: Dict[str, Any],
+    match_id: str,
+    view: Dict[str, Any],
+) -> None:
+    """Persist the FINAL adaptive state into the latest decision-journal row.
+
+    V5.6 writes the journal before V5.7 adaptive control runs. Without this
+    post-adaptive commit, Bridge-created TAKE_SOON states are invisible to the
+    next scan and TAKE_NOW stability can never accumulate.
+    """
+    rows = list(journal.get(match_id) or [])
+    if not rows:
+        return
+
+    latest = rows[-1]
+    signals = list(latest.get("signals") or [])
+    by_key = {str(s.get("key") or ""): s for s in signals}
+
+    for item in list(view.get("ADAPTIVE_ITEMS") or []):
+        key = _v56_signal_key(item)
+        saved = by_key.get(key)
+        if not saved:
+            continue
+        final_state = str((item.get("FLOW") or {}).get("state") or "PASS")
+        bridge = item.get("ADAPTIVE_BRIDGE") or {}
+        final_stable = int(bridge.get("adaptive_stable_count") or 1)
+        if final_state not in {"TAKE_SOON", "TAKE_NOW"}:
+            final_stable = 1
+        saved["adaptive_state"] = final_state
+        saved["adaptive_stable_count"] = final_stable
+
+    latest["signals"] = signals
+    rows[-1] = latest
+    journal[match_id] = rows[-V56_JOURNAL_KEEP:]
+
+
 def _v575c2_append_scan_audit(
     journal: Dict[str, Any],
     adaptive_take_now: List[Dict[str, Any]],
@@ -5332,6 +5371,8 @@ def _v56_transition_control(
     trend_score = float(trend.get("score") or 0)
     prev = _v56_previous_state(journal, match_id, item)
     prev_state = str((prev or {}).get("state") or "PASS")
+    prev_adaptive_state = str((prev or {}).get("adaptive_state") or "PASS")
+    prev_adaptive_stable_count = int((prev or {}).get("adaptive_stable_count") or 0)
     prev_p = float((prev or {}).get("probability") or 0)
 
     order = {
@@ -5371,6 +5412,8 @@ def _v56_transition_control(
         "raw_state": current,
         "controlled_state": controlled,
         "previous_state": prev_state,
+        "previous_adaptive_state": prev_adaptive_state,
+        "previous_adaptive_stable_count": prev_adaptive_stable_count,
         "previous_probability": prev_p if prev else None,
         "stable_count": stable_count,
         "reason": reason,
@@ -6101,6 +6144,8 @@ def _v57_adaptive_control(
 
         decision_control = y.get("DECISION_CONTROL") or {}
         stable = int(decision_control.get("stable_count") or 1)
+        previous_adaptive_state = str(decision_control.get("previous_adaptive_state") or "PASS")
+        previous_adaptive_stable_count = int(decision_control.get("previous_adaptive_stable_count") or 0)
         base_decision = str(y.get("decision") or "")
 
         # Existing bounded self-learning behavior.
@@ -6149,6 +6194,25 @@ def _v57_adaptive_control(
             )
             reason = bridge_reason
 
+        # V5.7.5e ADAPTIVE NOW STABILITY FIX
+        # The old bridge required raw FLOW to already be TAKE_SOON/TAKE_NOW and
+        # used only the pre-adaptive DECISION_CONTROL stable_count. A signal that
+        # was promoted by Adaptive Bridge itself therefore kept returning with
+        # stable_count=1 and could get stuck in TAKE_SOON forever.
+        #
+        # We now persist the FINAL adaptive state and use two consecutive final
+        # adaptive strong observations as the stability proof for TAKE_NOW.
+        adaptive_stable_count = 1
+        if bridge_soon_ok and previous_adaptive_state in {"TAKE_SOON", "TAKE_NOW"}:
+            adaptive_stable_count = max(2, previous_adaptive_stable_count + 1)
+        elif adaptive in {"TAKE_SOON", "TAKE_NOW"} and stable >= 2:
+            adaptive_stable_count = stable
+
+        now_stability_ok = (
+            stable >= 2
+            or adaptive_stable_count >= 2
+        )
+
         # TAKE_NOW bridge is intentionally stricter.
         # Moderate false pressure (penalty 4) can still be TAKE_SOON,
         # but cannot be promoted to TAKE_NOW by the bridge.
@@ -6156,20 +6220,20 @@ def _v57_adaptive_control(
             bridge_soon_ok
             and p_learned >= ADAPTIVE_BRIDGE_NOW_PROB
             and trend_score >= ADAPTIVE_BRIDGE_NOW_TREND
-            and stable >= 2
+            and now_stability_ok
             and false_penalty <= 0
             and not conflict_detected
             and context_risk_band == "LOW"
-            and cur in {"TAKE_SOON", "TAKE_NOW"}
         )
 
         if bridge_now_ok and adaptive == "TAKE_SOON":
             adaptive = "TAKE_NOW"
+            adaptive_stable_count = max(2, adaptive_stable_count)
             bridge_applied = True
             bridge_target = "TAKE_NOW"
             bridge_reason = (
-                "очень сильный CONFIRMED ENTER + устойчивый тренд + второй сильный скан "
-                "+ нет false pressure/market conflict"
+                "очень сильный CONFIRMED ENTER + устойчивый тренд + второй финальный "
+                "adaptive-сигнал + нет false pressure/market conflict"
             )
             reason = bridge_reason
 
@@ -6188,6 +6252,10 @@ def _v57_adaptive_control(
             "context_risk": context_risk_band,
             "market_conflict": conflict_detected,
             "stable_count": stable,
+            "previous_adaptive_state": previous_adaptive_state,
+            "previous_adaptive_stable_count": previous_adaptive_stable_count,
+            "adaptive_stable_count": adaptive_stable_count,
+            "now_stability_ok": now_stability_ok,
             "soon_probability_threshold": ADAPTIVE_BRIDGE_SOON_PROB,
             "soon_trend_threshold": ADAPTIVE_BRIDGE_SOON_TREND,
             "now_probability_threshold": ADAPTIVE_BRIDGE_NOW_PROB,
@@ -7569,6 +7637,12 @@ async def scan_final_live(limit: int = 18, max_pool: int = 80, concurrency: int 
                 view["WHEN_TO_ENTER_ADAPTIVE"] = f"👀 НАЗРЕВАЕТ — Score Sync Guard: {fail_reason}"
             else:
                 view["WHEN_TO_ENTER_ADAPTIVE"] = f"🔴 ПРОПУСКАЕМ — Score Sync Guard: {fail_reason}"
+
+        _v575e_commit_adaptive_state(
+            decision_journal,
+            mid,
+            view,
+        )
 
         _v575c2_attach_match_audit(
             decision_journal,
